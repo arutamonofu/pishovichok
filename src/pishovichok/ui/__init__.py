@@ -1,30 +1,38 @@
-"""Слой 4: Интерактивный веб-интерфейс Streamlit и 2D-рендеринг молекул."""
+"""Слой 4: графический интерфейс Chemical IDE на базе NiceGUI 4.0."""
 
-from pishovichok.ui.app import main, run_app
-from pishovichok.ui.components import (
-    DEMO_SCENARIOS,
-    render_candidates_four_zones_table,
-    render_control_panel,
-    render_explainable_trace,
-    render_export_buttons,
-    render_sar_and_cliffs_view,
+from __future__ import annotations
+
+from pishovichok.ui.app import register_ui_assets_and_routes, run_app, run_ui
+from pishovichok.ui.bridge import AgentUIBridge, agent_bridge
+from pishovichok.ui.components.agent_rail import DEMO_SCENARIOS
+from pishovichok.ui.session import (
+    HITLDecision,
+    HITLMode,
+    SessionRegistry,
+    SessionRuntime,
+    session_registry,
 )
-from pishovichok.ui.mol_rendering import (
-    molecule_svg_to_data_uri,
-    render_mmp_pair_svg,
-    render_molecule_svg,
+from pishovichok.ui.state_vm import (
+    CandidateRowVM,
+    MPOWeightsAndThresholds,
+    ReferencePointVM,
+    StateViewModel,
 )
 
 __all__ = [
     "DEMO_SCENARIOS",
-    "main",
-    "molecule_svg_to_data_uri",
-    "render_candidates_four_zones_table",
-    "render_control_panel",
-    "render_explainable_trace",
-    "render_export_buttons",
-    "render_mmp_pair_svg",
-    "render_molecule_svg",
-    "render_sar_and_cliffs_view",
+    "AgentUIBridge",
+    "CandidateRowVM",
+    "HITLDecision",
+    "HITLMode",
+    "MPOWeightsAndThresholds",
+    "ReferencePointVM",
+    "SessionRegistry",
+    "SessionRuntime",
+    "StateViewModel",
+    "agent_bridge",
+    "register_ui_assets_and_routes",
     "run_app",
+    "run_ui",
+    "session_registry",
 ]

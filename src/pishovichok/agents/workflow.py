@@ -38,7 +38,11 @@ from pishovichok.state.schemas import CandidateMolecule, QueryConstraints
 from pishovichok.state.storage import create_session_workspace, export_trace_log
 
 
-def build_sar_graph() -> Any:
+def build_sar_graph(
+    checkpointer: Any = None,
+    interrupt_before: list[str] | None = None,
+    interrupt_after: list[str] | None = None,
+) -> Any:
     """Создает и компилирует конечный автомат мультиагентного скрининга на базе LangGraph."""
     workflow = StateGraph(state_schema=SARGraphState)
 
@@ -67,7 +71,11 @@ def build_sar_graph() -> Any:
         },
     )
 
-    return workflow.compile()
+    return workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_before=interrupt_before,
+        interrupt_after=interrupt_after,
+    )
 
 
 def export_candidates_to_csv(

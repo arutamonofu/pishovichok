@@ -109,6 +109,14 @@ class AppSettings(BaseSettings):
         "auto", "admet_ai_dmpnn", "catboost_local_qsar", "rdkit_analytical_qsar"
     ] = Field(default="auto")
 
+    # Параметры веб-интерфейса NiceGUI (Слой 4)
+    ui_host: str = Field(default="127.0.0.1", description="Хост сервера NiceGUI")
+    ui_port: int = Field(default=8080, ge=1, le=65535, description="Порт сервера NiceGUI")
+    sketcher_backend: Literal["jsme", "ketcher"] = Field(
+        default="jsme",
+        description="Активный бэкенд 2D-скетчера молекул ('jsme' или 'ketcher')",
+    )
+
     @property
     def resolved_data_dir(self) -> Path:
         return (

@@ -1,250 +1,203 @@
-"""Главный модуль веб-интерфейса Streamlit (Слой 4).
-
-Точка входа веб-приложения:
-    uv run streamlit run src/pishovichok/ui/app.py
-"""
+"""Точка входа NiceGUI 4.0 для трёхпанельной рабочей среды исследователя («Chemical IDE»)."""
 
 from __future__ import annotations
 
-import json
-import sys
+import uuid
 from pathlib import Path
+from typing import Any
 
-import streamlit as st
+from fastapi import Request
+from nicegui import Client, app, ui
 
-from pishovichok import __version__
-from pishovichok.agents.workflow import run_sar_pipeline
-from pishovichok.ui.components import (
-    render_candidates_four_zones_table,
-    render_control_panel,
-    render_explainable_trace,
-    render_export_buttons,
-    render_sar_and_cliffs_view,
-)
+from pishovichok.config import settings
+from pishovichok.ui.components.agent_rail import AgentRail, TopStatusBar
+from pishovichok.ui.components.candidate_grid import CandidateGrid
+from pishovichok.ui.components.inspector import InspectorPane
+from pishovichok.ui.components.mpo_canvas import MPOCanvas
+from pishovichok.ui.routes import router as api_router
+from pishovichok.ui.session import SessionRuntime, session_registry
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_ASSETS_REGISTERED = False
 
 
-def _load_saved_session(session_id: str) -> bool:
-    """Загружает сохраненное состояние из `workspace/<session_id>/` в `st.session_state`."""
-    sess_dir = Path("workspace") / session_id
-    if not sess_dir.is_dir():
-        st.error(f"Директория сессии не найдена: {sess_dir}")
-        return False
+def register_ui_assets_and_routes() -> None:
+    """Регистрирует локальную статику `/static` (без CDN) и FastAPI-маршруты SVG."""
+    global _ASSETS_REGISTERED
+    if _ASSETS_REGISTERED:
+        return
+    if _STATIC_DIR.is_dir():
+        app.add_static_files("/static", str(_STATIC_DIR))
+    app.include_router(api_router)
+    _ASSETS_REGISTERED = True
 
-    trace_file = sess_dir / "trace_log.json"
-    candidates_file = sess_dir / "evaluated_candidates.parquet"
-    report_file = sess_dir / "report.md"
-    curated_file = sess_dir / "curated_dataset.parquet"
 
-    trace_log = []
-    if trace_file.is_file():
-        try:
-            trace_log = json.loads(trace_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            st.warning(f"Ошибка чтения trace_log.json: {e}")
-
-    candidates = []
-    if candidates_file.is_file():
-        try:
-            # Чтение Parquet кандидатов через DuckDB / PyArrow
-            import duckdb
-
-            from pishovichok.state.schemas import CandidateMolecule
-
-            df_cands = (
-                duckdb.connect()
-                .execute(f"SELECT * FROM '{candidates_file.as_posix()}'")
-                .df()
-            )
-            for _, row in df_cands.iterrows():
-                candidates.append(
-                    CandidateMolecule.from_flat_parquet_record(row.to_dict())
-                )
-        except (RuntimeError, ValueError, OSError) as e:
-            st.warning(f"Ошибка чтения кандидатов: {e}")
-
-    report_md = (
-        report_file.read_text(encoding="utf-8") if report_file.is_file() else None
+@ui.page("/")
+async def chemical_ide_page(
+    client: Client,
+    request: Request,
+    session_id: str | None = None,
+) -> None:
+    """Главная страница Chemical IDE с сохранением состояния графа при перезагрузке (F5)."""
+    register_ui_assets_and_routes()
+    ui.dark_mode(True)
+    ui.add_head_html(
+        '<script src="/static/3Dmol-min.js"></script>'
+        '<script src="/static/jsme/jsme.nocache.js"></script>'
     )
 
-    curated_df = None
-    if curated_file.is_file():
-        try:
-            import duckdb
+    await client.connected()
 
-            curated_df = (
-                duckdb.connect()
-                .execute(f"SELECT * FROM '{curated_file.as_posix()}'")
-                .df()
-            )
-        except (RuntimeError, ValueError, OSError):
-            curated_df = None
-
-    st.session_state.current_state = {
-        "session_id": session_id,
-        "workspace_dir": str(sess_dir),
-        "trace_log": trace_log,
-        "top_candidates": candidates,
-        "extracted_sar_rules": [],
-        "detected_activity_cliffs": [],
-        "curated_df": curated_df,
-        "final_report_markdown": report_md,
-    }
-    st.session_state.session_dir = str(sess_dir)
-    return True
-
-
-def init_app_state() -> None:
-    """Инициализирует сессионное состояние Streamlit."""
-    if "current_state" not in st.session_state:
-        st.session_state.current_state = None
-    if "session_dir" not in st.session_state:
-        st.session_state.session_dir = None
-
-
-def main() -> None:
-    """Основная функция рендеринга страницы Streamlit."""
-    st.set_page_config(
-        page_title="Pishovichok | SAR & Drug Design MAS",
-        page_icon="🧪",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    init_app_state()
-
-    # Заголовок системы
-    st.title("🧪 Pishovichok: Мультиагентный SAR-анализ и дизайн малых молекул")
-    st.caption(
-        f"Версия {__version__} | Слой 4: Интерфейс и трассируемость (Streamlit + rdMolDraw2D + LangGraph) | "
-        "Академическая CADD-платформа с гарантией отсутствия галлюцинаций"
+    resolved_sid = (
+        session_id
+        or request.query_params.get("session_id")
+        or app.storage.tab.get("session_id")
     )
 
-    # Боковая панель с информацией об архитектуре
-    with st.sidebar:
-        st.header("ℹ️ Архитектура системы")
-        st.markdown(
-            """
-            - **Слой 1:** Детерминированное ядро (RDKit, DuckDB, CReM, CatBoost)
-            - **Слой 2:** Blackboard + Fat Pointers (Parquet)
-            - **Слой 3:** Мультиагентный граф LangGraph:
-              - *ResearchAgent* 🔍
-              - *SARAgent* 📊
-              - *DesignAgent* 🧬
-              - *EvaluationAgent* 🔬
-              - *CriticAgent* ⚖️ (Петли №1 и №2)
-            - **Слой 4:** Explainable Trace & 2D SVG
-            - **Слой 5:** Предкэшированный контур `/data`
-            """
-        )
-        st.divider()
-        st.markdown("**Демонстрационные сценарии (SPEC.md):**")
-        st.markdown("1. `BTK (CHEMBL5251)` — Target SAR")
-        st.markdown("2. `EGFR (Gefitinib)` — Lead Opt")
-        st.markdown("3. `Wet-Lab CSV` — Серия из 25 соед.")
+    runtime: SessionRuntime | None = None
+    if resolved_sid:
+        sid_str = str(resolved_sid)
+        runtime = session_registry.get(sid_str)
+        if runtime is None:
+            runtime = await session_registry.restore_from_workspace(sid_str)
+    if runtime is None and not resolved_sid:
+        # При первом входе пробуем подхватить предрасчитанный сценарий для быстрого старта
+        runtime = await session_registry.restore_from_workspace("scenario1_btk")
+    if runtime is None:
+        new_sid = str(resolved_sid or f"sess_{uuid.uuid4().hex[:8]}")
+        runtime = session_registry.get_or_create(session_id=new_sid)
 
-    # Рендеринг панели управления
-    control_actions = render_control_panel()
+    app.storage.tab["session_id"] = runtime.session_id
+    ui.navigate.history.replace(f"/?session_id={runtime.session_id}")
 
-    # Обработка действий пользователя
-    if control_actions["load_saved"]:
-        with st.spinner(
-            f"Загрузка артефактов сессии '{control_actions['session_id']}'..."
+    top_bar: TopStatusBar | None = None
+    agent_rail: AgentRail | None = None
+    mpo_canvas: MPOCanvas | None = None
+    candidate_grid: CandidateGrid | None = None
+    inspector: InspectorPane | None = None
+
+    def _select_candidate(cid: str) -> None:
+        runtime.view_model.selected_candidate_id = cid
+        if inspector is not None:
+            inspector.refresh()
+        if mpo_canvas is not None:
+            mpo_canvas.refresh(mark_pca_dirty=False)
+        if candidate_grid is not None:
+            candidate_grid.select_row(cid)
+
+    def _on_mpo_recalculated() -> None:
+        if candidate_grid is not None:
+            candidate_grid.push_updated_rows()
+        if inspector is not None:
+            inspector.refresh()
+
+    def _on_row_updated(cid: str) -> None:
+        if candidate_grid is not None:
+            candidate_grid.push_updated_rows([cid])
+        if mpo_canvas is not None:
+            mpo_canvas.refresh(mark_pca_dirty=False)
+
+    async def _on_session_switched(new_sid: str) -> None:
+        app.storage.tab["session_id"] = new_sid
+        ui.navigate.to(f"/?session_id={new_sid}")
+
+    def _on_csv_uploaded(csv_path: Path) -> None:
+        if agent_rail is not None:
+            agent_rail.uploaded_csv_path = csv_path
+
+    top_bar = TopStatusBar(
+        runtime,
+        on_session_switched=_on_session_switched,
+        on_csv_uploaded=_on_csv_uploaded,
+    )
+
+    with (
+        ui.element("div").classes("w-full h-[calc(100vh-52px)] bg-slate-950 overflow-hidden"),
+        ui.splitter(value=24, limits=(16, 42)).classes("w-full h-full") as outer_split,
+    ):
+        with outer_split.before:
+            agent_rail = AgentRail(runtime)
+        with (
+            outer_split.after,
+            ui.splitter(value=62, limits=(38, 82)).classes("w-full h-full") as mid_split,
         ):
-            if _load_saved_session(control_actions["session_id"]):
-                st.success(
-                    f"Артефакты сессии '{control_actions['session_id']}' успешно загружены!"
-                )
+                    with mid_split.before, ui.splitter(
+                        horizontal=True,
+                        value=48,
+                        limits=(24, 76),
+                    ).classes("w-full h-full") as center_split:
+                        with center_split.before:
+                            mpo_canvas = MPOCanvas(
+                                runtime,
+                                on_candidate_selected=_select_candidate,
+                                on_mpo_recalculated=_on_mpo_recalculated,
+                            )
+                        with center_split.after:
+                            candidate_grid = CandidateGrid(
+                                runtime,
+                                on_candidate_selected=_select_candidate,
+                            )
+                    with mid_split.after:
+                        inspector = InspectorPane(
+                            runtime,
+                            on_row_updated=_on_row_updated,
+                        )
 
-    if control_actions["start_screening"]:
-        with st.spinner(
-            "Запуск мультиагентного оркестратора LangGraph (Research -> SAR -> Critic -> Design -> Evaluation)..."
-        ):
-            final_state, _trace_path, _csv_path, _sdf_path = run_sar_pipeline(
-                user_query=control_actions["user_query"],
-                session_id=control_actions["session_id"],
-                uploaded_csv_path=control_actions["uploaded_csv_path"],
-                export_artifacts=True,
-            )
-            # Извлечение DataFrame для графика
-            curated_df = None
-            if final_state.get("dataset_uri"):
-                try:
-                    import duckdb
+    async def _on_runtime_event(event: dict[str, Any]) -> None:
+        event_type = str(event.get("type", ""))
+        with client:
+            if top_bar is not None:
+                top_bar.refresh()
+            if agent_rail is not None:
+                agent_rail.refresh()
+            if event_type in (
+                "node_completed",
+                "pipeline_completed",
+                "hitl_resumed",
+                "branch_restarted",
+            ):
+                if candidate_grid is not None:
+                    candidate_grid.push_new_rows()
+                if mpo_canvas is not None:
+                    mpo_canvas.refresh(mark_pca_dirty=True)
+                if inspector is not None:
+                    inspector.refresh()
+            elif event_type == "pipeline_error":
+                ui.notify(f"Ошибка графа: {event.get('error', '')}", type="negative")
 
-                    curated_df = (
-                        duckdb.connect()
-                        .execute(f"SELECT * FROM '{final_state['dataset_uri'].uri}'")
-                        .df()
-                    )
-                except (RuntimeError, ValueError, OSError):
-                    curated_df = None
+    client_key = str(client.id)
+    session_registry.subscribe(runtime.session_id, client_key, _on_runtime_event)
+    client.on_disconnect(
+        lambda: session_registry.unsubscribe(runtime.session_id, client_key)
+    )
 
-            st.session_state.current_state = {
-                "session_id": final_state.get("session_id"),
-                "workspace_dir": final_state.get("workspace_dir"),
-                "trace_log": final_state.get("trace_log", []),
-                "top_candidates": final_state.get("top_candidates", []),
-                "extracted_sar_rules": final_state.get("extracted_sar_rules", []),
-                "detected_activity_cliffs": final_state.get(
-                    "detected_activity_cliffs", []
-                ),
-                "lead_reference_metrics": final_state.get("lead_reference_metrics"),
-                "curated_df": curated_df,
-                "final_report_markdown": final_state.get("final_report_markdown"),
-            }
-            st.session_state.session_dir = final_state.get("workspace_dir")
-            st.success("Вычислительная сессия оркестратора успешно завершена!")
 
-    st.divider()
-
-    # Основные рабочие вкладки системы
-    if st.session_state.current_state is not None:
-        state = st.session_state.current_state
-        tab_trace, tab_sar, tab_candidates, tab_exports = st.tabs(
-            [
-                "🧭 Журнал трассировки (Explainable Trace)",
-                "🔬 SAR-матрица и Activity Cliffs",
-                "🧬 Сводная таблица кандидатов (4 зоны)",
-                "📥 Экспорт результатов и отчет",
-            ]
-        )
-
-        with tab_trace:
-            render_explainable_trace(state.get("trace_log", []))
-
-        with tab_sar:
-            render_sar_and_cliffs_view(
-                sar_rules=state.get("extracted_sar_rules", []),
-                activity_cliffs=state.get("detected_activity_cliffs", []),
-                curated_df=state.get("curated_df"),
-            )
-
-        with tab_candidates:
-            render_candidates_four_zones_table(
-                candidates=state.get("top_candidates", []),
-                lead_reference=state.get("lead_reference_metrics"),
-            )
-
-        with tab_exports:
-            render_export_buttons(
-                session_dir=st.session_state.session_dir,
-                candidates=state.get("top_candidates", []),
-                trace_log=state.get("trace_log", []),
-                final_report_md=state.get("final_report_markdown"),
-            )
-    else:
-        st.info(
-            "👆 Выберите один из демонстрационных сценариев выше и нажмите **Запустить скрининг** или **Загрузить сохраненные результаты**."
-        )
+def run_ui(
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    native: bool = False,
+    reload: bool = False,
+) -> None:
+    """Запускает NiceGUI-приложение строго в одном воркере (`workers=1`)."""
+    register_ui_assets_and_routes()
+    ui.run(
+        host=host or settings.ui_host,
+        port=port or settings.ui_port,
+        title="Pishovichok · Chemical IDE",
+        dark=True,
+        reload=reload,
+        native=native,
+        workers=1,
+        show=False,
+        storage_secret="pishovichok-chemical-ide-secret",
+    )
 
 
 def run_app() -> None:
-    """Точка входа CLI для запуска streamlit run."""
-    import subprocess
-
-    app_path = Path(__file__).resolve()
-    cmd = [sys.executable, "-m", "streamlit", "run", str(app_path)] + sys.argv[1:]
-    subprocess.run(cmd, check=False)
+    """Entry point для консольной команды `pishovichok-ui`."""
+    run_ui()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ in {"__main__", "__mp_main__"}:
+    run_app()

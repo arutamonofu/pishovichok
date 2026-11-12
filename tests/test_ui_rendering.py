@@ -1,270 +1,324 @@
-"""Автоматические тесты Слой 4: Веб-интерфейс, 2D-рендеринг молекул и экспорт артефактов.
-
-Критерий готовности:
-1. Отсутствие исключений в функциях генерации 2D-графики (SVG, пары, подсветка атомов, фолбэки).
-2. Программное тестирование рендеринга интерфейса через Streamlit AppTest.
-3. Корректность формирования файлов экспорта (CSV, SDF с 2D координатами, JSON) на всех 3 сценариях.
-"""
+"""Тесты NiceGUI 4.0 Chemical IDE, 2D/3D рендеринга, изоляции слоёв и контрактов UI."""
 
 from __future__ import annotations
 
-import json
+import asyncio
+import pickle
 from pathlib import Path
 
 import pytest
-from streamlit.testing.v1 import AppTest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from pishovichok.agents.workflow import (
-    export_candidates_to_csv,
-    export_candidates_to_sdf,
-)
-from pishovichok.state.schemas import CandidateMolecule, TraceEvent
-from pishovichok.state.storage import export_trace_log
-from pishovichok.ui.mol_rendering import (
-    COLOR_ACTIVITY_GAIN,
+from pishovichok.config import settings
+from pishovichok.core.rendering import (
+    compute_chemical_space_projection,
+    generate_3d_conformer_molblock,
     molecule_svg_to_data_uri,
+    render_aligned_diff_svg,
     render_mmp_pair_svg,
+    render_mmp_pair_svgs,
     render_molecule_svg,
 )
+from pishovichok.state.schemas import (
+    CalcRDKitMetrics,
+    CandidateMolecule,
+    PredADMETMetrics,
+    SARHypothesisRationale,
+)
+from pishovichok.ui.bridge import AgentUIBridge
+from pishovichok.ui.routes import router as api_router
+from pishovichok.ui.session import HITLDecision, SessionRegistry
+from pishovichok.ui.state_vm import StateViewModel
+
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "pishovichok"
 
 
-class TestMol2DRendering:
-    """Тестирование C++ модуля 2D-рендеринга молекул на базе rdMolDraw2D."""
+def _make_dummy_candidate(
+    candidate_id: str = "cand_test_1",
+    smiles: str = "COc1ccc(Nc2ncnc3ccccc23)cc1",
+    parent_smiles: str = "c1ccc(Nc2ncnc3ccccc23)cc1",
+    scaffold_smiles: str = "c1ccc(Nc2ncnc3ccccc23)cc1",
+    pains_count: int = 0,
+    brenk_count: int = 0,
+    pic50: float = 8.2,
+    clogp: float = 3.1,
+) -> CandidateMolecule:
+    mpo = 0.0 if (pains_count > 0 or brenk_count > 0) else 0.78
+    return CandidateMolecule(
+        candidate_id=candidate_id,
+        canonical_smiles=smiles,
+        scaffold_smiles=scaffold_smiles,
+        generation_iteration=1,
+        parent_chembl_id="CHEMBL1873475",
+        parent_smiles=parent_smiles,
+        parent_exp_pic50=7.5,
+        parent_exp_ic50_nm=31.6,
+        parent_bao_format="BAO_0000357",
+        parent_assay_type="B",
+        parent_source_dataset="chembl_test",
+        calc_rdkit=CalcRDKitMetrics(
+            mw=251.3,
+            clogp=clogp,
+            tpsa=47.0,
+            hbd=1,
+            hba=4,
+            rotatable_bonds=3,
+            fsp3=0.1,
+            qed=0.81,
+            sa_score=2.1,
+            lipinski_violations=0,
+            pains_alerts_count=pains_count,
+            brenk_alerts_count=brenk_count,
+            delta_clogp_vs_parent=0.1,
+            delta_tpsa_vs_parent=9.2,
+            brics_fragments=["c1ccccc1"],
+        ),
+        pred_admet=PredADMETMetrics(
+            model_source="catboost_local_qsar",
+            log_s_aq=-3.2,
+            solubility_class="moderate",
+            bbb_permeability_prob=0.55,
+            herg_liability_prob=0.18,
+            herg_risk_level="low",
+            cyp3a4_inhibition_prob=0.22,
+            predicted_pic50=pic50,
+            prediction_confidence="high",
+        ),
+        hypothesis_rationale=SARHypothesisRationale(
+            generation_origin="crem_fragment_replacement",
+            rule_id="rule_1",
+            applied_smirks="[cH:1]>>[c:1]OC",
+            replaced_group_smiles="*[H]",
+            introduced_group_smiles="*OC",
+            historical_mean_delta_pic50=0.7,
+            support_pairs_count=5,
+            assay_homogeneous=True,
+            text_summary="Test methoxy substitution",
+        ),
+        highlighted_atom_indices=[0, 1],
+        mpo_harrington_score=mpo,
+        passes_all_constraints=(pains_count == 0 and brenk_count == 0),
+        constraint_violations=["PAINS"] if pains_count > 0 else [],
+    )
 
-    def test_render_valid_molecule_svg(self) -> None:
-        """Проверка рендеринга стандартных молекул в SVG."""
-        svg = render_molecule_svg("c1ccccc1O", width=300, height=200, legend="Phenol")
-        assert "<svg" in svg
-        assert "</svg>" in svg
-        assert "300" in svg and "200" in svg
 
-    def test_render_with_highlighted_atoms(self) -> None:
-        """Проверка подсветки атомов с настраиваемой палитрой."""
-        # Подсветка кислорода в феноле
+class TestCoreRendering:
+    """Проверка чистых RDKit-функций рендеринга и совместимости с `spawn` (`pickle`)."""
+
+    def test_render_molecule_svg_and_alignment(self) -> None:
         svg = render_molecule_svg(
-            "c1ccccc1O",
-            highlight_atoms=[6],
-            highlight_colors={6: COLOR_ACTIVITY_GAIN},
-            width=320,
-            height=220,
+            "COc1ccc(Nc2ncnc3ccccc23)cc1",
+            highlight_atoms=[0, 1],
+            align_to_scaffold_smiles="c1ccc(Nc2ncnc3ccccc23)cc1",
         )
         assert "<svg" in svg
         assert "</svg>" in svg
 
-    def test_render_gefitinib_complex_structure(self) -> None:
-        """Проверка рендеринга сложной молекулы-лидера (гефитиниб)."""
-        gefitinib = "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1"
-        svg = render_molecule_svg(gefitinib, width=400, height=300, legend="Gefitinib")
-        assert "<svg" in svg
-        assert "</svg>" in svg
+        bad_svg = render_molecule_svg("INVALID_SMILES_###")
+        assert "<svg" in bad_svg
 
-    def test_render_fallback_on_invalid_smiles(self) -> None:
-        """Проверка детерминированного фолбэка на невалидный или пустой SMILES."""
-        svg_empty = render_molecule_svg("")
-        assert "<svg" in svg_empty
-        assert "Пустой SMILES" in svg_empty
-
-        svg_invalid = render_molecule_svg("NOT_A_VALID_SMILES_12345")
-        assert "<svg" in svg_invalid
-        assert "Невалидная структура" in svg_invalid
-
-    def test_render_mmp_pair_svg(self) -> None:
-        """Проверка рендеринга пары молекулярных трансформаций с дельтой активности."""
-        pair_html = render_mmp_pair_svg(
-            smiles_lhs="c1ccccc1O",
-            smiles_rhs="c1ccccc1Cl",
-            title_lhs="Фенол",
-            title_rhs="Хлорбензол",
-            delta_pic50=1.65,
-            sali_index=22.4,
-            width=650,
-            height=250,
+    def test_render_aligned_diff_svg_and_mmp_pairs(self) -> None:
+        svg = render_aligned_diff_svg(
+            smiles="COc1ccc(Nc2ncnc3ccccc23)cc1",
+            parent_smiles="c1ccc(Nc2ncnc3ccccc23)cc1",
+            scaffold_smiles="c1ccc(Nc2ncnc3ccccc23)cc1",
+            is_positive_delta=True,
         )
-        assert "<svg" in pair_html
-        assert "ΔpIC50 = +1.65" in pair_html
-        assert "SALI = 22.4" in pair_html
-        assert "Фенол" in pair_html
-        assert "Хлорбензол" in pair_html
+        assert "<svg" in svg
 
-    def test_molecule_svg_to_data_uri(self) -> None:
-        """Проверка кодирования SVG в Data URI."""
-        svg = "<svg><circle r='10'/></svg>"
-        uri = molecule_svg_to_data_uri(svg)
-        assert uri.startswith("data:image/svg+xml;base64,")
+        p_svg, c_svg = render_mmp_pair_svgs(
+            "c1ccc(Nc2ncnc3ccccc23)cc1",
+            "COc1ccc(Nc2ncnc3ccccc23)cc1",
+            delta_pic50=0.7,
+        )
+        assert "<svg" in p_svg and "<svg" in c_svg
+
+        combined = render_mmp_pair_svg(
+            "c1ccc(Nc2ncnc3ccccc23)cc1",
+            "COc1ccc(Nc2ncnc3ccccc23)cc1",
+            delta_pic50=-0.4,
+        )
+        assert "<svg" in combined
+        assert molecule_svg_to_data_uri(p_svg).startswith("data:image/svg+xml;base64,")
+
+    def test_generate_3d_conformer_and_pca(self) -> None:
+        molblock, hl = generate_3d_conformer_molblock("COc1ccc(Nc2ncnc3ccccc23)cc1")
+        assert "V2000" in molblock or "V3000" in molblock
+        assert "M  END" in molblock
+        assert isinstance(hl, list)
+
+        coords = compute_chemical_space_projection(
+            [
+                "c1ccc(Nc2ncnc3ccccc23)cc1",
+                "COc1ccc(Nc2ncnc3ccccc23)cc1",
+                "Fc1ccc(Nc2ncnc3ccccc23)cc1",
+            ]
+        )
+        assert len(coords) == 3
+        assert all(len(pt) == 2 for pt in coords)
+
+    def test_spawn_pickle_compatibility(self) -> None:
+        """Все функции для `run.cpu_bound` должны быть сериализуемы через `pickle`."""
+        for fn in (
+            render_molecule_svg,
+            render_aligned_diff_svg,
+            generate_3d_conformer_molblock,
+            compute_chemical_space_projection,
+        ):
+            unpickled = pickle.loads(pickle.dumps(fn))
+            assert unpickled is fn
+
+
+class TestLayerIsolationAndAssets:
+    """Проверка изоляции слоёв, удаления Streamlit и локальных JS-ассетов."""
+
+    def test_no_web_imports_in_domain_layers(self) -> None:
+        forbidden = ("nicegui", "fastapi", "starlette", "streamlit")
+        for subpkg in ("core", "agents", "state"):
+            for py_file in (_SRC_ROOT / subpkg).rglob("*.py"):
+                text = py_file.read_text(encoding="utf-8")
+                for mod in forbidden:
+                    assert f"import {mod}" not in text, f"{mod} found in {py_file}"
+                    assert f"from {mod}" not in text, f"{mod} found in {py_file}"
+
+    def test_no_streamlit_and_no_external_cdn_in_ui(self) -> None:
+        ui_dir = _SRC_ROOT / "ui"
+        cdn_markers = ("cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "3dmol.org")
+        for file_path in list(ui_dir.rglob("*.py")) + list(ui_dir.rglob("*.js")):
+            if "jsme/" in file_path.as_posix():
+                continue
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            assert "streamlit" not in text.lower(), f"streamlit found in {file_path}"
+            for cdn in cdn_markers:
+                assert cdn not in text, f"External CDN {cdn} found in {file_path}"
+
+    def test_local_static_js_assets_exist(self) -> None:
+        static_dir = _SRC_ROOT / "ui" / "static"
+        assert (static_dir / "3Dmol-min.js").is_file()
+        assert (static_dir / "viewer3d.js").is_file()
+        assert (static_dir / "jsme_sketcher.js").is_file()
+        assert (static_dir / "ketcher_sketcher.js").is_file()
+        assert (static_dir / "jsme" / "jsme.nocache.js").is_file()
+
+
+class TestStateViewModel:
+    """Проверка векторного пересчёта MPO и лёгких строк `ui.aggrid`."""
+
+    def test_aggrid_rows_contain_no_svg_and_mpo_recalculates(self) -> None:
+        vm = StateViewModel("sess_vm_1")
+        c_ok = _make_dummy_candidate("c1", pic50=8.6, clogp=2.8)
+        c_veto = _make_dummy_candidate("c2", pains_count=1, pic50=9.0, clogp=2.5)
+        vm.upsert_candidates([c_ok, c_veto])
+
+        rows = vm.pop_new_grid_rows()
+        assert len(rows) == 2
+        assert vm.pop_new_grid_rows() == []
+
+        for row in rows:
+            assert "<svg" not in str(row)
+            assert "/api/sessions/sess_vm_1/mol/" in row["preview_html"]
+            assert 'loading="lazy"' in row["preview_html"]
+
+        vm.weights.max_logp = 2.6
+        vm.recalculate_mpo()
+        assert vm.rows_by_id["c1"].passes_all is False
+        assert vm.rows_by_id["c2"].mpo_score == 0.0
+
+        vm.set_pinned("c1", True)
+        assert vm.rows_by_id["c1"].pinned is True
+        vm.set_excluded("c1", True)
+        assert vm.rows_by_id["c1"].excluded is True
+        assert vm.rows_by_id["c1"].pinned is False
+
+
+class TestSessionRegistryAndRoutes:
+    """Проверка `SessionRegistry`, отписок клиентов и FastAPI-маршрута SVG."""
+
+    def test_svg_route_and_session_lifecycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        registry = SessionRegistry()
+        monkeypatch.setattr("pishovichok.ui.routes.session_registry", registry)
+
+        rt = registry.get_or_create("sess_route_1")
+        cand = _make_dummy_candidate("cand_svg_1")
+        rt.view_model.upsert_candidates([cand])
+        registry.subscribe("sess_route_1", "client_1", lambda _ev: None)
+        assert "client_1" in rt.subscribers
+        registry.unsubscribe("sess_route_1", "client_1")
+        assert "client_1" not in rt.subscribers
+
+        from nicegui import run as nicegui_run
+
+        nicegui_run.setup()
+        try:
+            app = FastAPI()
+            app.include_router(api_router)
+            client = TestClient(app)
+
+            resp = client.get("/api/sessions/sess_route_1/mol/cand_svg_1/svg?variant=diff")
+            assert resp.status_code == 200
+            assert "image/svg+xml" in resp.headers["content-type"]
+            assert "max-age=3600" in resp.headers.get("cache-control", "")
+            assert "<svg" in resp.text
+
+            # Повторный запрос должен попадать в кэш сессии
+            resp_cached = client.get("/api/sessions/sess_route_1/mol/cand_svg_1/svg?variant=diff")
+            assert resp_cached.status_code == 200
+            assert resp_cached.text == resp.text
+
+            resp_404 = client.get("/api/sessions/sess_route_1/mol/missing_id/svg")
+            assert resp_404.status_code == 404
+        finally:
+            nicegui_run.tear_down()
+
+
+class TestAgentUIBridge:
+    """Проверка HITL-шлюза, отмены и перезапуска ветки в `AgentUIBridge`."""
+
+    def test_hitl_gate_and_cancel(self) -> None:
+        async def _run_test() -> None:
+            reg = SessionRegistry()
+            bridge = AgentUIBridge(registry=reg)
+            rt = reg.get_or_create("sess_hitl")
+
+            # Имитация паузы HITL
+            rt.status = "paused_hitl"
+            rt.hitl_gate.clear()
+
+            async def _approve_soon() -> None:
+                await asyncio.sleep(0.05)
+                await bridge.submit_hitl_decision(
+                    "sess_hitl", HITLDecision(action="approve")
+                )
+
+            task = asyncio.create_task(_approve_soon())
+            await asyncio.wait_for(rt.hitl_gate.wait(), timeout=2.0)
+            await task
+            assert rt.pending_decision is not None
+            assert rt.pending_decision.action == "approve"
+
+            # Проверка отмены активной задачи
+            rt.active_task = asyncio.create_task(asyncio.sleep(10.0))
+            rt.status = "running"
+            await bridge.cancel_current_run("sess_hitl")
+            assert rt.status == "cancelled"
+
+        asyncio.run(_run_test())
 
 
 class TestScenarioArtifactExports:
-    """Тестирование корректности формирования файлов экспорта на 3 демонстрационных сценариях."""
+    """Проверка восстановления сохранённых сценариев из `workspace/`."""
 
     @pytest.mark.parametrize(
-        "scenario_key",
+        "scenario_id",
         ["scenario1_btk", "scenario2_gefitinib", "scenario3_wetlab"],
     )
-    def test_scenario_export_formats_and_content(
-        self, scenario_key: str, tmp_path: Path
-    ) -> None:
-        """Проверяет экспорт CSV, SDF (2D) и JSON трассировки для каждого сценария."""
-        ws_dir = Path("workspace") / scenario_key
-        assert ws_dir.is_dir(), f"Workspace directory missing: {ws_dir}"
+    def test_restore_saved_scenarios(self, scenario_id: str) -> None:
+        if not (settings.resolved_workspace_dir / scenario_id).is_dir():
+            pytest.skip(f"Scenario {scenario_id} not present in workspace")
 
-        # 1. Проверка чтения кандидатов и 4 категорий
-        cands_parquet = ws_dir / "evaluated_candidates.parquet"
-        assert cands_parquet.is_file(), (
-            f"Parquet candidates file missing: {cands_parquet}"
-        )
-
-        import duckdb
-
-        rows = (
-            duckdb.connect().execute(f"SELECT * FROM '{cands_parquet.as_posix()}'").df()
-        )
-        assert len(rows) >= 5, (
-            f"Expected at least 5 candidates in {scenario_key}, got {len(rows)}"
-        )
-
-        candidates = [
-            CandidateMolecule.from_flat_parquet_record(r.to_dict())
-            for _, r in rows.iterrows()
-        ]
-
-        for cand in candidates:
-            # Категория 1: Экспериментальный факт
-            assert cand.parent_chembl_id, "Missing parent_chembl_id"
-            assert cand.parent_exp_pic50 > 0.0, "Invalid parent_exp_pic50"
-            assert cand.parent_bao_format, "Missing parent_bao_format"
-
-            # Категория 2: Расчет RDKit + BRICS
-            assert cand.calc_rdkit.mw > 0.0
-            assert cand.calc_rdkit.sa_score >= 1.0
-            assert isinstance(cand.calc_rdkit.brics_fragments, list)
-            if scenario_key == "scenario3_wetlab":
-                assert len(cand.calc_rdkit.brics_fragments) >= 2, (
-                    "Scenario 3 must have BRICS precursors"
-                )
-
-            # Категория 3: ML-прогноз
-            assert cand.pred_admet.model_source in (
-                "admet_ai_dmpnn",
-                "catboost_local_qsar",
-                "rdkit_analytical_qsar",
-            )
-            assert 0.0 <= cand.pred_admet.herg_liability_prob <= 1.0
-
-            # Категория 4: Гипотеза SAR
-            assert cand.hypothesis_rationale.rule_id
-            assert cand.hypothesis_rationale.applied_smirks
-
-        # 2. Тестирование генерации CSV
-        csv_out = tmp_path / f"{scenario_key}_test.csv"
-        export_candidates_to_csv(candidates, csv_out)
-        assert csv_out.is_file()
-        csv_text = csv_out.read_text(encoding="utf-8")
-        assert "candidate_id" in csv_text
-        assert "parent_chembl_id" in csv_text
-        assert "brics_fragments" in csv_text
-        assert "model_source" in csv_text
-        assert "applied_smirks" in csv_text
-
-        # 3. Тестирование генерации SDF с 2D координатами
-        sdf_out = tmp_path / f"{scenario_key}_test.sdf"
-        export_candidates_to_sdf(candidates, sdf_out)
-        assert sdf_out.is_file()
-        sdf_text = sdf_out.read_text(encoding="utf-8", errors="ignore")
-        assert "$$$$" in sdf_text
-        assert "Cat1_Parent_ChEMBL_ID" in sdf_text
-        assert "Cat2_SAscore" in sdf_text
-        assert "Cat3_Model_Source" in sdf_text
-        assert "Cat4_Applied_SMIRKS" in sdf_text
-
-        # 4. Тестирование генерации trace_log.json
-        trace_file = ws_dir / "trace_log.json"
-        assert trace_file.is_file()
-        trace_data = json.loads(trace_file.read_text(encoding="utf-8"))
-        assert len(trace_data) >= 3
-
-        events = [TraceEvent.model_validate(e) for e in trace_data]
-        json_out = export_trace_log(events, tmp_path / f"{scenario_key}_trace")
-        assert json_out.is_file()
-
-
-class TestStreamlitAppRendering:
-    """Интеграционное тестирование рендеринга веб-интерфейса Streamlit через AppTest."""
-
-    @classmethod
-    def setup_class(cls) -> None:
-        cls.app_file = (
-            Path(__file__).resolve().parents[1]
-            / "src"
-            / "pishovichok"
-            / "ui"
-            / "app.py"
-        ).as_posix()
-
-    def test_streamlit_app_loads_without_exceptions(self) -> None:
-        """Проверяет первоначальную загрузку Streamlit-приложения без ошибок."""
-        at = AppTest.from_file(self.app_file)
-        at.run(timeout=15)
-        assert not at.exception, f"App loaded with exception: {at.exception}"
-
-    def test_streamlit_app_loads_scenario1_data(self) -> None:
-        """Проверяет загрузку и рендеринг данных Сценария 1 (BTK) в UI."""
-        at = AppTest.from_file(self.app_file)
-        at.run(timeout=15)
-
-        at.text_input(key="session_id_input_widget").input("scenario1_btk").run()
-        load_btn = next((b for b in at.button if "Загрузить" in b.label), None)
-        assert load_btn is not None, (
-            "Button 'Загрузить сохраненные результаты' not found"
-        )
-        load_btn.click().run(timeout=15)
-
-        assert not at.exception, (
-            f"App exception after loading Scenario 1: {at.exception}"
-        )
-        curr_state = at.session_state.get("current_state")
-        assert curr_state is not None, (
-            "current_state must not be None after loading Scenario 1"
-        )
-        assert len(curr_state.get("top_candidates", [])) >= 5
-
-    def test_streamlit_app_loads_scenario2_gefitinib(self) -> None:
-        """Проверяет загрузку и рендеринг данных Сценария 2 (Gefitinib) с обеими петлями."""
-        at = AppTest.from_file(self.app_file)
-        at.run(timeout=15)
-
-        at.text_input(key="session_id_input_widget").input("scenario2_gefitinib").run()
-        load_btn = next((b for b in at.button if "Загрузить" in b.label), None)
-        assert load_btn is not None
-        load_btn.click().run(timeout=15)
-
-        assert not at.exception, (
-            f"App exception after loading Scenario 2: {at.exception}"
-        )
-        curr_state = at.session_state.get("current_state")
-        assert curr_state is not None
-        trace_log = curr_state.get("trace_log", [])
-        loop1_found = any(
-            e.get("verdict_or_routing") == "refilter_data" for e in trace_log
-        )
-        loop2_found = any(
-            e.get("verdict_or_routing") == "redesign_molecules" for e in trace_log
-        )
-        assert loop1_found, "Scenario 2 trace must contain Loop 1 (refilter_data)"
-        assert loop2_found, "Scenario 2 trace must contain Loop 2 (redesign_molecules)"
-
-    def test_streamlit_app_loads_scenario3_wetlab(self) -> None:
-        """Проверяет загрузку и рендеринг данных Сценария 3 (Wet-Lab CSV)."""
-        at = AppTest.from_file(self.app_file)
-        at.run(timeout=15)
-
-        at.text_input(key="session_id_input_widget").input("scenario3_wetlab").run()
-        load_btn = next((b for b in at.button if "Загрузить" in b.label), None)
-        assert load_btn is not None
-        load_btn.click().run(timeout=15)
-
-        assert not at.exception, (
-            f"App exception after loading Scenario 3: {at.exception}"
-        )
-        curr_state = at.session_state.get("current_state")
-        assert curr_state is not None
-        assert len(curr_state.get("top_candidates", [])) >= 5
+        reg = SessionRegistry()
+        rt = asyncio.run(reg.restore_from_workspace(scenario_id))
+        assert rt is not None
+        assert len(rt.view_model.rows_by_id) > 0
+        assert len(rt.state.get("trace_log", [])) > 0

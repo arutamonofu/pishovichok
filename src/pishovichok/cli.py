@@ -1,4 +1,4 @@
-"""Интерфейс командной строки (CLI) для мультиагентного скрининга Pishovichok."""
+"""Интерфейс командной строки (CLI) для мультиагентного скрининга и запуска NiceGUI Chemical IDE."""
 
 from __future__ import annotations
 
@@ -6,23 +6,46 @@ import argparse
 
 from pishovichok import __version__
 from pishovichok.agents.workflow import run_sar_pipeline
+from pishovichok.config import settings
 
 
 def main() -> None:
-    """Точка входа CLI."""
+    """Точка входа CLI: консольный запуск пайплайна (-q) или запуск веб-интерфейса NiceGUI (--ui)."""
     parser = argparse.ArgumentParser(
         prog="pishovichok",
-        description="Мультиагентный SAR-скрининг и направленный дизайн малых молекул",
+        description="Мультиагентный SAR-скрининг и направленный дизайн малых молекул (Chemical IDE)",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
     parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Запустить интерактивную рабочую среду NiceGUI Chemical IDE",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=settings.ui_host,
+        help="Хост веб-сервера NiceGUI (по умолчанию из AppSettings)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=settings.ui_port,
+        help="Порт веб-сервера NiceGUI (по умолчанию 8080)",
+    )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="Запустить NiceGUI в нативном desktop-окне (pywebview)",
+    )
+    parser.add_argument(
         "-q",
         "--query",
         type=str,
-        required=True,
-        help="Запрос на естественном языке (цель, мишень, ограничения)",
+        default=None,
+        help="Запрос на естественном языке для автономного запуска в консоли",
     )
     parser.add_argument(
         "--csv",
@@ -44,6 +67,12 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.ui or not args.query:
+        from pishovichok.ui.app import run_ui
+
+        run_ui(host=args.host, port=args.port, native=args.native)
+        return
 
     print(f"[*] Запуск конвейера Pishovichok v{__version__}...")
     print(f"[*] Запрос: {args.query}")

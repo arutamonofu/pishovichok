@@ -17,7 +17,7 @@
 | **Слой 1. Вычислительный слой (Детерминированное ядро)** | Курация структур, SQL-аналитика по локальным слепкам, поиск парных соответствий (MMP), расчет SALI, генерация аналогов, расчет дескрипторов RDKit, фильтров PAINS/Brenk, ретросинтез BRICS, прогноз ADMET и скоринг Харрингтона | `rdkit>=2024.3.5`, `duckdb>=1.1.0`, `pyarrow>=17.0.0`, `pandas>=2.2.0`, `numpy>=2.0.0`, `crem>=0.2.10` (опц. / встроенный движок), `catboost>=1.2.7`, `scikit-learn>=1.5.0`, `chembl-webresource-client>=0.10.9` (опц. сетевой фолбэк), `admet-ai>=1.3.0` (опц. плагин) | **1.0 – 3.5 с** (пакетная обработка 50–350 молекул в C++ ядре RDKit и векторизованном DuckDB) |
 | **Слой 2. Слой состояния и адаптации данных (State & Adapters)** | Строгие контракты данных, разделение 4 категорий знаний, управление сессионным хранилищем Parquet («толстые указатели» / Fat Pointers), сериализация трассировки | `pydantic>=2.9.0`, `pydantic-settings>=2.5.0`, `pyarrow>=17.0.0`, `duckdb>=1.1.0` | **< 0.1 с** (передача только URI и компактных агрегатов в памяти) |
 | **Слой 3. Слой агентной оркестрации (LangGraph)** | Конечный автомат из 5 агентов, семантический парсинг запросов, условная маршрутизация, две замкнутые петли самокоррекции, синтез научных объяснений | `langgraph>=0.2.35`, `langchain-core>=0.3.10`, `langchain-openai>=0.2.2`, `httpx>=0.27.0` | **0.5 – 4.0 с** (зависит от режима LLM; **< 0.05 с** в детерминированном Rule-Based фолбэке) |
-| **Слой 4. Слой интерфейса и трассируемости (Streamlit UI)** | Диалоговое окно, загрузка CSV, визуализация графа переходов (`Explainable Trace`), 2D-рендеринг молекул и подсветка субструктур, интерактивные графики SAR и цветовая таблица 4 категорий данных | `streamlit>=1.39.0`, `plotly>=5.24.0`, `pillow>=10.4.0`, `rdkit.Chem.Draw.rdMolDraw2D` (SVG/PNG генерация без внешних рендереров) | **0.2 – 0.5 с** (векторный SVG-рендеринг топ-кандидатов и пар MMP) |
+| **Слой 4. Слой интерфейса и трассируемости (NiceGUI 4.0 Chemical IDE)** | Трёхпанельная рабочая среда: оркестрация графа + HITL-шлюз + скетчер JSME, интерактивный MPO-холст (`ui.echart`) и виртуализированная таблица (`ui.aggrid`), инспектор 2D/3D (ETKDGv3 + `3Dmol.js`) и 4-категорийного provenance | `nicegui>=4.0.0`, локальные статические ассеты `3Dmol-min.js` и `jsme`, `core/rendering.py` (`rdMolDraw2D` в `run.cpu_bound`) | **0.1 – 0.3 с** (ленивые HTTP SVG-эндпоинты с кэшированием и инкрементальные транзакции AG Grid) |
 | **Слой 5. Инфраструктурный слой (DevOps и воспроизводимость)** | Управление зависимостями, предкэшированные эталонные датасеты ChEMBL, локальная база фрагментов и весов моделей, экспорт артефактов для грантовых отчетов | `uv` (`uv_build`), `pytest>=8.3.0`, `ruff>=0.7.0`, файловый кэш `/data` (Parquet, SQLite, JSON/CBM) и `/workspace/<session_id>` | **0 с** сетевых задержек при работе по предкэшированным данным |
 
 ---
@@ -375,22 +375,21 @@ def verify_interface(
 
 ---
 
-### 3.11. Веб-интерфейс (`streamlit`, сессионное состояние, CLI-фолбэк) — Слой 4
+### 3.11. Веб-интерфейс (`nicegui>=4.0.0`, `SessionRegistry`, CLI-фолбэк) — Слой 4
 
-* **Назначение:** Интерактивное управление вычислительными сценариями, загрузка CSV, отображение журнала Explainable Trace и 4-цветной таблицы кандидатов.
+* **Назначение:** Трёхпанельная рабочая среда Chemical IDE с независимым от вкладки жизненным циклом графа агентов (переживает F5), HITL-паузами и векторным пересчётом MPO.
 * **Критичные интерфейсы:**
-  - `st.set_page_config(layout="wide")`
-  - `st.session_state` (хранение `SARGraphState`)
-  - `st.file_uploader(type=["csv"])`, `st.chat_input()`
-  - `st.components.v1.html(svg_string, height=...)`
-  - `st.download_button(...)`
+  - `SessionRegistry` и `AgentUIBridge` (`nicegui.background_tasks.create` + `asyncio.Event` HITL-шлюз)
+  - FastAPI-маршрут `GET /api/sessions/{session_id}/mol/{mol_id}/svg` с `nicegui.run.cpu_bound(...)`
+  - `ui.aggrid` с `html_columns=[0]`, `:getRowId`, `deferRender: True` и `applyTransaction`
+  - `ui.echart` (Pareto и PCA) и локальные JS-ассеты `/static` (`3Dmol-min.js`, `jsme`)
 * **Форматы входных / выходных данных:**
-  - *Вход:* Действия пользователя в браузере, загруженные файлы CSV.
-  - *Выход:* Рендеринг HTML/SVG, скачивание артефактов `trace_log.json`, `candidates_export.sdf`, `candidates_export.csv`.
+  - *Вход:* Действия пользователя в браузере, загруженные файлы CSV, SMILES/SMARTS из скетчера.
+  - *Выход:* Ленивый HTTP SVG (`image/svg+xml`), 3D MolBlock (ETKDGv3), скачивание `trace_log.json`, `ui_export.sdf`, `ui_export.csv`, `report.md`.
 * **Точки обязательной проверки интроспекцией:**
-  - Сохранение объектов сессии в `st.session_state` при повторных перерисовках (rerun).
+  - Сохранение `SARGraphState` и активной `asyncio.Task` в `SessionRegistry` при перезагрузке страницы (F5) и отписка в `client.on_disconnect`.
 * **Детерминированный локальный фолбэк:**
-  - Помимо веб-интерфейса Streamlit в проекте предусмотрена консольная точка входа `pishovichok` (`src/pishovichok/cli.py`) с идентичными аргументами, обеспечивающая автономный запуск всех 3 сценариев из терминала и в тестах.
+  - Помимо веб-интерфейса NiceGUI в проекте предусмотрена консольная точка входа `pishovichok` (`src/pishovichok/cli.py`, режим `-q`) с идентичными аргументами, обеспечивающая автономный запуск всех сценариев из терминала и в тестах.
 
 ---
 
@@ -481,11 +480,15 @@ pishovichok/
 │       │   ├── critic_node.py             # Узел 5: Critic Agent (двухфазный методологический контроль и маршрутизация петель)
 │       │   └── workflow.py                # Сборка StateGraph, регистрация условных переходов и экспорт trace_log.json
 │       │
-│       └── ui/                            # Слой 4: Интерактивный веб-интерфейс Streamlit
+│       └── ui/                            # Слой 4: NiceGUI 4.0 Chemical IDE
 │           ├── __init__.py
-│           ├── app.py                     # Главный модуль Streamlit (4 рабочих блока, пресеты 3 сценариев)
-│           ├── mol_rendering.py           # 2D-отрисовка rdMolDraw2D (SVG/PNG) с цветовой подсветкой измененных радикалов
-│           └── components.py              # Виджеты: Explainable Trace, диаграмма pIC50-LogP, таблица с 4 цветовыми зонами
+│           ├── app.py                     # Главный модуль NiceGUI (`workers=1`, 3-панельный splitter, F5-восстановление)
+│           ├── session.py                 # Серверный реестр сессий `SessionRegistry` и HITL-шлюз
+│           ├── bridge.py                  # `AgentUIBridge` для асинхронного запуска и ветвления `workflow.py`
+│           ├── routes.py                  # FastAPI-маршруты ленивого 2D SVG-рендеринга
+│           ├── state_vm.py                # `StateViewModel` с векторным пересчётом MPO
+│           ├── components/                # Модульные панели: agent_rail, mpo_canvas, candidate_grid, inspector, chem_widgets
+│           └── static/                    # Локальные JS-ассеты (3Dmol-min.js, jsme/, viewer3d.js, jsme_sketcher.js)
 │
 └── tests/                                 # Автоматические тесты детерминированного ядра и сквозных сценариев
     ├── test_core_chemistry.py             # Юнит-тесты стандартизации, SALI, rdMMPA, BRICS и индекса Харрингтона

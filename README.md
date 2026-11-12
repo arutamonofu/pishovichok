@@ -60,12 +60,12 @@ PISHOVICHOK_OLLAMA_MODEL=qwen2.5:7b
 
 ## 🖥️ Использование
 
-### Веб-интерфейс (Streamlit UI)
+### Веб-интерфейс (NiceGUI 4.0 Chemical IDE)
 
-Интерактивный дашборд с 2D-визуализацией молекулярных структур, графом Activity Cliffs, матрицей SAR и таблицей кандидатов с 4-зонной цветовой кодировкой:
+Трёхпанельная рабочая среда исследователя (оркестрация агентов & скетчер JSME, интерактивный MPO-холст `ui.echart` + виртуализированная таблица `ui.aggrid`, инспектор 2D-диффа, 3D-конформеров `3Dmol.js` и 4-категорийного provenance):
 
 ```bash
-uv run streamlit run src/pishovichok/ui/app.py
+uv run pishovichok --ui
 # или через консольную команду:
 uv run pishovichok-ui
 ```
@@ -120,7 +120,7 @@ pishovichok/
 │   ├── agents/            # Оркестратор LangGraph, узлы агентов (Research, SAR, Design, Critic, Eval)
 │   ├── core/              # Детерминированное ядро: RDKit, CReM, ADMET/CatBoost, скоринг Харрингтона
 │   ├── state/             # Схемы данных Pydantic и контракты Fat Pointers
-│   ├── ui/                # Streamlit UI, SVG-рендерер молекул и интерактивные компоненты
+│   ├── ui/                # NiceGUI 4.0 Chemical IDE (сессии, мост агентов, маршруты SVG, компоненты)
 │   ├── cli.py             # Точка входа CLI
 │   └── config.py          # Конфигурация Pydantic Settings
 ├── tests/                 # Интеграционные и модульные тесты

@@ -37,6 +37,19 @@ from pishovichok.core.generation import (
     select_parent_seeds_from_curated,
     verify_scaffold_preservation,
 )
+from pishovichok.core.rendering import (
+    COLOR_ACTIVITY_GAIN,
+    COLOR_ACTIVITY_LOSS,
+    COLOR_CORE_REFERENCE,
+    COLOR_NEUTRAL_ACCENT,
+    compute_chemical_space_projection,
+    generate_3d_conformer_molblock,
+    molecule_svg_to_data_uri,
+    render_aligned_diff_svg,
+    render_mmp_pair_svg,
+    render_mmp_pair_svgs,
+    render_molecule_svg,
+)
 from pishovichok.core.sar_analysis import (
     calculate_sali,
     canonicalize_substituent_smiles,
@@ -54,6 +67,10 @@ from pishovichok.core.scoring import (
 )
 
 __all__ = [
+    "COLOR_ACTIVITY_GAIN",
+    "COLOR_ACTIVITY_LOSS",
+    "COLOR_CORE_REFERENCE",
+    "COLOR_NEUTRAL_ACCENT",
     "CURATED_BIOISOSTERE_CATALOG",
     "BioisostereRule",
     "StandardizedMoleculeResult",
@@ -70,6 +87,7 @@ __all__ = [
     "check_structural_alerts",
     "classify_herg_risk",
     "classify_solubility",
+    "compute_chemical_space_projection",
     "compute_highlighted_atoms",
     "convert_to_pchembl",
     "count_lipinski_violations",
@@ -82,10 +100,16 @@ __all__ = [
     "extract_mmp_with_background_fallback",
     "fragment_contains_halogen",
     "fragment_molecule_mmpa",
+    "generate_3d_conformer_molblock",
     "generate_candidate_structures",
     "harrington_one_sided_desirability",
+    "molecule_svg_to_data_uri",
     "parse_activity_cell",
     "predict_admet_metrics",
+    "render_aligned_diff_svg",
+    "render_mmp_pair_svg",
+    "render_mmp_pair_svgs",
+    "render_molecule_svg",
     "select_parent_seeds_from_curated",
     "standardize_molecule_detailed",
     "standardize_smiles",
