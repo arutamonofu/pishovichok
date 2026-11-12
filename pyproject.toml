@@ -33,7 +33,7 @@ dev = [
 ]
 
 [project.scripts]
-pishovichok = "pishovichok:main"
+pishovichok = "pishovichok.cli:main"
 pishovichok-ui = "pishovichok.ui.app:run_app"
 
 [build-system]
