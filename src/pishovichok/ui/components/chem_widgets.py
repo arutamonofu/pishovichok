@@ -33,9 +33,13 @@ class MoleculeViewer3D(
         """Передаёт 3D MolBlock и индексы подсвечиваемых атомов в активный WebGL-вьюер."""
         self.run_method("loadMolBlock", molblock, list(highlight_indices or []))
 
-    def clear(self) -> None:
+    def clear_viewer(self) -> None:
         """Очищает текущую 3D-модель без пересоздания WebGL-контекста."""
-        self.run_method("clear")
+        self.run_method("clearViewer")
+
+    def clear(self) -> None:
+        """Совместимый алиас очистки текущей 3D-модели."""
+        self.clear_viewer()
 
 
 class MoleculeSketcher(

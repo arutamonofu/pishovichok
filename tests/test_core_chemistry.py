@@ -776,3 +776,20 @@ def test_scenario2_corrective_constraints_shift_molecular_profile(
             < lead_ref.pred_admet.herg_liability_prob
         )
         assert cand.mpo_harrington_score >= 0.70
+
+
+def test_clean_brics_fragment_smiles_no_isolated_h_warning(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Очистка BRICS-фрагментов не должна вызывать RDKit-предупреждение об изолированном H."""
+    from pishovichok.core.evaluation import _clean_brics_fragment_smiles
+
+    assert _clean_brics_fragment_smiles("[1*]c1ccccc1") == "c1ccccc1"
+    assert _clean_brics_fragment_smiles("[9*]n1cccc1") == "c1cc[nH]c1"
+    assert _clean_brics_fragment_smiles("[5*]N1CCN([5*])CC1") == "C1CNCCN1"
+    assert _clean_brics_fragment_smiles("[*]") is None
+    assert _clean_brics_fragment_smiles("[1*][H]") is None
+
+    captured = capfd.readouterr()
+    assert "not removing hydrogen atom without neighbors" not in captured.err
+    assert "not removing hydrogen atom without neighbors" not in captured.out

@@ -202,6 +202,8 @@ class InspectorPane:
                 self._smiles_label.set_text("Выберите строку в таблице или точку на графике")
             if self._pairwise_box is not None:
                 self._pairwise_box.clear()
+            if self._viewer3d is not None:
+                self._viewer3d.clear_viewer()
             if self._desirability_box is not None:
                 self._desirability_box.clear()
             if self._provenance_box is not None:
@@ -242,7 +244,7 @@ class InspectorPane:
             if cached_3d:
                 self._viewer3d.load_molblock(cached_3d, list(cand.highlighted_atom_indices))
             else:
-                self._viewer3d.clear()
+                self._viewer3d.clear_viewer()
 
         if self._desirability_box is not None:
             self._desirability_box.clear()

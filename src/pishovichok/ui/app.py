@@ -60,9 +60,6 @@ async def chemical_ide_page(
         runtime = session_registry.get(sid_str)
         if runtime is None:
             runtime = await session_registry.restore_from_workspace(sid_str)
-    if runtime is None and not resolved_sid:
-        # При первом входе пробуем подхватить предрасчитанный сценарий для быстрого старта
-        runtime = await session_registry.restore_from_workspace("scenario1_btk")
     if runtime is None:
         new_sid = str(resolved_sid or f"sess_{uuid.uuid4().hex[:8]}")
         runtime = session_registry.get_or_create(session_id=new_sid)
@@ -150,11 +147,19 @@ async def chemical_ide_page(
                 top_bar.refresh()
             if agent_rail is not None:
                 agent_rail.refresh()
-            if event_type in (
+            if event_type in ("pipeline_started", "branch_restarted"):
+                if candidate_grid is not None:
+                    candidate_grid.reset_rows()
+                    if event_type == "branch_restarted":
+                        candidate_grid.push_new_rows()
+                if mpo_canvas is not None:
+                    mpo_canvas.refresh(mark_pca_dirty=True)
+                if inspector is not None:
+                    inspector.refresh()
+            elif event_type in (
                 "node_completed",
                 "pipeline_completed",
                 "hitl_resumed",
-                "branch_restarted",
             ):
                 if candidate_grid is not None:
                     candidate_grid.push_new_rows()

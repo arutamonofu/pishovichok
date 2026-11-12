@@ -113,15 +113,21 @@ class MPOCanvas:
             if row is not None:
                 smiles_list.append(row.canonical_smiles)
                 targets.append(("row", row))
+        if vm.lead_reference is not None:
+            smiles_list.append(vm.lead_reference.canonical_smiles)
+            targets.append(("lead", vm))
 
         if len(smiles_list) < 2:
             self._pca_dirty = False
             return
 
         coords = await run.cpu_bound(compute_chemical_space_projection, smiles_list)
-        for (_, obj), (x, y) in zip(targets, coords, strict=False):
-            obj.pca_x = float(x)
-            obj.pca_y = float(y)
+        for (kind, obj), (x, y) in zip(targets, coords, strict=False):
+            if kind == "lead":
+                obj.lead_pca_coords = (float(x), float(y))
+            else:
+                obj.pca_x = float(x)
+                obj.pca_y = float(y)
         self._pca_dirty = False
 
     def _handle_point_click(self, e: Any) -> None:
@@ -142,26 +148,79 @@ class MPOCanvas:
         failed_pts: list[dict[str, Any]] = []
         selected_pts: list[dict[str, Any]] = []
 
+        lead_ids: set[str] = set()
+        lead_smiles_set: set[str] = set()
+        if vm.lead_reference is not None:
+            lead_ids.add(vm.lead_reference.parent_chembl_id)
+            lead_smiles_set.add(vm.lead_reference.canonical_smiles)
+        for cand in vm.candidates_by_id.values():
+            lead_ids.add(cand.parent_chembl_id)
+            lead_smiles_set.add(cand.parent_smiles)
+
         for ref in vm.reference_points:
             x_val = ref.pca_x if is_pca else ref.clogp
             y_val = ref.pca_y if is_pca else ref.pchembl_value
-            pt = {"value": [round(x_val, 3), round(y_val, 3)], "name": ref.mol_id}
-            if ref.source_group == "wetlab":
-                wetlab_pts.append(pt)
-            elif ref.source_group == "lead":
+            is_lead_ref = (
+                ref.source_group == "lead"
+                or ref.mol_id in lead_ids
+                or ref.canonical_smiles in lead_smiles_set
+            )
+            pt = {
+                "value": [round(x_val, 3), round(y_val, 3)],
+                "name": f"Lead ({ref.mol_id})" if is_lead_ref else ref.mol_id,
+            }
+            if is_lead_ref:
                 lead_pts.append(pt)
+            elif ref.source_group == "wetlab":
+                wetlab_pts.append(pt)
             else:
                 chembl_pts.append(pt)
 
-        if not lead_pts and vm.lead_reference is not None and not is_pca:
+        if not lead_pts and vm.lead_reference is not None:
             lead = vm.lead_reference
-            lead_pts.append(
-                {
-                    "value": [round(lead.calc_rdkit.clogp, 3), round(lead.pred_admet.predicted_pic50, 3)],
-                    "name": f"Lead ({lead.parent_chembl_id})",
-                    "candidate_id": lead.candidate_id,
-                }
-            )
+            if not is_pca:
+                lead_pts.append(
+                    {
+                        "value": [
+                            round(lead.calc_rdkit.clogp, 3),
+                            round(lead.pred_admet.predicted_pic50, 3),
+                        ],
+                        "name": f"Lead ({lead.parent_chembl_id})",
+                        "candidate_id": lead.candidate_id,
+                    }
+                )
+            elif vm.lead_pca_coords is not None:
+                lead_pts.append(
+                    {
+                        "value": [
+                            round(vm.lead_pca_coords[0], 3),
+                            round(vm.lead_pca_coords[1], 3),
+                        ],
+                        "name": f"Lead ({lead.parent_chembl_id})",
+                        "candidate_id": lead.candidate_id,
+                    }
+                )
+        elif not lead_pts and vm.candidates_by_id and not is_pca:
+            from rdkit import Chem
+            from rdkit.Chem import Descriptors
+
+            seen_parents: set[str] = set()
+            for cand in vm.candidates_by_id.values():
+                if cand.parent_chembl_id in seen_parents:
+                    continue
+                seen_parents.add(cand.parent_chembl_id)
+                pmol = Chem.MolFromSmiles(cand.parent_smiles)
+                if pmol is None:
+                    continue
+                lead_pts.append(
+                    {
+                        "value": [
+                            round(float(Descriptors.MolLogP(pmol)), 3),
+                            round(float(cand.parent_exp_pic50), 3),
+                        ],
+                        "name": f"Lead ({cand.parent_chembl_id})",
+                    }
+                )
 
         for cid in vm.row_order:
             row = vm.rows_by_id.get(cid)

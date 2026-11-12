@@ -159,35 +159,50 @@ def check_structural_alerts(
     return (len(pains_names), pains_names, len(brenk_names), brenk_names, glaxo_count)
 
 
+def _strip_dummy_and_isolated_h(mol: Chem.Mol) -> Chem.Mol:
+    """Заменяет связанные фиктивные атомы `[#0]` на водород и удаляет несвязанные H/фиктивные атомы."""
+    rw = Chem.RWMol(mol)
+    atoms_to_remove: list[int] = []
+    for atom in rw.GetAtoms():
+        atomic_num = atom.GetAtomicNum()
+        if atomic_num == 0:
+            if atom.GetDegree() == 0:
+                atoms_to_remove.append(atom.GetIdx())
+            else:
+                atom.SetAtomicNum(1)
+                atom.SetIsotope(0)
+                atom.SetFormalCharge(0)
+                atom.SetNoImplicit(False)
+        elif atomic_num == 1 and atom.GetDegree() == 0:
+            atoms_to_remove.append(atom.GetIdx())
+
+    for idx in sorted(atoms_to_remove, reverse=True):
+        rw.RemoveAtom(idx)
+
+    clean_mol = Chem.RemoveHs(rw.GetMol())
+    Chem.SanitizeMol(clean_mol)
+    return clean_mol
+
+
 def _clean_brics_fragment_smiles(raw_frag_smiles: str) -> str | None:
     """Очищает фрагмент BRICS от изотопных меток точек разрыва (`[1*]`, `[16*]`) и канонизирует SMILES."""
     frag_mol = Chem.MolFromSmiles(raw_frag_smiles)
     if frag_mol is not None:
-        dummy_query = Chem.MolFromSmarts("[#0]")
-        h_replacement = Chem.MolFromSmiles("[H]")
-        if dummy_query is not None and h_replacement is not None:
-            with contextlib.suppress(Exception):
-                replaced = Chem.ReplaceSubstructs(
-                    frag_mol,
-                    dummy_query,
-                    h_replacement,
-                    replaceAll=True,
+        with contextlib.suppress(Exception):
+            clean_mol = _strip_dummy_and_isolated_h(frag_mol)
+            if clean_mol.GetNumHeavyAtoms() > 0:
+                return Chem.MolToSmiles(
+                    clean_mol, canonical=True, isomericSmiles=True
                 )
-                if replaced and replaced[0] is not None:
-                    clean_mol = Chem.RemoveHs(replaced[0])
-                    Chem.SanitizeMol(clean_mol)
-                    if clean_mol.GetNumHeavyAtoms() > 0:
-                        return Chem.MolToSmiles(
-                            clean_mol, canonical=True, isomericSmiles=True
-                        )
 
-    # Текстовый фолбэк удаления фиктивных меток [n*]
+    # Текстовый фолбэк удаления фиктивных меток [n*] без удаления несвязанного H до очистки
+    parser_params = Chem.SmilesParserParams()
+    parser_params.removeHs = False
     stripped = _BRICS_DUMMY_REGEX.sub("[H]", raw_frag_smiles)
-    fallback_mol = Chem.MolFromSmiles(stripped)
+    fallback_mol = Chem.MolFromSmiles(stripped, parser_params)
     if fallback_mol is not None:
         with contextlib.suppress(Exception):
-            clean_fb = Chem.RemoveHs(fallback_mol)
-            Chem.SanitizeMol(clean_fb)
+            clean_fb = _strip_dummy_and_isolated_h(fallback_mol)
             if clean_fb.GetNumHeavyAtoms() > 0:
                 return Chem.MolToSmiles(clean_fb, canonical=True, isomericSmiles=True)
 

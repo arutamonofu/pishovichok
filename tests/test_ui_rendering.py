@@ -322,3 +322,204 @@ class TestScenarioArtifactExports:
         assert rt is not None
         assert len(rt.view_model.rows_by_id) > 0
         assert len(rt.state.get("trace_log", [])) > 0
+
+
+class TestUIComponentAndCheckpointFixes:
+    """Регрессионные тесты для 3D-вьюера и строгой msgpack-сериализации чекпоинтов."""
+
+    def test_viewer3d_clear_methods_match_js_component(self) -> None:
+        from pishovichok.ui.components.chem_widgets import MoleculeViewer3D
+
+        js_text = (_SRC_ROOT / "ui" / "static" / "viewer3d.js").read_text(
+            encoding="utf-8"
+        )
+        assert "clear()" in js_text
+        assert "clearViewer()" in js_text
+
+        called: list[tuple[str, tuple[object, ...]]] = []
+
+        class _FakeViewer(MoleculeViewer3D):
+            def __init__(self) -> None:
+                pass
+
+            def run_method(self, name: str, *args: object, **_kwargs: object) -> None:  # type: ignore[override]
+                called.append((name, args))
+
+        viewer = _FakeViewer()
+        viewer.clear_viewer()
+        viewer.clear()
+        assert called == [("clearViewer", ()), ("clearViewer", ())]
+
+    def test_checkpoint_serializer_allows_all_schema_models_without_warnings(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+        from pishovichok.state.schemas import (
+            ActivityCliff,
+            DatasetCurationSummary,
+            ParquetPointer,
+            QueryConstraints,
+            SARRule,
+            TraceEvent,
+        )
+        from pishovichok.ui.bridge import _ALLOWED_CHECKPOINT_MODULES
+
+        serde = JsonPlusSerializer(
+            allowed_msgpack_modules=_ALLOWED_CHECKPOINT_MODULES
+        )
+        saver = MemorySaver(serde=serde)
+        cand = _make_dummy_candidate("cand_ckpt_1")
+        payload = {
+            "query_constraints": QueryConstraints(scenario_type="target_based_sar"),
+            "dataset_uri": ParquetPointer(
+                uri="/tmp/curated.parquet",
+                table_type="curated_dataset",
+                row_count=1,
+                columns=[
+                    "mol_id",
+                    "canonical_smiles",
+                    "inchi_key",
+                    "scaffold_smiles",
+                    "pchembl_value",
+                    "pchembl_std",
+                    "replicate_count",
+                    "is_censored",
+                    "assay_type",
+                    "bao_format",
+                    "standard_type",
+                    "tanimoto_to_lead",
+                ],
+                sha256_checksum="0" * 64,
+            ),
+            "curation_summary": DatasetCurationSummary(
+                source_type="chembl_parquet",
+                initial_rows_count=1,
+                invalid_smiles_dropped=0,
+                salts_stripped_count=0,
+                duplicates_merged_count=0,
+                censored_values_count=0,
+                curated_molecules_count=1,
+                dominant_bao_format="BAO_0000357",
+                dominant_standard_type="IC50",
+                bao_distribution={"BAO_0000357": 1},
+                is_dataset_assay_homogeneous=True,
+            ),
+            "extracted_sar_rules": [
+                SARRule(
+                    rule_id="R1",
+                    smirks="[*:1]C>>[*:1]OC",
+                    from_fragment="*C",
+                    to_fragment="*OC",
+                    mean_delta_pic50=0.5,
+                    support_pairs_count=2,
+                    mean_delta_clogp=-0.1,
+                    mean_delta_tpsa=9.2,
+                    assay_homogeneous=True,
+                    participating_bao_formats=["BAO_0000357"],
+                )
+            ],
+            "detected_activity_cliffs": [
+                ActivityCliff(
+                    cliff_id="CL1",
+                    mol_id_active="M1",
+                    mol_id_inactive="M2",
+                    smiles_active="COc1ccccc1",
+                    smiles_inactive="c1ccccc1",
+                    pic50_active=8.0,
+                    pic50_inactive=6.0,
+                    abs_delta_pic50=2.0,
+                    tanimoto_similarity=0.9,
+                    sali_index=20.0,
+                    smirks_difference="[cH:1]>>[c:1]OC",
+                    assay_homogeneous=True,
+                )
+            ],
+            "top_candidates": [cand],
+            "trace_log": [
+                TraceEvent(
+                    step_index=0,
+                    timestamp_iso="2026-01-01T00:00:00Z",
+                    agent_name="ResearchAgent",
+                    phase="init",
+                    input_summary="in",
+                    action_taken="act",
+                    output_summary="out",
+                    duration_ms=1.0,
+                )
+            ],
+        }
+        with caplog.at_level("WARNING"):
+            blob = saver.serde.dumps_typed(payload)
+            restored = saver.serde.loads_typed(blob)
+
+        assert isinstance(restored["query_constraints"], QueryConstraints)
+        assert isinstance(restored["top_candidates"][0], CandidateMolecule)
+        assert "Deserializing unregistered type" not in caplog.text
+        assert "Blocked deserialization" not in caplog.text
+
+    def test_candidate_grid_uses_valid_nicegui_aggrid_theme(self) -> None:
+        grid_src = (_SRC_ROOT / "ui" / "components" / "candidate_grid.py").read_text(
+            encoding="utf-8"
+        )
+        assert 'theme="quartz"' in grid_src
+        assert "quartz-dark" not in grid_src
+
+    def test_mpo_canvas_plots_lead_in_pareto_and_pca_without_lead_reference(self) -> None:
+        from pishovichok.ui.components.mpo_canvas import MPOCanvas
+        from pishovichok.ui.state_vm import ReferencePointVM
+
+        reg = SessionRegistry()
+        rt = reg.get_or_create("sess_lead_plot")
+        cand = _make_dummy_candidate("cand_lead_1")
+        rt.view_model.reference_points = [
+            ReferencePointVM(
+                mol_id=cand.parent_chembl_id,
+                canonical_smiles=cand.parent_smiles,
+                pchembl_value=cand.parent_exp_pic50,
+                clogp=3.4,
+                tpsa=38.0,
+                source_group="chembl",
+                pca_x=-0.5,
+                pca_y=0.25,
+            )
+        ]
+        rt.view_model.upsert_candidates([cand])
+
+        canvas = object.__new__(MPOCanvas)
+        canvas.runtime = rt
+        canvas._mode = "pareto"
+        opts_pareto = canvas._build_chart_options()
+        lead_series_pareto = next(
+            s for s in opts_pareto["series"] if s["name"] == "Lead"
+        )
+        assert len(lead_series_pareto["data"]) == 1
+        assert lead_series_pareto["data"][0]["name"] == f"Lead ({cand.parent_chembl_id})"
+
+        canvas._mode = "pca"
+        opts_pca = canvas._build_chart_options()
+        lead_series_pca = next(s for s in opts_pca["series"] if s["name"] == "Lead")
+        assert len(lead_series_pca["data"]) == 1
+        assert lead_series_pca["data"][0]["value"] == [-0.5, 0.25]
+
+    def test_clean_startup_and_clear_session_button(self) -> None:
+        app_src = (_SRC_ROOT / "ui" / "app.py").read_text(encoding="utf-8")
+        assert 'restore_from_workspace("scenario1_btk")' not in app_src
+
+        from pishovichok.ui.components.agent_rail import TopStatusBar
+
+        reg = SessionRegistry()
+        rt = reg.get_or_create("sess_to_clear")
+        switched: list[str] = []
+
+        bar = object.__new__(TopStatusBar)
+        bar.runtime = rt
+        bar._on_session_switched = lambda sid: switched.append(sid)
+
+        async def _run() -> None:
+            await bar._handle_clear_session()
+
+        asyncio.run(_run())
+        assert len(switched) == 1
+        assert switched[0] != "sess_to_clear"

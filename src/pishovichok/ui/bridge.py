@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from nicegui import background_tasks, run
 
 from pishovichok.agents.workflow import (
@@ -42,6 +43,22 @@ from pishovichok.ui.session import (
 from pishovichok.ui.state_vm import ReferencePointVM
 
 _ALL_GRAPH_NODES = ["research", "sar", "design", "evaluation", "critic"]
+
+_ALLOWED_CHECKPOINT_MODULES: list[tuple[str, str]] = [
+    ("pishovichok.state.schemas", "ExperimentalParentFact"),
+    ("pishovichok.state.schemas", "CalcRDKitMetrics"),
+    ("pishovichok.state.schemas", "PredADMETMetrics"),
+    ("pishovichok.state.schemas", "SARHypothesisRationale"),
+    ("pishovichok.state.schemas", "CandidateMolecule"),
+    ("pishovichok.state.schemas", "ParquetPointer"),
+    ("pishovichok.state.schemas", "QueryConstraints"),
+    ("pishovichok.state.schemas", "SARRule"),
+    ("pishovichok.state.schemas", "ActivityCliff"),
+    ("pishovichok.state.schemas", "DatasetCurationSummary"),
+    ("pishovichok.state.schemas", "TraceEvent"),
+    ("pishovichok.state.schemas", "ParentSeed"),
+    ("pishovichok.state.schemas", "GeneratedRawCandidate"),
+]
 
 
 def _run_graph_chunk_sync(
@@ -331,7 +348,11 @@ class AgentUIBridge:
         """Основной цикл пошагового выполнения графа с поддержкой HITL и отмены."""
         session_id = runtime.session_id
         try:
-            checkpointer = MemorySaver()
+            checkpointer = MemorySaver(
+                serde=JsonPlusSerializer(
+                    allowed_msgpack_modules=_ALLOWED_CHECKPOINT_MODULES,
+                )
+            )
             compiled_graph = build_sar_graph(
                 checkpointer=checkpointer,
                 interrupt_after=_ALL_GRAPH_NODES,
@@ -582,6 +603,9 @@ class AgentUIBridge:
             for ref in runtime.view_model.reference_points:
                 ref_ids.append(ref.mol_id)
                 all_smiles.append(ref.canonical_smiles)
+            has_lead_ref = lead_ref is not None
+            if has_lead_ref and lead_ref is not None:
+                all_smiles.append(lead_ref.canonical_smiles)
 
             if all_smiles:
                 coords = await run.cpu_bound(
@@ -598,6 +622,10 @@ class AgentUIBridge:
                 runtime.view_model.update_pca_coordinates(
                     cand_coord_map, ref_coord_map
                 )
+                if has_lead_ref and len(coords) > n_cands + len(ref_ids):
+                    runtime.view_model.lead_pca_coords = coords[
+                        n_cands + len(ref_ids)
+                    ]
 
             await self.registry.broadcast(
                 session_id,

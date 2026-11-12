@@ -110,6 +110,9 @@ export default {
       this._viewer.zoomTo();
       this._viewer.render();
     },
+    clear() {
+      this.clearViewer();
+    },
     clearViewer() {
       if (this._viewer) {
         this._viewer.clear();

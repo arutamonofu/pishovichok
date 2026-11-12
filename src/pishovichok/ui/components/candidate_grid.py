@@ -128,8 +128,8 @@ class CandidateGrid:
             self._grid = ui.aggrid(
                 grid_options,
                 html_columns=[0],
-                theme="quartz-dark",
-            ).classes("w-full flex-1 min-h-[220px]")
+                theme="quartz",
+            ).classes("w-full flex-1 h-full min-h-[220px]")
             self._grid.on("cellClicked", self._handle_cell_clicked)
 
     def _handle_cell_clicked(self, e: Any) -> None:
@@ -140,6 +140,13 @@ class CandidateGrid:
                 cid = data.get("candidate_id")
                 if cid and self._on_candidate_selected is not None:
                     self._on_candidate_selected(str(cid))
+
+    def reset_rows(self) -> None:
+        """Очищает строки таблицы при новом запуске или перезапуске ветви."""
+        if self._grid is None:
+            return
+        self._grid.options["rowData"] = []
+        self._grid.update()
 
     def push_new_rows(self) -> None:
         """Инкрементально добавляет новые строки в таблицу через `applyTransaction`."""

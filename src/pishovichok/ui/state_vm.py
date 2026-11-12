@@ -146,6 +146,7 @@ class StateViewModel:
         self.emitted_to_grid_ids: set[str] = set()
         self.reference_points: list[ReferencePointVM] = []
         self.lead_reference: CandidateMolecule | None = None
+        self.lead_pca_coords: tuple[float, float] | None = None
         self.pinned_ids: set[str] = set()
         self.excluded_ids: set[str] = set()
         self.selected_candidate_id: str | None = None
@@ -409,4 +410,6 @@ class StateViewModel:
         self.rows_by_id.clear()
         self.row_order.clear()
         self.emitted_to_grid_ids.clear()
+        self.lead_reference = None
+        self.lead_pca_coords = None
         self.selected_candidate_id = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,13 @@ class TopStatusBar:
                     icon="folder_open",
                     on_click=self._handle_open_scenario,
                 ).props("dense flat color=emerald").classes("text-xs")
+                ui.button(
+                    "Очистить",
+                    icon="cleaning_services",
+                    on_click=self._handle_clear_session,
+                ).props("dense flat color=slate").classes("text-xs").tooltip(
+                    "Очистить рабочую область и начать новую сессию"
+                )
 
         self.refresh()
 
@@ -139,6 +147,15 @@ class TopStatusBar:
             return
         if self._on_session_switched is not None:
             res = self._on_session_switched(sid)
+            if asyncio.iscoroutine(res):
+                await res
+
+    async def _handle_clear_session(self) -> None:
+        await agent_bridge.cancel_current_run(self.runtime.session_id)
+        new_sid = f"sess_{uuid.uuid4().hex[:8]}"
+        session_registry.get_or_create(session_id=new_sid)
+        if self._on_session_switched is not None:
+            res = self._on_session_switched(new_sid)
             if asyncio.iscoroutine(res):
                 await res
 
@@ -182,9 +199,18 @@ class TopStatusBar:
 
         vm = self.runtime.view_model
         total = len(vm.rows_by_id)
-        passed = sum(1 for r in vm.rows_by_id.values() if r.pains_count == 0 and r.brenk_count == 0)
-        rejected = int(self.runtime.state.get("rejected_candidates_count", 0))
-        it = int(self.runtime.state.get("iteration_count", 0))
+        passed = sum(
+            1
+            for r in vm.rows_by_id.values()
+            if r.passes_all and r.pains_count == 0 and r.brenk_count == 0 and not r.excluded
+        )
+        rejected = total - passed
+        it = int(self.runtime.state.get("design_iteration") or 0)
+        if it == 0 and vm.candidates_by_id:
+            it = max(
+                (c.generation_iteration for c in vm.candidates_by_id.values()),
+                default=0,
+            )
         if self._counters_label is not None:
             self._counters_label.set_text(
                 f"Итер: {it} | Кандидаты: {total} (OK: {passed}) | Откл: {rejected}"
@@ -235,12 +261,13 @@ class AgentRail:
                         on_click=lambda k=sc_key: self._apply_preset(k),
                     ).props("dense outline size=sm color=emerald").classes("text-[11px]")
 
-            initial_query = str(
-                self.runtime.state.get("user_query")
-                or DEMO_SCENARIOS["scenario1_btk"]["query"]
-            )
+            initial_query = str(self.runtime.state.get("user_query") or "")
             self._query_input = (
-                ui.textarea(label="Исследовательский запрос", value=initial_query)
+                ui.textarea(
+                    label="Исследовательский запрос",
+                    value=initial_query,
+                    placeholder="Введите исследовательский запрос или выберите пресет выше...",
+                )
                 .props("outlined dark autogrow rows=2")
                 .classes("w-full text-xs")
             )
@@ -290,14 +317,16 @@ class AgentRail:
                 .classes("w-full border border-slate-800 rounded"),
                 ui.column().classes("w-full gap-2 p-2"),
             ):
+                    constraints_obj = self.runtime.state.get("query_constraints")
+                    initial_lead_smiles = (
+                        str(constraints_obj.lead_smiles)
+                        if constraints_obj is not None and constraints_obj.lead_smiles
+                        else ""
+                    )
                     self._smiles_input = (
                         ui.input(
                             label="Lead / Scaffold SMILES",
-                            value=str(
-                                self.runtime.state.get("query_constraints").lead_smiles
-                                if self.runtime.state.get("query_constraints")
-                                else ""
-                            ),
+                            value=initial_lead_smiles,
                         )
                         .props("dense outlined dark clearable")
                         .classes("w-full text-xs font-mono")
@@ -456,7 +485,7 @@ class AgentRail:
 
         if self._sar_box is not None:
             self._sar_box.clear()
-            rules = self.runtime.state.get("sar_rules", [])
+            rules = self.runtime.state.get("extracted_sar_rules", [])
             with self._sar_box:
                 for rule in rules[:4]:
                     delta = getattr(rule, "mean_delta_pic50", 0.0)
