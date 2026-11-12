@@ -12,7 +12,10 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from pishovichok.state.schemas import ToolConfig
 
 
 class BioisostereRule(NamedTuple):
@@ -663,3 +666,22 @@ CURATED_BIOISOSTERE_CATALOG: tuple[BioisostereRule, ...] = (
         heavy_atoms_added=1,
     ),
 )
+
+
+def select_bioisostere_rules(
+    tool_config: ToolConfig | None = None,
+) -> list[BioisostereRule]:
+    """Фильтрует каталог биоизостеров по `crem_mode`, `crem_min_rel_atoms` и `crem_max_rel_atoms`."""
+    if tool_config is None:
+        return list(CURATED_BIOISOSTERE_CATALOG)
+    min_rel = (
+        max(1, tool_config.crem_min_rel_atoms)
+        if tool_config.crem_mode == "grow"
+        else tool_config.crem_min_rel_atoms
+    )
+    max_rel = tool_config.crem_max_rel_atoms
+    return [
+        rule
+        for rule in CURATED_BIOISOSTERE_CATALOG
+        if min_rel <= rule.heavy_atoms_added <= max_rel
+    ]

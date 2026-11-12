@@ -25,21 +25,21 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from rdkit import Chem, DataStructs
-from rdkit.Chem import Descriptors, rdFingerprintGenerator, rdMMPA
+from rdkit import Chem
+from rdkit.Chem import Descriptors, rdMMPA
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from pishovichok.config import settings
 from pishovichok.core.curation import curate_chembl_or_csv
+from pishovichok.core.fingerprints import compute_fp_similarity, compute_mol_fingerprint
 from pishovichok.state.schemas import (
     ActivityCliff,
     ParquetPointer,
     QueryConstraints,
     SARRule,
+    ToolConfig,
 )
 from pishovichok.state.storage import read_parquet_pointer, write_parquet_pointer
-
-_MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 _SULFONYL_CANONICAL_MAP: dict[str, str] = {
     "[*:1]S(C)(=O)=O": "[*:1]S(=O)(=O)C",
@@ -110,6 +110,9 @@ def fragment_molecule_mmpa(
     max_cuts: int = 1,
     max_rgroup_heavy_atoms: int = 13,
     min_core_heavy_atoms: int = 6,
+    max_cut_bonds: int = 20,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> list[tuple[str, str, bool, int]]:
     """Выполняет фрагментацию молекулы через `rdMMPA.FragmentMol` и выделяет пары `(core, r_group)`.
 
@@ -124,7 +127,18 @@ def fragment_molecule_mmpa(
     if mol is None:
         return []
 
-    raw_fragments = rdMMPA.FragmentMol(mol, maxCuts=max_cuts, resultsAsMols=False)
+    if tool_config is not None:
+        max_cuts = tool_config.mmpa_max_cuts
+        max_cut_bonds = tool_config.mmpa_max_cut_bonds
+        max_rgroup_heavy_atoms = tool_config.max_rgroup_heavy_atoms
+        min_core_heavy_atoms = tool_config.mmpa_min_core_heavy_atoms
+
+    raw_fragments = rdMMPA.FragmentMol(
+        mol,
+        maxCuts=int(max_cuts),
+        maxCutBonds=int(max_cut_bonds),
+        resultsAsMols=False,
+    )
     results: list[tuple[str, str, bool, int]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -217,31 +231,48 @@ def extract_mmp_and_cliffs(
     curated_pointer: ParquetPointer,
     session_dir: Path | str,
     fixed_scaffold_smiles: str | None = None,
-    min_support_pairs: int = 2,
+    min_support_pairs: int | None = None,
     *,
     tanimoto_cliff_threshold: float | None = None,
     delta_pic50_cliff_threshold: float | None = None,
     sali_epsilon: float | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[ParquetPointer, list[SARRule], list[ActivityCliff]]:
     """Строит сеть парных молекулярных соответствий (`rdMMPA`), извлекает правила `SARRule`
     и детектирует критические перепады активности (`ActivityCliff`).
 
     Возвращает кортеж `(mmp_table_uri, extracted_sar_rules, detected_activity_cliffs)`.
     """
+    cfg = tool_config or ToolConfig()
+    resolved_min_support = (
+        min_support_pairs if min_support_pairs is not None else cfg.min_support_pairs
+    )
     resolved_session_dir = Path(session_dir).resolve()
     resolved_session_dir.mkdir(parents=True, exist_ok=True)
 
     cliff_sim_thresh = (
         tanimoto_cliff_threshold
         if tanimoto_cliff_threshold is not None
-        else settings.sali_tanimoto_threshold
+        else (
+            tool_config.cliff_similarity_cutoff
+            if tool_config is not None
+            else settings.sali_tanimoto_threshold
+        )
     )
     cliff_delta_thresh = (
         delta_pic50_cliff_threshold
         if delta_pic50_cliff_threshold is not None
-        else settings.sali_delta_pic50_threshold
+        else (
+            tool_config.cliff_delta_pic50_cutoff
+            if tool_config is not None
+            else settings.sali_delta_pic50_threshold
+        )
     )
-    eps = sali_epsilon if sali_epsilon is not None else settings.sali_epsilon
+    eps = (
+        sali_epsilon
+        if sali_epsilon is not None
+        else (tool_config.sali_epsilon if tool_config is not None else settings.sali_epsilon)
+    )
 
     # 1. Чтение стандартизированной выборки из ParquetPointer
     all_rows = read_parquet_pointer(curated_pointer).to_pylist()
@@ -251,7 +282,7 @@ def extract_mmp_and_cliffs(
     if fixed_scaffold_smiles:
         quant_rows = _filter_by_fixed_scaffold(quant_rows, fixed_scaffold_smiles)
 
-    # 2. Предварительный расчет графов RDKit, отпечатков Моргана, cLogP, TPSA и фрагментов rdMMPA
+    # 2. Предварительный расчет графов RDKit, отпечатков, cLogP, TPSA и фрагментов rdMMPA
     mol_records: list[dict[str, Any]] = []
     core_index: dict[str, list[tuple[int, str, bool, int]]] = defaultdict(list)
 
@@ -261,10 +292,21 @@ def extract_mmp_and_cliffs(
         if mol is None:
             continue
 
-        fp = _MORGAN_FP_GENERATOR.GetFingerprint(mol)
+        fp = compute_mol_fingerprint(
+            mol,
+            fp_type=cfg.fp_type,
+            fp_radius=cfg.fp_radius,
+            fp_nbits=cfg.fp_nbits,
+        )
         clogp = float(Descriptors.MolLogP(mol))
         tpsa = float(Descriptors.TPSA(mol))
-        frags = fragment_molecule_mmpa(mol, max_cuts=1)
+        frags = fragment_molecule_mmpa(
+            mol,
+            max_cuts=cfg.mmpa_max_cuts,
+            max_rgroup_heavy_atoms=cfg.max_rgroup_heavy_atoms,
+            min_core_heavy_atoms=cfg.mmpa_min_core_heavy_atoms,
+            max_cut_bonds=cfg.mmpa_max_cut_bonds,
+        )
 
         rec_idx = len(mol_records)
         mol_records.append(
@@ -331,7 +373,10 @@ def extract_mmp_and_cliffs(
         pic50_rhs = rhs["pchembl_value"]
         delta_pic50 = round(pic50_rhs - pic50_lhs, 4)
 
-        sim = round(float(DataStructs.TanimotoSimilarity(lhs["fp"], rhs["fp"])), 4)
+        sim = round(
+            compute_fp_similarity(lhs["fp"], rhs["fp"], metric=cfg.similarity_metric),
+            4,
+        )
         sali_val = round(calculate_sali(pic50_lhs, pic50_rhs, sim, epsilon=eps), 4)
         is_cliff = bool(
             sim >= cliff_sim_thresh and abs(delta_pic50) >= cliff_delta_thresh
@@ -383,6 +428,11 @@ def extract_mmp_and_cliffs(
     if mmp_rows:
         conn = duckdb.connect(database=":memory:")
         mmp_path_posix = Path(mmp_pointer.uri).as_posix()
+        min_delta_clause = (
+            f" AND AVG(delta_pic50) >= {float(cfg.min_mean_delta_pic50)}"
+            if cfg.prioritize_positive_rules
+            else ""
+        )
         agg_sql = f"""
             SELECT
                 smirks_transformation,
@@ -399,14 +449,34 @@ def extract_mmp_and_cliffs(
                 LIST(pair_id) AS pair_ids
             FROM read_parquet('{mmp_path_posix}')
             GROUP BY smirks_transformation, from_fragment, to_fragment
-            HAVING COUNT(*) >= {int(min_support_pairs)}
+            HAVING COUNT(*) >= {int(resolved_min_support)}{min_delta_clause}
             ORDER BY (COUNT(*) >= 3) DESC, mean_delta_pic50 DESC, support_pairs_count DESC, smirks_transformation ASC
         """
         agg_records = conn.sql(agg_sql).to_arrow_table().to_pylist()
+        if not agg_records and cfg.prioritize_positive_rules and tool_config is None:
+            # Обратная совместимость при отсутствии положительных правил без явного ToolConfig
+            fallback_sql = f"""
+                SELECT
+                    smirks_transformation,
+                    from_fragment,
+                    to_fragment,
+                    COUNT(*) AS support_pairs_count,
+                    AVG(delta_pic50) AS mean_delta_pic50,
+                    COALESCE(STDDEV_SAMP(delta_pic50), 0.0) AS std_delta_pic50,
+                    AVG(delta_clogp) AS mean_delta_clogp,
+                    AVG(delta_tpsa) AS mean_delta_tpsa,
+                    BOOL_AND(pair_assay_homogeneous) AS all_pairs_homog,
+                    LIST_SORT(LIST_DISTINCT(LIST_CONCAT(LIST(bao_lhs), LIST(bao_rhs)))) AS bao_formats,
+                    LIST_SORT(LIST_DISTINCT(LIST_CONCAT(LIST(standard_type_lhs), LIST(standard_type_rhs)))) AS std_types,
+                    LIST(pair_id) AS pair_ids
+                FROM read_parquet('{mmp_path_posix}')
+                GROUP BY smirks_transformation, from_fragment, to_fragment
+                HAVING COUNT(*) >= {int(resolved_min_support)}
+                ORDER BY (COUNT(*) >= 3) DESC, mean_delta_pic50 DESC, support_pairs_count DESC, smirks_transformation ASC
+            """
+            agg_records = conn.sql(fallback_sql).to_arrow_table().to_pylist()
 
-        # Приоритет отдается положительным правилам (ΔpIC50 > 0); если все <= 0, возвращаем все с support >= min_support_pairs
-        positive_agg = [r for r in agg_records if float(r["mean_delta_pic50"]) > 0.0]
-        selected_agg = positive_agg if positive_agg else agg_records
+        selected_agg = agg_records
 
         for rule_idx, rec in enumerate(selected_agg, start=1):
             bao_list = [str(b) for b in (rec["bao_formats"] or [])]
@@ -446,7 +516,9 @@ def extract_mmp_and_cliffs(
             if rec_i["canonical_smiles"] == rec_j["canonical_smiles"]:
                 continue
 
-            sim = float(DataStructs.TanimotoSimilarity(rec_i["fp"], rec_j["fp"]))
+            sim = compute_fp_similarity(
+                rec_i["fp"], rec_j["fp"], metric=cfg.similarity_metric
+            )
             if sim < cliff_sim_thresh:
                 continue
 
@@ -512,48 +584,66 @@ def extract_mmp_with_background_fallback(
     curated_pointer: ParquetPointer,
     session_dir: Path | str,
     fixed_scaffold_smiles: str | None = None,
-    min_support_pairs: int = 2,
-    background_target_id: str = "CHEMBL203",
+    min_support_pairs: int | None = None,
+    background_target_id: str | None = None,
     min_rules_threshold: int | None = None,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[ParquetPointer, list[SARRule], list[ActivityCliff], bool]:
     """Обертка над `extract_mmp_and_cliffs` с автоматическим обогащением фоновыми правилами ChEMBL.
 
     Реализует детерминированный фолбэк из Раздела 3.3 и 6.3 ARCHITECTURE.md для Сценария 3:
-    если в загруженной малой лабораторной серии CSV найдено менее `min_rules_threshold` (по умолч. 3)
+    если в загруженной малой лабораторной серии CSV найдено менее `min_rules_threshold`
     статистически значимых правил SAR, автоматически извлекаются гомогенные правила MMP
     по целевой мишени из локального кэша `/data/chembl/` и выставляется флаг
     `enriched_with_chembl_background = True`.
     """
+    cfg = tool_config or ToolConfig()
+    resolved_min_support = (
+        min_support_pairs if min_support_pairs is not None else cfg.min_support_pairs
+    )
+    resolved_bg_target = (
+        background_target_id
+        if background_target_id is not None
+        else cfg.background_target_id
+    )
     mmp_ptr, rules, cliffs = extract_mmp_and_cliffs(
         curated_pointer=curated_pointer,
         session_dir=session_dir,
         fixed_scaffold_smiles=fixed_scaffold_smiles,
-        min_support_pairs=min_support_pairs,
+        min_support_pairs=resolved_min_support,
+        tool_config=cfg,
     )
 
     thresh = (
         min_rules_threshold
         if min_rules_threshold is not None
-        else settings.min_sar_rules_before_enrichment
+        else (
+            tool_config.min_rules_before_enrichment
+            if tool_config is not None
+            else settings.min_sar_rules_before_enrichment
+        )
     )
-    if len(rules) >= thresh:
+    if len(rules) >= thresh or thresh <= 0:
         return (mmp_ptr, rules, cliffs, False)
 
     # Фоновое обогащение из локального слепка ChEMBL в изолированном временном буфере
     with tempfile.TemporaryDirectory() as bg_tmp:
         bg_constraints = QueryConstraints(
             scenario_type="target_based_sar",
-            target_chembl_id=background_target_id,
+            target_chembl_id=resolved_bg_target,
         )
         _raw_bg_ptr, cur_bg_ptr, _bg_summary = curate_chembl_or_csv(
             session_dir=Path(bg_tmp),
             constraints=bg_constraints,
             assay_filter_strict=True,
+            tool_config=cfg,
         )
         _bg_mmp_ptr, bg_rules, _bg_cliffs = extract_mmp_and_cliffs(
             curated_pointer=cur_bg_ptr,
             session_dir=Path(bg_tmp),
-            min_support_pairs=min_support_pairs,
+            min_support_pairs=resolved_min_support,
+            tool_config=cfg,
         )
 
     existing_smirks = {r.smirks for r in rules}

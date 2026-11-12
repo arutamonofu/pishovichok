@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import re
 import socket
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field
+from rdkit.Chem import Descriptors
 
 from pishovichok.agents.prompts import (
     CRITIC_CORRECTIVE_SYSTEM_PROMPT,
@@ -27,11 +28,143 @@ from pishovichok.agents.prompts import (
 )
 from pishovichok.config import settings
 from pishovichok.state.schemas import (
+    ADMETBackendLiteral,
     CandidateMolecule,
     DatasetCurationSummary,
+    FilterCatalogLiteral,
     QueryConstraints,
     SARRule,
+    ToolConfig,
 )
+
+_KNOWN_RDKIT_DESCRIPTOR_NAMES: frozenset[str] = frozenset(
+    name for name, _fn in Descriptors._descList
+)
+
+
+class MPOWeightsOverride(BaseModel):
+    """Частичное переопределение весов MPO Харрингтона в структурированном выводе LLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pic50: float | None = None
+    logp: float | None = None
+    sascore: float | None = None
+    qed: float | None = None
+    tpsa: float | None = None
+    logs: float | None = None
+    herg: float | None = None
+
+
+class ToolConfigOverrides(BaseModel):
+    """Строгая схема извлекаемых из NL-запроса переопределений настроек ToolConfig."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 1. Курация
+    allowed_bao_formats: list[str] | None = None
+    standard_types: list[str] | None = None
+    relation_mode: Literal["exact_only", "include_censored"] | None = None
+    pchembl_min_cutoff: float | None = None
+    duplicate_agg_method: Literal["median", "mean", "max"] | None = None
+    max_duplicate_std: float | None = None
+    strip_salts: bool | None = None
+    neutralize_charges: bool | None = None
+    canonicalize_tautomers: bool | None = None
+    keep_chirality: bool | None = None
+    scaffold_mode: Literal["bemis_murcko", "generic_framework"] | None = None
+    chembl_api_limit: int | None = None
+    min_neighborhood_rows_fallback: int | None = None
+    top_scaffolds_limit: int | None = None
+
+    # 2. SAR и SALI
+    mmpa_max_cuts: Literal[1, 2, 3] | None = None
+    mmpa_max_cut_bonds: int | None = None
+    min_support_pairs: int | None = None
+    min_mean_delta_pic50: float | None = None
+    max_rgroup_heavy_atoms: int | None = None
+    mmpa_min_core_heavy_atoms: int | None = None
+    fp_type: Literal["ecfp", "fcfp", "rdkit", "maccs"] | None = None
+    fp_radius: Literal[1, 2, 3] | None = None
+    fp_nbits: Literal[1024, 2048, 4096] | None = None
+    similarity_metric: Literal["tanimoto", "dice", "cosine"] | None = None
+    cliff_similarity_cutoff: float | None = None
+    cliff_delta_pic50_cutoff: float | None = None
+    sali_epsilon: float | None = None
+    min_rules_before_enrichment: int | None = None
+    background_target_id: str | None = None
+    prioritize_positive_rules: bool | None = None
+
+    # 3. Генерация и биоизостеры
+    generation_engine: Literal["mmp_and_crem", "mmp_only", "crem_only"] | None = None
+    crem_mode: Literal["mutate", "grow"] | None = None
+    crem_context_radius: Literal[1, 2, 3] | None = None
+    crem_min_rel_atoms: int | None = None
+    crem_max_rel_atoms: int | None = None
+    crem_max_replacements: int | None = None
+    freeze_murcko_core: bool | None = None
+    protected_smarts: str | None = None
+    modifiable_atom_indices: list[int] | None = None
+    neighborhood_tanimoto: float | None = None
+    max_candidates_pool: int | None = None
+    top_k_output: int | None = None
+    max_parent_seeds: int | None = None
+    use_bioisostere_catalog: bool | None = None
+    bioisostere_fallback_threshold: int | None = None
+    crem_max_fragment_heavy_atoms: int | None = None
+
+    # 4. Оценка, дескрипторы, фильтры, BRICS, ADMET, MPO и 3D
+    active_filter_catalogs: list[FilterCatalogLiteral] | None = None
+    custom_ban_smarts: list[str] | None = None
+    extra_rdkit_descriptors: list[str] | None = None
+    brenk_ignore_long_chain: bool | None = None
+    brics_min_fragment_size: int | None = None
+    brics_only_leaf_nodes: bool | None = None
+    admet_backend: ADMETBackendLiteral | None = None
+    cns_profile_mode: (
+        Literal["peripheral_low_bbb", "cns_high_bbb", "neutral"] | None
+    ) = None
+    alert_penalty_mode: Literal["veto", "soft_penalty", "ignore"] | None = None
+    alert_soft_multiplier: float | None = None
+    mpo_weights: MPOWeightsOverride | None = None
+    etkdg_variant: Literal["ETKDGv3", "ETKDGv2"] | None = None
+    force_field: Literal["MMFF94s", "MMFF94", "UFF", "none"] | None = None
+    num_conformers: int | None = None
+    lipinski_mw_cutoff: float | None = None
+    lipinski_logp_cutoff: float | None = None
+    lipinski_hbd_cutoff: int | None = None
+    lipinski_hba_cutoff: int | None = None
+    conformer_opt_max_iters: int | None = None
+
+    # 5. Оркестрация
+    max_iterations: int | None = None
+    max_refilter_iterations: int | None = None
+    strict_assay_homogeneity: bool | None = None
+    strict_property_thresholds: bool | None = None
+
+    def to_override_dict(self) -> dict[str, Any]:
+        """Преобразует непустые переопределения в словарь для ToolConfig.apply_overrides."""
+        raw = self.model_dump(mode="python", exclude_none=True)
+        if isinstance(raw.get("mpo_weights"), dict):
+            weights = {
+                k: float(v) for k, v in raw["mpo_weights"].items() if v is not None
+            }
+            if weights:
+                raw["mpo_weights"] = weights
+            else:
+                raw.pop("mpo_weights", None)
+        return raw
+
+
+class ParsedQueryWithConfig(BaseModel):
+    """Объединенный структурированный вывод парсера NL-запроса."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    constraints: QueryConstraints
+    tool_config_overrides: ToolConfigOverrides = Field(
+        default_factory=ToolConfigOverrides
+    )
 
 
 class CorrectiveDesignDirective(BaseModel):
@@ -96,17 +229,47 @@ class LLMAdapter:
         self.force_rule_based = settings.force_rule_based_llm
 
     # ========================================================================
-    # 1. СЕМАНТИЧЕСКИЙ РАЗБОР ВХОДНОГО ЗАПРОСА В QueryConstraints
+    # 1. СЕМАНТИЧЕСКИЙ РАЗБОР ВХОДНОГО ЗАПРОСА В QueryConstraints + ToolConfig
     # ========================================================================
-    def parse_query_constraints(
+    @staticmethod
+    def _sync_constraints_and_tool_overrides(
+        constraints: QueryConstraints,
+        overrides: dict[str, Any],
+    ) -> tuple[QueryConstraints, dict[str, Any]]:
+        """Синхронизирует пересекающиеся настройки QueryConstraints и ToolConfigOverrides."""
+        synced_overrides = dict(overrides)
+        c_updates: dict[str, Any] = {}
+
+        if "freeze_murcko_core" in synced_overrides:
+            c_updates["freeze_scaffold"] = bool(synced_overrides["freeze_murcko_core"])
+        elif not constraints.freeze_scaffold:
+            synced_overrides["freeze_murcko_core"] = False
+
+        if "top_k_output" in synced_overrides:
+            top_v = int(synced_overrides["top_k_output"])
+            if 1 <= top_v <= 20:
+                c_updates["top_k_candidates"] = top_v
+        elif constraints.top_k_candidates != 5:
+            synced_overrides["top_k_output"] = constraints.top_k_candidates
+
+        if synced_overrides.get("alert_penalty_mode") == "ignore":
+            c_updates["require_no_pains"] = False
+        elif not constraints.require_no_pains and "alert_penalty_mode" not in synced_overrides:
+            synced_overrides["alert_penalty_mode"] = "ignore"
+
+        if c_updates:
+            constraints = constraints.model_copy(update=c_updates)
+        return constraints, synced_overrides
+
+    def parse_query_with_tool_config(
         self,
         user_query: str,
         uploaded_csv_path: str | None = None,
-    ) -> tuple[QueryConstraints, str | None]:
-        """Парсит запрос пользователя на естественном языке в типизированную схему `QueryConstraints`.
+    ) -> tuple[QueryConstraints, dict[str, Any], str | None]:
+        """Парсит запрос пользователя в `(QueryConstraints, tool_config_overrides, fallback_triggered)`."""
+        # Детерминированный экстрактор работает всегда как страховка для точных технических флагов
+        det_overrides = self._deterministic_parse_tool_config(user_query)
 
-        Возвращает кортеж `(constraints, fallback_triggered)`.
-        """
         # Уровень 1: Облачный API (OpenAI / DeepSeek / vLLM)
         if not self.force_rule_based and self.openai_api_key:
             try:
@@ -119,9 +282,10 @@ class LLMAdapter:
                     base_url=self.openai_base_url,
                     temperature=0.0,
                     timeout=self.timeout_seconds,
+                    max_retries=0,
                 )
                 structured_llm = llm.with_structured_output(
-                    QueryConstraints,
+                    ParsedQueryWithConfig,
                     method="json_schema",
                     strict=True,
                 )
@@ -138,8 +302,15 @@ class LLMAdapter:
                         ),
                     ]
                 )
-                if isinstance(res, QueryConstraints):
-                    return res, None
+                if isinstance(res, ParsedQueryWithConfig):
+                    merged_overrides = {
+                        **res.tool_config_overrides.to_override_dict(),
+                        **det_overrides,
+                    }
+                    c, synced = self._sync_constraints_and_tool_overrides(
+                        res.constraints, merged_overrides
+                    )
+                    return c, synced, None
             except Exception:  # noqa: BLE001, S110
                 pass
 
@@ -159,7 +330,7 @@ class LLMAdapter:
                     timeout=self.timeout_seconds,
                 )
                 structured_ollama = ollama_llm.with_structured_output(
-                    QueryConstraints,
+                    ParsedQueryWithConfig,
                     method="function_calling",
                 )
                 res = structured_ollama.invoke(
@@ -168,8 +339,15 @@ class LLMAdapter:
                         HumanMessage(content=f"Запрос исследователя: {user_query}"),
                     ]
                 )
-                if isinstance(res, QueryConstraints):
-                    return res, "ollama_local_llm"
+                if isinstance(res, ParsedQueryWithConfig):
+                    merged_overrides = {
+                        **res.tool_config_overrides.to_override_dict(),
+                        **det_overrides,
+                    }
+                    c, synced = self._sync_constraints_and_tool_overrides(
+                        res.constraints, merged_overrides
+                    )
+                    return c, synced, "ollama_local_llm"
             except Exception:  # noqa: BLE001, S110
                 pass
 
@@ -177,7 +355,21 @@ class LLMAdapter:
         deterministic_constraints = self._deterministic_parse_query(
             user_query, uploaded_csv_path
         )
-        return deterministic_constraints, "deterministic_rule_based_engine"
+        c, synced = self._sync_constraints_and_tool_overrides(
+            deterministic_constraints, det_overrides
+        )
+        return c, synced, "deterministic_rule_based_engine"
+
+    def parse_query_constraints(
+        self,
+        user_query: str,
+        uploaded_csv_path: str | None = None,
+    ) -> tuple[QueryConstraints, str | None]:
+        """Совместимый контракт разбора запроса: возвращает `(QueryConstraints, fallback_triggered)`."""
+        constraints, _overrides, fallback = self.parse_query_with_tool_config(
+            user_query, uploaded_csv_path
+        )
+        return constraints, fallback
 
     def _deterministic_parse_query(
         self,
@@ -282,11 +474,20 @@ class LLMAdapter:
             if 1 <= parsed_k <= 20:
                 top_k = parsed_k
 
+        # 9. Явное отключение фиксации скаффолда
+        freeze_scaffold = not (
+            "не фиксируй скаффолд" in text_lower
+            or "не сохраняй каркас" in text_lower
+            or "разморозить скаффолд" in text_lower
+            or "freeze_murcko_core=false" in text_lower
+            or "freeze_scaffold=false" in text_lower
+        )
+
         return QueryConstraints(
             scenario_type=scenario_type,
             target_chembl_id=target_chembl_id,
             lead_smiles=lead_smiles,
-            freeze_scaffold=True,
+            freeze_scaffold=freeze_scaffold,
             min_logp=min_logp,
             max_logp=max_logp,
             max_sa_score=max_sa_score,
@@ -296,6 +497,534 @@ class LLMAdapter:
             preferred_substituent_types=["any"],
         )
 
+    def _deterministic_parse_tool_config(self, user_query: str) -> dict[str, Any]:
+        """Детерминированно извлекает явно упомянутые настройки ToolConfig из текста запроса."""
+        text = user_query.strip()
+        text_lower = text.lower()
+        overrides: dict[str, Any] = {}
+
+        # --- 1. Курация ---
+        bao_codes = re.findall(r"\b(BAO_\d+)\b", text, re.IGNORECASE)
+        if bao_codes:
+            overrides["allowed_bao_formats"] = list(
+                dict.fromkeys(c.upper() for c in bao_codes)
+            )
+
+        if (
+            "standard_types" in text_lower
+            or "только ki" in text_lower
+            or "только ic50" in text_lower
+            or "только ec50" in text_lower
+            or "только kd" in text_lower
+            or "типы активности" in text_lower
+            or "измерениях" in text_lower
+            or "измерения " in text_lower
+            or re.search(r"\bпо\s+(?:ic50|ki|kd|ec50)\b", text_lower)
+        ):
+            stypes = re.findall(r"\b(IC50|Ki|Kd|EC50)\b", text)
+            if stypes:
+                overrides["standard_types"] = list(dict.fromkeys(stypes))
+
+        if (
+            "exact_only" in text_lower
+            or "только точные" in text_lower
+            or "без цензурир" in text_lower
+        ):
+            overrides["relation_mode"] = "exact_only"
+        elif "include_censored" in text_lower or "включая цензурир" in text_lower:
+            overrides["relation_mode"] = "include_censored"
+
+        m_pchembl = re.search(
+            r"(?:pchembl_min_cutoff|min_pchembl|pchembl)\s*(?:>=|>|не\s*ниже|от|=|:)?\s*(\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if m_pchembl:
+            overrides["pchembl_min_cutoff"] = float(m_pchembl.group(1))
+
+        if (
+            "duplicate_agg_method=mean" in text_lower
+            or "агрег" in text_lower
+            and "средн" in text_lower
+            or "по среднему" in text_lower
+        ):
+            overrides["duplicate_agg_method"] = "mean"
+        elif (
+            "duplicate_agg_method=max" in text_lower
+            or "агрег" in text_lower
+            and "максим" in text_lower
+            or "по максимуму" in text_lower
+        ):
+            overrides["duplicate_agg_method"] = "max"
+        elif "duplicate_agg_method=median" in text_lower:
+            overrides["duplicate_agg_method"] = "median"
+
+        m_dup_std = re.search(
+            r"(?:max_duplicate_std|разброс\s*дубликат\w*|std\s*дубликат\w*)\s*(?:<=|<|=|:)?\s*(\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if m_dup_std:
+            overrides["max_duplicate_std"] = float(m_dup_std.group(1))
+
+        if (
+            "не удаляй соли" in text_lower
+            or "не удалять соли" in text_lower
+            or "сохраняй соли" in text_lower
+            or "strip_salts=false" in text_lower
+        ):
+            overrides["strip_salts"] = False
+        if (
+            "не нейтрализуй" in text_lower
+            or "сохраняй заряды" in text_lower
+            or "neutralize_charges=false" in text_lower
+        ):
+            overrides["neutralize_charges"] = False
+        if (
+            "не канонизируй таутомер" in text_lower
+            or "без канонизации таутомеров" in text_lower
+            or "canonicalize_tautomers=false" in text_lower
+        ):
+            overrides["canonicalize_tautomers"] = False
+        if (
+            "без хиральности" in text_lower
+            or "удали стереохим" in text_lower
+            or "удали хиральность" in text_lower
+            or "keep_chirality=false" in text_lower
+        ):
+            overrides["keep_chirality"] = False
+
+        if (
+            re.search(r"\bgeneric[\s_-]*framework\b", text_lower)
+            or "общий граф скаффолд" in text_lower
+            or "универсальный каркас" in text_lower
+        ):
+            overrides["scaffold_mode"] = "generic_framework"
+
+        # --- 2. SAR и SALI ---
+        m_cuts = re.search(
+            r"(?:mmpa_max_cuts\s*(?:=|:)?\s*|макс\.?\s*)([123])(?:\s*(?:разрез\w*|cuts?))?",
+            text_lower,
+        ) or re.search(r"\b([123])\s*(?:разрез\w*|cuts?)\b", text_lower)
+        if m_cuts and ("mmpa_max_cuts" in text_lower or "разрез" in text_lower or "cut" in text_lower):
+            overrides["mmpa_max_cuts"] = int(m_cuts.group(1))
+
+        m_bonds = re.search(
+            r"(?:mmpa_max_cut_bonds|max_cut_bonds)\s*(?:=|:)?\s*(\d+)", text_lower
+        )
+        if m_bonds:
+            overrides["mmpa_max_cut_bonds"] = int(m_bonds.group(1))
+
+        m_sup = re.search(
+            r"(?:min_support_pairs\s*(?:=|:)?\s*|минимум\s+|не\s*менее\s+)(\d+)\s*(?:подтверждающ\w*\s*)?пар",
+            text_lower,
+        ) or re.search(r"min_support_pairs\s*(?:=|:)?\s*(\d+)", text_lower)
+        if m_sup:
+            overrides["min_support_pairs"] = int(m_sup.group(1))
+
+        m_dpic = re.search(
+            r"(?:min_mean_delta_pic50|мин\.?\s*(?:средн\w*\s*)?(?:delta|Δ)_?pic50)\s*(?:>=|>|=|:)?\s*([+-]?\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if m_dpic:
+            overrides["min_mean_delta_pic50"] = float(m_dpic.group(1))
+
+        m_rg = re.search(
+            r"(?:max_rgroup_heavy_atoms|макс\.?\s*тяж[её]л\w*\s*атомов\s*(?:в\s*)?r-?групп\w*)\s*(?:<=|=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_rg:
+            overrides["max_rgroup_heavy_atoms"] = int(m_rg.group(1))
+
+        m_core_ha = re.search(
+            r"(?:mmpa_min_core_heavy_atoms|мин\.?\s*атомов\s*ядра)\s*(?:>=|=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_core_ha:
+            overrides["mmpa_min_core_heavy_atoms"] = int(m_core_ha.group(1))
+
+        if "ecfp6" in text_lower:
+            overrides["fp_type"] = "ecfp"
+            overrides["fp_radius"] = 3
+        elif "ecfp4" in text_lower:
+            overrides["fp_type"] = "ecfp"
+            overrides["fp_radius"] = 2
+        elif "ecfp2" in text_lower:
+            overrides["fp_type"] = "ecfp"
+            overrides["fp_radius"] = 1
+        elif "fcfp6" in text_lower:
+            overrides["fp_type"] = "fcfp"
+            overrides["fp_radius"] = 3
+        elif "fcfp4" in text_lower:
+            overrides["fp_type"] = "fcfp"
+            overrides["fp_radius"] = 2
+        elif "fcfp" in text_lower:
+            overrides["fp_type"] = "fcfp"
+        elif re.search(r"\bmaccs\b", text_lower):
+            overrides["fp_type"] = "maccs"
+        elif re.search(
+            r"(?:\brdkit\s*(?:fp|фингерпринт\w*|fingerprint\w*)|fp_type\s*(?:=|:)\s*rdkit\b)",
+            text_lower,
+        ):
+            overrides["fp_type"] = "rdkit"
+
+        m_rad = re.search(
+            r"(?:fp_radius|радиус\s*(?:фингерпринт\w*|морган\w*|fp))\s*(?:=|:)?\s*([123])",
+            text_lower,
+        )
+        if m_rad:
+            overrides["fp_radius"] = int(m_rad.group(1))
+
+        m_bits = re.search(
+            r"(?:fp_nbits\s*(?:=|:)?\s*(1024|2048|4096)|\b(1024|2048|4096)\s*(?:бит|bits?)\b)",
+            text_lower,
+        )
+        if m_bits:
+            bits_val = int(m_bits.group(1) or m_bits.group(2))
+            overrides["fp_nbits"] = bits_val
+
+        if re.search(r"(?:\bdice\b|дайс)", text_lower):
+            overrides["similarity_metric"] = "dice"
+        elif re.search(r"(?:\bcosine\b|косинус)", text_lower):
+            overrides["similarity_metric"] = "cosine"
+        elif re.search(
+            r"(?:similarity_metric\s*(?:=|:)\s*tanimoto|метрик\w*\s*танимото)",
+            text_lower,
+        ):
+            overrides["similarity_metric"] = "tanimoto"
+
+        m_csim = re.search(
+            r"(?:cliff_similarity_cutoff|cliff[\s_]*sim(?:ilarity)?|порог\s*сходства\s*(?:клиффов|sali))\s*(?:>=|>|=|:)?\s*(0?\.\d+|1\.0)",
+            text_lower,
+        )
+        if m_csim:
+            overrides["cliff_similarity_cutoff"] = float(m_csim.group(1))
+
+        m_cdelta = re.search(
+            r"(?:cliff_delta_pic50_cutoff|порог\s*(?:перепада|дельта)\s*sali)\s*(?:>=|>|=|:)?\s*(\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if m_cdelta:
+            overrides["cliff_delta_pic50_cutoff"] = float(m_cdelta.group(1))
+
+        m_eps = re.search(
+            r"(?:sali[\s_]*epsilon|epsilon\s*sali|эпсилон\s*sali)\s*(?:=|:)?\s*(\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if m_eps:
+            overrides["sali_epsilon"] = float(m_eps.group(1))
+
+        # --- 3. Генерация и биоизостеры ---
+        if re.search(r"\bmmp[\s_-]*only\b", text_lower) or "только mmp" in text_lower:
+            overrides["generation_engine"] = "mmp_only"
+        elif re.search(r"\bcrem[\s_-]*only\b", text_lower) or "только crem" in text_lower:
+            overrides["generation_engine"] = "crem_only"
+        elif re.search(r"\bmmp[\s_-]*and[\s_-]*crem\b", text_lower):
+            overrides["generation_engine"] = "mmp_and_crem"
+
+        if (
+            "crem_mode=grow" in text_lower
+            or "режим grow" in text_lower
+            or "выращивани" in text_lower
+            or (re.search(r"\bgrow\b", text_lower) and ("crem" in text_lower or "radius" in text_lower))
+        ):
+            overrides["crem_mode"] = "grow"
+        elif "crem_mode=mutate" in text_lower or "режим mutate" in text_lower:
+            overrides["crem_mode"] = "mutate"
+
+        m_crad = re.search(
+            r"(?:crem_context_radius|crem\s*(?:радиус|radius)|\bradius\b)\s*(?:=|:)?\s*([123])",
+            text_lower,
+        )
+        if m_crad:
+            overrides["crem_context_radius"] = int(m_crad.group(1))
+
+        m_crem_min = re.search(
+            r"crem_min_rel_atoms\s*(?:=|:)?\s*([+-]?\d+)", text_lower
+        )
+        if m_crem_min:
+            overrides["crem_min_rel_atoms"] = int(m_crem_min.group(1))
+
+        m_crem_max = re.search(
+            r"crem_max_rel_atoms\s*(?:=|:)?\s*([+-]?\d+)", text_lower
+        )
+        if m_crem_max:
+            overrides["crem_max_rel_atoms"] = int(m_crem_max.group(1))
+
+        m_crem_rep = re.search(
+            r"crem_max_replacements\s*(?:=|:)?\s*(\d+)", text_lower
+        )
+        if m_crem_rep:
+            overrides["crem_max_replacements"] = int(m_crem_rep.group(1))
+
+        if (
+            "не фиксируй скаффолд" in text_lower
+            or "не замораживать скаффолд" in text_lower
+            or "не сохраняй каркас" in text_lower
+            or "разморозить скаффолд" in text_lower
+            or "freeze_murcko_core=false" in text_lower
+        ):
+            overrides["freeze_murcko_core"] = False
+
+        m_prot = re.search(
+            r"(?:protected[\s_]*smarts|защищ\w*\s*smarts|фиксир\w*\s*smarts)\s*(?:=|:)?\s*['\"]?([A-Za-z0-9@+\-\[\]\(\)=#:\*\\/]+)['\"]?",
+            text,
+            re.IGNORECASE,
+        )
+        if m_prot:
+            overrides["protected_smarts"] = m_prot.group(1).strip()
+
+        m_mod = re.search(
+            r"(?:modifiable_atom_indices|модифицируем\w*\s*индекс\w*\s*атом\w*|модифицируем\w*\s*атом\w*)\s*(?:=|:)?\s*\[?(\d+(?:\s*,\s*\d+)*)\]?",
+            text_lower,
+        )
+        if m_mod:
+            overrides["modifiable_atom_indices"] = [
+                int(x.strip()) for x in m_mod.group(1).split(",") if x.strip()
+            ]
+
+        m_nt = re.search(
+            r"(?:neighborhood_tanimoto|окрестност\w*\s*(?:лидера|танимото))\s*(?:>=|>|=|:)?\s*(0?\.\d+|1\.0)",
+            text_lower,
+        )
+        if m_nt:
+            overrides["neighborhood_tanimoto"] = float(m_nt.group(1))
+
+        m_pool = re.search(
+            r"(?:max_candidates_pool|размер\s*пула\s*кандидатов|пул\s*кандидатов)\s*(?:=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_pool:
+            overrides["max_candidates_pool"] = int(m_pool.group(1))
+
+        m_seeds = re.search(
+            r"(?:max_parent_seeds|родительских\s*структур|число\s*родителе\w*)\s*(?:=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_seeds:
+            overrides["max_parent_seeds"] = int(m_seeds.group(1))
+
+        m_topk = re.search(
+            r"(?:top_k_output\s*(?:=|:)?\s*(\d+)|\b(?:топ|top)\s*-?\s*(\d+)(?:\s*(?:кандидат\w*|молекул\w*|структур\w*))?)",
+            text_lower,
+        )
+        if m_topk:
+            topk_val = int(m_topk.group(1) or m_topk.group(2))
+            if 1 <= topk_val <= 50:
+                overrides["top_k_output"] = topk_val
+
+        if (
+            "без биоизостеров" in text_lower
+            or "отключи биоизостеры" in text_lower
+            or "use_bioisostere_catalog=false" in text_lower
+        ):
+            overrides["use_bioisostere_catalog"] = False
+
+        # --- 4. Фильтры, дескрипторы, BRICS, ADMET, MPO, 3D ---
+        catalog_tokens: list[FilterCatalogLiteral] = []
+        has_extra_catalog = False
+        for cat_name in ("Glaxo", "SureChEMBL", "NIH", "ZINC"):
+            if re.search(rf"\b{cat_name}\b", text, re.IGNORECASE):
+                has_extra_catalog = True
+                catalog_tokens.append(cat_name)
+        for cat_name in ("PAINS_A", "PAINS_B", "PAINS_C", "Brenk"):
+            if re.search(rf"\b{cat_name}\b", text, re.IGNORECASE):
+                catalog_tokens.append(cat_name)
+        if re.search(r"\bPAINS\b", text, re.IGNORECASE) and not any(
+            p in catalog_tokens for p in ("PAINS_A", "PAINS_B", "PAINS_C")
+        ):
+            catalog_tokens.extend(["PAINS_A", "PAINS_B", "PAINS_C"])
+
+        explicit_catalog_cmd = (
+            has_extra_catalog
+            or "active_filter_catalogs" in text_lower
+            or "каталог" in text_lower
+            or "фильтр" in text_lower
+            or any(p in text for p in ("PAINS_A", "PAINS_B", "PAINS_C"))
+        )
+        if explicit_catalog_cmd and catalog_tokens:
+            if any(w in text_lower for w in ("добавь", "включи также", "плюс")):
+                merged_cats = list(
+                    dict.fromkeys(
+                        ["PAINS_A", "PAINS_B", "PAINS_C", "Brenk", *catalog_tokens]
+                    )
+                )
+                overrides["active_filter_catalogs"] = merged_cats
+            else:
+                overrides["active_filter_catalogs"] = list(
+                    dict.fromkeys(catalog_tokens)
+                )
+
+        m_ban = re.search(
+            r"(?:custom_ban_smarts|запрещенн\w*\s*smarts|забань\s*smarts)\s*(?:=|:)?\s*\[?([^;\n]+)\]?",
+            text,
+            re.IGNORECASE,
+        )
+        if m_ban:
+            raw_ban = m_ban.group(1)
+            ban_items = [
+                s.strip().strip("'\"") for s in raw_ban.split(",") if s.strip().strip("'\"")
+            ]
+            if ban_items:
+                overrides["custom_ban_smarts"] = ban_items
+
+        m_extra_desc = re.search(
+            r"(?:extra_rdkit_descriptors|доп\w*\s*дескриптор\w*)\s*(?:=|:)?\s*\[?([A-Za-z0-9_,\s]+)\]?",
+            text,
+            re.IGNORECASE,
+        )
+        found_descs: list[str] = []
+        if m_extra_desc:
+            for tok in re.split(r"[\s,]+", m_extra_desc.group(1)):
+                if tok in _KNOWN_RDKIT_DESCRIPTOR_NAMES and tok not in found_descs:
+                    found_descs.append(tok)
+        for cand_tok in re.findall(r"\b([A-Z][A-Za-z0-9_]{2,})\b", text):
+            if (
+                cand_tok
+                in (
+                    "BertzCT",
+                    "MolMR",
+                    "HeavyAtomCount",
+                    "RingCount",
+                    "NumAromaticRings",
+                    "BalabanJ",
+                    "HallKierAlpha",
+                    "LabuteASA",
+                    "NumHeteroatoms",
+                )
+                and cand_tok in _KNOWN_RDKIT_DESCRIPTOR_NAMES
+                and cand_tok not in found_descs
+            ):
+                found_descs.append(cand_tok)
+        if found_descs:
+            overrides["extra_rdkit_descriptors"] = found_descs
+
+        if (
+            "brenk_ignore_long_chain=false" in text_lower
+            or "не игнорируй длинные цепи" in text_lower
+        ):
+            overrides["brenk_ignore_long_chain"] = False
+
+        m_brics_sz = re.search(
+            r"(?:brics_min_fragment_size|мин\.?\s*размер\s*(?:фрагмента\s*)?brics)\s*(?:>=|=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_brics_sz:
+            overrides["brics_min_fragment_size"] = int(m_brics_sz.group(1))
+
+        if (
+            "brics_only_leaf_nodes=false" in text_lower
+            or "нелистовые узлы brics" in text_lower
+            or "промежуточные фрагменты brics" in text_lower
+        ):
+            overrides["brics_only_leaf_nodes"] = False
+
+        for backend_pattern, backend_val in (
+            (r"\bempirical[\s_-]*only\b", "empirical_only"),
+            (r"\brdkit[\s_-]*analytical[\s_-]*qsar\b", "rdkit_analytical_qsar"),
+            (r"\bcatboost[\s_-]*local[\s_-]*qsar\b", "catboost_local_qsar"),
+            (r"\badmet[\s_-]*ai[\s_-]*dmpnn\b", "admet_ai_dmpnn"),
+            (r"\bauto[\s_-]*catboost\b", "auto_catboost"),
+        ):
+            if re.search(backend_pattern, text_lower):
+                overrides["admet_backend"] = backend_val
+                break
+        if "admet_backend" not in overrides and (
+            "только эмпирический admet" in text_lower
+            or "без ml admet" in text_lower
+        ):
+            overrides["admet_backend"] = "empirical_only"
+
+        if (
+            "cns_high_bbb" in text_lower
+            or "проникновение в цнс" in text_lower
+            or "через гэб" in text_lower
+            or "через гтб" in text_lower
+            or "цнс гтб" in text_lower
+            or "цнс гэб" in text_lower
+            or "для цнс" in text_lower
+        ):
+            overrides["cns_profile_mode"] = "cns_high_bbb"
+        elif "cns_profile_mode=neutral" in text_lower or "нейтральный профиль г" in text_lower:
+            overrides["cns_profile_mode"] = "neutral"
+        elif "peripheral_low_bbb" in text_lower:
+            overrides["cns_profile_mode"] = "peripheral_low_bbb"
+
+        if re.search(r"\bsoft[\s_-]*penalty\b", text_lower) or "мягкий штраф" in text_lower:
+            overrides["alert_penalty_mode"] = "soft_penalty"
+        elif "alert_penalty_mode=ignore" in text_lower or "игнорируй алерты" in text_lower:
+            overrides["alert_penalty_mode"] = "ignore"
+        elif "alert_penalty_mode=veto" in text_lower or "жесткое вето" in text_lower:
+            overrides["alert_penalty_mode"] = "veto"
+
+        m_mult = re.search(
+            r"(?:alert_soft_multiplier|soft[\s_-]*penalty|множитель\s*штрафа)\s*(?:=|:)?\s*(0?\.\d+|1\.0)",
+            text_lower,
+        )
+        if m_mult:
+            overrides["alert_soft_multiplier"] = float(m_mult.group(1))
+
+        weight_matches = re.findall(
+            r"(?:вес|weight)\s+(pic50|logp|sascore|qed|tpsa|logs|herg)\s*(?:=|:)?\s*(\d+(?:\.\d+)?)",
+            text_lower,
+        )
+        if weight_matches:
+            overrides["mpo_weights"] = {
+                wk: float(wv) for wk, wv in weight_matches
+            }
+
+        if re.search(r"\bETKDGv2\b", text, re.IGNORECASE):
+            overrides["etkdg_variant"] = "ETKDGv2"
+        elif re.search(r"\bETKDGv3\b", text, re.IGNORECASE):
+            overrides["etkdg_variant"] = "ETKDGv3"
+
+        if re.search(r"\bMMFF94s\b", text, re.IGNORECASE):
+            overrides["force_field"] = "MMFF94s"
+        elif re.search(r"\bMMFF94\b", text, re.IGNORECASE):
+            overrides["force_field"] = "MMFF94"
+        elif re.search(r"\bUFF\b", text, re.IGNORECASE):
+            overrides["force_field"] = "UFF"
+        elif (
+            "force_field=none" in text_lower
+            or "без оптимизации конформеров" in text_lower
+        ):
+            overrides["force_field"] = "none"
+
+        m_confs = re.search(
+            r"(?:num_conformers\s*(?:=|:)?\s*(\d+)|(\d+)\s*конформер\w*)",
+            text_lower,
+        )
+        if m_confs:
+            overrides["num_conformers"] = int(m_confs.group(1) or m_confs.group(2))
+
+        # --- 5. Оркестрация ---
+        m_max_it = re.search(
+            r"(?:max_iterations|макс\.?\s*итерац\w*\s*(?:дизайна)?)\s*(?:=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_max_it:
+            overrides["max_iterations"] = int(m_max_it.group(1))
+
+        m_ref_it = re.search(
+            r"(?:max_refilter_iterations|итерац\w*\s*рекурац\w*)\s*(?:=|:)?\s*(\d+)",
+            text_lower,
+        )
+        if m_ref_it:
+            overrides["max_refilter_iterations"] = int(m_ref_it.group(1))
+
+        if (
+            "strict_assay_homogeneity=false" in text_lower
+            or "игнорируй неоднородность bao" in text_lower
+            or "разреши смешанные тесты" in text_lower
+        ):
+            overrides["strict_assay_homogeneity"] = False
+
+        if (
+            "strict_property_thresholds=false" in text_lower
+            or "мягкие пороги свойств" in text_lower
+        ):
+            overrides["strict_property_thresholds"] = False
+
+        return overrides
+
     # ========================================================================
     # 2. ФОРМИРОВАНИЕ КОРРЕКТИРУЮЩИХ ОГРАНИЧЕНИЙ ДЛЯ ПЕТЛИ №2 (Critic Agent)
     # ========================================================================
@@ -304,11 +1033,18 @@ class LLMAdapter:
         current_constraints: QueryConstraints,
         evaluated_candidates: list[CandidateMolecule],
         critic_summary_reasons: list[str],
+        *,
+        tool_config: ToolConfig | None = None,
     ) -> tuple[QueryConstraints, str, str | None]:
         """Анализирует причины отклонения кандидатов и формирует директиву самокоррекции для Петли №2.
 
         Возвращает `(updated_constraints, critic_feedback, fallback_triggered)`.
         """
+        fallback_tpsa = (
+            tool_config.critic_fallback_min_tpsa
+            if tool_config is not None
+            else 85.0
+        )
         # Уровень 1: Облачный API со структурированным выводом CorrectiveDesignDirective
         if not self.force_rule_based and self.openai_api_key:
             try:
@@ -321,6 +1057,7 @@ class LLMAdapter:
                     base_url=self.openai_base_url,
                     temperature=0.0,
                     timeout=self.timeout_seconds,
+                    max_retries=0,
                 )
                 structured_llm = llm.with_structured_output(
                     CorrectiveDesignDirective,
@@ -352,7 +1089,7 @@ class LLMAdapter:
                         "preferred_substituent_types": directive.preferred_substituent_types,
                         "min_tpsa": directive.adjusted_min_tpsa
                         or current_constraints.min_tpsa
-                        or 85.0,
+                        or fallback_tpsa,
                         "max_sa_score": directive.adjusted_max_sa_score
                         or current_constraints.max_sa_score,
                     }
@@ -369,7 +1106,7 @@ class LLMAdapter:
                     "less_lipophilic",
                     "exclude_halogens",
                 ],
-                "min_tpsa": 85.0,
+                "min_tpsa": current_constraints.min_tpsa or fallback_tpsa,
             }
         )
         reasons_str = "; ".join(critic_summary_reasons)
@@ -403,6 +1140,7 @@ class LLMAdapter:
                     base_url=self.openai_base_url,
                     temperature=0.0,
                     timeout=self.timeout_seconds,
+                    max_retries=0,
                 )
                 structured_llm = llm.with_structured_output(
                     BatchHypothesisRationales,
@@ -466,6 +1204,7 @@ class LLMAdapter:
                     base_url=self.openai_base_url,
                     temperature=0.0,
                     timeout=self.timeout_seconds,
+                    max_retries=0,
                 )
                 brief = (
                     f"Запрос: {user_query}\n"

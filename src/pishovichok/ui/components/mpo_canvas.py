@@ -8,6 +8,8 @@ from typing import Any
 from nicegui import run, ui
 
 from pishovichok.core.rendering import compute_chemical_space_projection
+from pishovichok.state.graph_state import resolve_tool_config
+from pishovichok.ui.bridge import agent_bridge
 from pishovichok.ui.session import SessionRuntime
 
 
@@ -20,14 +22,18 @@ class MPOCanvas:
         *,
         on_candidate_selected: Callable[[str], Any] | None = None,
         on_mpo_recalculated: Callable[[], Any] | None = None,
+        on_tool_config_changed: Callable[[], Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self._on_candidate_selected = on_candidate_selected
         self._on_mpo_recalculated = on_mpo_recalculated
+        self._on_tool_config_changed = on_tool_config_changed
         self._mode: str = "pareto"
         self._pca_dirty: bool = True
+        self._syncing: bool = False
         self._chart: ui.echart | None = None
         self._mode_toggle: ui.toggle | None = None
+        self._slider_bindings: list[tuple[str, str, ui.slider, ui.label]] = []
         self._build()
 
     def _build(self) -> None:
@@ -53,46 +59,57 @@ class MPOCanvas:
             ).classes("w-full border border-slate-800 rounded"):
                 w = self.runtime.view_model.weights
                 with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-1 p-2"):
-                    self._make_slider("Вес pIC50", w.w_activity, 0.0, 5.0, 0.1, lambda v: setattr(w, "w_activity", v))
-                    self._make_slider("Вес cLogP", w.w_logp, 0.0, 5.0, 0.1, lambda v: setattr(w, "w_logp", v))
-                    self._make_slider("Вес SAscore", w.w_sa, 0.0, 5.0, 0.1, lambda v: setattr(w, "w_sa", v))
-                    self._make_slider("Вес QED", w.w_qed, 0.0, 5.0, 0.1, lambda v: setattr(w, "w_qed", v))
-                    self._make_slider("Вес hERG", w.w_herg, 0.0, 5.0, 0.1, lambda v: setattr(w, "w_herg", v))
-                    self._make_slider("Max cLogP", w.max_logp, 1.0, 7.0, 0.1, lambda v: setattr(w, "max_logp", v))
-                    self._make_slider("Max SA", w.max_sa_score, 2.0, 7.0, 0.1, lambda v: setattr(w, "max_sa_score", v))
-                    self._make_slider("Max hERG", w.max_herg_prob, 0.1, 0.9, 0.05, lambda v: setattr(w, "max_herg_prob", v))
-                    self._make_slider("Max MW", w.max_mw, 300.0, 800.0, 10.0, lambda v: setattr(w, "max_mw", v))
+                    self._make_slider("w_activity", "Вес pIC50", w.w_activity, 0.0, 5.0, 0.1)
+                    self._make_slider("w_logp", "Вес cLogP", w.w_logp, 0.0, 5.0, 0.1)
+                    self._make_slider("w_sa", "Вес SAscore", w.w_sa, 0.0, 5.0, 0.1)
+                    self._make_slider("w_qed", "Вес QED", w.w_qed, 0.0, 5.0, 0.1)
+                    self._make_slider("w_tpsa", "Вес TPSA", w.w_tpsa, 0.0, 5.0, 0.1)
+                    self._make_slider("w_logs", "Вес LogS", w.w_logs, 0.0, 5.0, 0.1)
+                    self._make_slider("w_herg", "Вес hERG", w.w_herg, 0.0, 5.0, 0.1)
+                    self._make_slider("max_logp", "Max cLogP", w.max_logp, 1.0, 7.0, 0.1)
+                    self._make_slider("max_sa_score", "Max SA", w.max_sa_score, 2.0, 7.0, 0.1)
+                    self._make_slider("max_herg_prob", "Max hERG", w.max_herg_prob, 0.1, 0.9, 0.05)
+                    self._make_slider("max_mw", "Max MW", w.max_mw, 300.0, 800.0, 10.0)
 
     def _make_slider(
         self,
+        attr_name: str,
         label: str,
         value: float,
         min_v: float,
         max_v: float,
         step: float,
-        setter: Callable[[float], None],
     ) -> None:
         with ui.column().classes("w-full gap-0"):
             val_lbl = ui.label(f"{label}: {value:.2f}").classes(
                 "text-[11px] text-slate-300"
             )
 
-            def _on_change(e: Any) -> None:
+            def _on_change(e: Any, attr: str = attr_name, lbl_text: str = label, lbl_w: ui.label = val_lbl) -> None:
+                if self._syncing:
+                    return
                 v = float(e.value)
-                setter(v)
-                val_lbl.set_text(f"{label}: {v:.2f}")
+                setattr(self.runtime.view_model.weights, attr, v)
+                lbl_w.set_text(f"{lbl_text}: {v:.2f}")
+                agent_bridge.apply_ui_tool_overrides(
+                    self.runtime,
+                    self.runtime.view_model.weights.to_tool_config_overrides(),
+                )
                 self.runtime.view_model.recalculate_mpo()
                 self.refresh(mark_pca_dirty=False)
                 if self._on_mpo_recalculated is not None:
                     self._on_mpo_recalculated()
+                if self._on_tool_config_changed is not None:
+                    self._on_tool_config_changed()
 
-            ui.slider(
+            sld = ui.slider(
                 min=min_v,
                 max=max_v,
                 step=step,
                 value=value,
                 on_change=_on_change,
             ).props("dense color=emerald")
+            self._slider_bindings.append((attr_name, label, sld, val_lbl))
 
     async def _handle_mode_change(self, e: Any) -> None:
         self._mode = str(e.value)
@@ -121,7 +138,12 @@ class MPOCanvas:
             self._pca_dirty = False
             return
 
-        coords = await run.cpu_bound(compute_chemical_space_projection, smiles_list)
+        coords = await run.cpu_bound(
+            compute_chemical_space_projection,
+            smiles_list,
+            None,
+            resolve_tool_config(self.runtime.state),
+        )
         for (kind, obj), (x, y) in zip(targets, coords, strict=False):
             if kind == "lead":
                 obj.lead_pca_coords = (float(x), float(y))
@@ -322,9 +344,19 @@ class MPOCanvas:
         }
 
     def refresh(self, *, mark_pca_dirty: bool = True) -> None:
-        """Обновляет опции графика без пересоздания DOM-элемента."""
+        """Обновляет опции графика и положение слайдеров без пересоздания DOM-элемента."""
         if mark_pca_dirty:
             self._pca_dirty = True
+        w = self.runtime.view_model.weights
+        if self._slider_bindings:
+            self._syncing = True
+            try:
+                for attr_name, lbl_text, sld, val_lbl in self._slider_bindings:
+                    cur = float(getattr(w, attr_name))
+                    sld.set_value(cur)
+                    val_lbl.set_text(f"{lbl_text}: {cur:.2f}")
+            finally:
+                self._syncing = False
         if self._chart is not None:
             self._chart.options.update(self._build_chart_options())
             self._chart.update()

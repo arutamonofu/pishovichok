@@ -11,20 +11,22 @@ from __future__ import annotations
 import base64
 import contextlib
 import html
+from typing import Any
 
 import numpy as np
-from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, rdDepictor, rdFingerprintGenerator, rdFMCS
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem, Descriptors, rdDepictor, rdFMCS
 from rdkit.Chem.Draw import rdMolDraw2D
 from sklearn.decomposition import PCA
+
+from pishovichok.core.fingerprints import compute_mol_fingerprint
+from pishovichok.state.schemas import ToolConfig
 
 # Палитра стандартных цветов для подсветки (RGB строго в [0.0, 1.0])
 COLOR_ACTIVITY_GAIN: tuple[float, float, float] = (0.1, 0.8, 0.2)  # Зелёный
 COLOR_ACTIVITY_LOSS: tuple[float, float, float] = (0.9, 0.2, 0.2)  # Красный
 COLOR_CORE_REFERENCE: tuple[float, float, float] = (0.2, 0.4, 0.9)  # Синий
 COLOR_NEUTRAL_ACCENT: tuple[float, float, float] = (0.95, 0.65, 0.15)  # Оранжевый
-
-_PCA_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
 
 
 def _render_placeholder_svg(message: str, width: int, height: int) -> str:
@@ -293,16 +295,58 @@ def molecule_svg_to_data_uri(svg_content: str) -> str:
     return f"data:image/svg+xml;base64,{encoded}"
 
 
+def _coerce_tool_config(tool_config: ToolConfig | dict[str, Any] | None) -> ToolConfig:
+    if isinstance(tool_config, ToolConfig):
+        return tool_config
+    if isinstance(tool_config, dict):
+        return ToolConfig.model_validate(tool_config)
+    return ToolConfig()
+
+
+def _optimize_conformer_with_ff(
+    mol_h: Chem.Mol,
+    conf_id: int,
+    force_field: str,
+    max_iters: int,
+) -> float:
+    """Оптимизирует конформер выбранным силовым полем и возвращает энергию (или 0.0)."""
+    if force_field == "none" or max_iters <= 0:
+        return 0.0
+    if force_field in ("MMFF94s", "MMFF94"):
+        with contextlib.suppress(RuntimeError, ValueError):
+            mmff_props = AllChem.MMFFGetMoleculeProperties(
+                mol_h, mmffVariant=force_field
+            )
+            if mmff_props is not None:
+                ff = AllChem.MMFFGetMoleculeForceField(
+                    mol_h, mmff_props, confId=conf_id
+                )
+                if ff is not None:
+                    ff.Minimize(maxIts=int(max_iters))
+                    return float(ff.CalcEnergy())
+    # Фолбэк на UFF (или явный UFF)
+    with contextlib.suppress(RuntimeError, ValueError):
+        uff = AllChem.UFFGetMoleculeForceField(mol_h, confId=conf_id)
+        if uff is not None:
+            uff.Minimize(maxIts=int(max_iters))
+            return float(uff.CalcEnergy())
+    return 0.0
+
+
 def generate_3d_conformer_molblock(
     smiles: str,
     highlight_atoms: list[int] | tuple[int, ...] | None = None,
-    random_seed: int = 42,
+    random_seed: int | None = None,
     optimize_uff: bool = True,
+    *,
+    etkdg_variant: str | None = None,
+    force_field: str | None = None,
+    num_conformers: int | None = None,
+    max_iters: int | None = None,
+    tool_config: ToolConfig | dict[str, Any] | None = None,
 ) -> tuple[str, list[int]]:
-    """Генерирует 3D-конформер через ETKDGv3 + UFF и возвращает `(molblock, valid_highlight_indices)`.
-
-    Тяжёлые атомы сохраняют исходную индексацию `[0 .. N-1]` после `Chem.AddHs(mol)`,
-    поэтому индексы подсветки `highlight_atoms` корректно отображаются в 3Dmol.js.
+    """Генерирует ансамбль 3D-конформеров через `ETKDGv3`/`ETKDGv2` (`EmbedMultipleConfs`)
+    и выбирает конформер с минимальной энергией после оптимизации `MMFF94s`/`MMFF94`/`UFF`/`none`.
     """
     if not smiles or not isinstance(smiles, str):
         raise ValueError("Пустой SMILES для генерации 3D-конформера.")
@@ -311,40 +355,68 @@ def generate_3d_conformer_molblock(
     if mol is None or mol.GetNumAtoms() == 0:
         raise ValueError(f"Невалидный SMILES для 3D-конформера: '{smiles}'")
 
+    cfg = _coerce_tool_config(tool_config)
+    eff_variant = etkdg_variant or cfg.etkdg_variant
+    eff_ff = (
+        force_field
+        if force_field is not None
+        else ("none" if not optimize_uff and tool_config is None else cfg.force_field)
+    )
+    eff_num_confs = int(num_conformers if num_conformers is not None else cfg.num_conformers)
+    eff_seed = int(random_seed if random_seed is not None else cfg.conformer_random_seed)
+    eff_iters = int(max_iters if max_iters is not None else cfg.conformer_opt_max_iters)
+
     heavy_count = mol.GetNumAtoms()
     valid_highlights = [
         int(idx) for idx in (highlight_atoms or []) if 0 <= int(idx) < heavy_count
     ]
 
     mol_h = Chem.AddHs(mol)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = int(random_seed)
+    params = AllChem.ETKDGv2() if eff_variant == "ETKDGv2" else AllChem.ETKDGv3()
+    params.randomSeed = eff_seed
 
-    embed_status = AllChem.EmbedMolecule(mol_h, params)
-    if embed_status == -1:
+    conf_ids = list(
+        AllChem.EmbedMultipleConfs(mol_h, numConfs=max(1, eff_num_confs), params=params)
+    )
+    if not conf_ids:
         params.useRandomCoords = True
-        embed_status = AllChem.EmbedMolecule(mol_h, params)
-    if embed_status == -1:
+        conf_ids = list(
+            AllChem.EmbedMultipleConfs(
+                mol_h, numConfs=max(1, eff_num_confs), params=params
+            )
+        )
+    if not conf_ids:
         AllChem.Compute2DCoords(mol_h)
+        return (Chem.MolToMolBlock(mol_h), valid_highlights)
 
-    if optimize_uff:
-        with contextlib.suppress(RuntimeError, ValueError):
-            AllChem.UFFOptimizeMolecule(mol_h, maxIters=200)
+    best_conf_id = int(conf_ids[0])
+    if eff_ff != "none":
+        energies: list[tuple[float, int]] = []
+        for cid in conf_ids:
+            energy = _optimize_conformer_with_ff(
+                mol_h, int(cid), force_field=eff_ff, max_iters=eff_iters
+            )
+            energies.append((energy, int(cid)))
+        energies.sort(key=lambda item: item[0])
+        best_conf_id = energies[0][1]
 
-    molblock = Chem.MolToMolBlock(mol_h)
+    molblock = Chem.MolToMolBlock(mol_h, confId=best_conf_id)
     return (molblock, valid_highlights)
 
 
 def compute_chemical_space_projection(
     smiles_list: list[str],
+    *,
+    tool_config: ToolConfig | dict[str, Any] | None = None,
 ) -> list[tuple[float, float]]:
-    """Вычисляет 2D-проекцию (PCA по отпечаткам Моргана) для списка SMILES.
+    """Вычисляет 2D-проекцию (PCA по выбранным фингерпринтам) для списка SMILES.
 
     При числе валидных молекул < 3 или нулевой дисперсии возвращает `(cLogP, TPSA)`.
     """
     if not smiles_list:
         return []
 
+    cfg = _coerce_tool_config(tool_config)
     fps: list[np.ndarray] = []
     valid_indices: list[int] = []
     fallback_coords: list[tuple[float, float]] = []
@@ -357,7 +429,14 @@ def compute_chemical_space_projection(
         clogp = round(float(Descriptors.MolLogP(mol)), 4)
         tpsa = round(float(Descriptors.TPSA(mol)), 4)
         fallback_coords.append((clogp, tpsa))
-        fp_arr = _PCA_FP_GENERATOR.GetFingerprintAsNumPy(mol).astype(np.float32)
+        fp = compute_mol_fingerprint(
+            mol,
+            fp_type=cfg.fp_type if tool_config is not None else "ecfp",
+            fp_radius=cfg.fp_radius if tool_config is not None else 2,
+            fp_nbits=cfg.fp_nbits if tool_config is not None else 1024,
+        )
+        fp_arr = np.zeros((fp.GetNumBits(),), dtype=np.float32)
+        DataStructs.ConvertToNumpyArray(fp, fp_arr)
         fps.append(fp_arr)
         valid_indices.append(idx)
 
@@ -366,7 +445,7 @@ def compute_chemical_space_projection(
 
     matrix = np.vstack(fps)
     try:
-        pca = PCA(n_components=2, random_state=42)
+        pca = PCA(n_components=2, random_state=int(cfg.pca_random_seed))
         coords_2d = pca.fit_transform(matrix)
         result = list(fallback_coords)
         for local_i, orig_idx in enumerate(valid_indices):

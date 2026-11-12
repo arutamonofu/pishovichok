@@ -21,7 +21,7 @@ from pishovichok.core.sar_analysis import (
     extract_mmp_and_cliffs,
     extract_mmp_with_background_fallback,
 )
-from pishovichok.state.graph_state import SARGraphState
+from pishovichok.state.graph_state import SARGraphState, resolve_tool_config
 from pishovichok.state.schemas import TraceEvent
 
 
@@ -44,6 +44,7 @@ def sar_node(state: SARGraphState) -> dict[str, Any]:
         )
 
     constraints = state["query_constraints"]
+    tool_config = resolve_tool_config(state)
 
     # Для Сценария 2 фиксируем скаффолд молекулы-лидера
     fixed_scaffold: str | None = None
@@ -52,20 +53,25 @@ def sar_node(state: SARGraphState) -> dict[str, Any]:
 
     # Выбор алгоритма в зависимости от типа сценария
     if constraints.scenario_type == "custom_csv_analysis":
-        bg_target = constraints.target_chembl_id or "CHEMBL203"
+        bg_target = (
+            constraints.target_chembl_id
+            or tool_config.background_target_id
+        )
         mmp_ptr, sar_rules, cliffs, enriched = extract_mmp_with_background_fallback(
             curated_pointer=curated_ptr,
             session_dir=session_dir,
             fixed_scaffold_smiles=fixed_scaffold,
-            min_support_pairs=2,
+            min_support_pairs=tool_config.min_support_pairs,
             background_target_id=bg_target,
+            tool_config=tool_config,
         )
     else:
         mmp_ptr, sar_rules, cliffs = extract_mmp_and_cliffs(
             curated_pointer=curated_ptr,
             session_dir=session_dir,
             fixed_scaffold_smiles=fixed_scaffold,
-            min_support_pairs=2,
+            min_support_pairs=tool_config.min_support_pairs,
+            tool_config=tool_config,
         )
         enriched = False
 
@@ -96,11 +102,38 @@ def sar_node(state: SARGraphState) -> dict[str, Any]:
         duration_ms=round(duration_ms, 2),
     )
 
+    node_telemetry = dict(state.get("node_telemetry", {}))
+    node_telemetry["sar"] = {
+        "active_params": {
+            "mmpa_max_cuts": tool_config.mmpa_max_cuts,
+            "mmpa_max_cut_bonds": tool_config.mmpa_max_cut_bonds,
+            "min_support_pairs": tool_config.min_support_pairs,
+            "min_mean_delta_pic50": tool_config.min_mean_delta_pic50,
+            "max_rgroup_heavy_atoms": tool_config.max_rgroup_heavy_atoms,
+            "fp_type": tool_config.fp_type,
+            "fp_radius": tool_config.fp_radius,
+            "fp_nbits": tool_config.fp_nbits,
+            "similarity_metric": tool_config.similarity_metric,
+            "cliff_similarity_cutoff": tool_config.cliff_similarity_cutoff,
+            "cliff_delta_pic50_cutoff": tool_config.cliff_delta_pic50_cutoff,
+            "sali_epsilon": tool_config.sali_epsilon,
+            "prioritize_positive_rules": tool_config.prioritize_positive_rules,
+        },
+        "stats": {
+            "rules_count": len(sar_rules),
+            "homogeneous_rules_count": homo_count,
+            "activity_cliffs_count": len(cliffs),
+            "background_enriched": enriched,
+            "duration_ms": round(duration_ms, 2),
+        },
+    }
+
     return {
         "mmp_table_uri": mmp_ptr,
         "extracted_sar_rules": sar_rules,
         "detected_activity_cliffs": cliffs,
         "enriched_with_chembl_background": enriched,
+        "node_telemetry": node_telemetry,
         "last_executed_stage": "sar",
         "trace_log": [trace_event],
     }

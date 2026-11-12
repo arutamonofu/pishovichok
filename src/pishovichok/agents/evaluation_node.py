@@ -26,7 +26,7 @@ from pishovichok.core.scoring import (
     evaluate_lead_reference,
     write_candidates_parquet,
 )
-from pishovichok.state.graph_state import SARGraphState
+from pishovichok.state.graph_state import SARGraphState, resolve_tool_config
 from pishovichok.state.schemas import (
     CandidateMolecule,
     GeneratedRawCandidate,
@@ -48,6 +48,8 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
     session_dir = _resolve_session_dir(state["workspace_dir"], state["session_id"])
     iteration = int(state.get("design_iteration", 1))
     constraints = state["query_constraints"]
+    tool_config = resolve_tool_config(state)
+    param_sources = state.get("param_sources", {})
     llm_adapter = LLMAdapter()
 
     # 1. Чтение сгенерированного сырого пула текущей итерации
@@ -66,10 +68,17 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         constraints=constraints,
         session_dir=session_dir,
         filename=f"evaluated_candidates_it{iteration}.parquet",
+        tool_config=tool_config,
     )
 
     # 3. Выборка среза лучших кандидатов (топ-K)
-    top_k = evaluated_pool[: constraints.top_k_candidates]
+    top_k_limit = (
+        tool_config.top_k_output
+        if param_sources.get("top_k_output") not in (None, "default")
+        or tool_config.top_k_output != 5
+        else constraints.top_k_candidates
+    )
+    top_k = evaluated_pool[:top_k_limit]
 
     # 4. Формирование детализированных текстовых обоснований гипотез через LLM-адаптер
     id_to_text, fallback_hypotheses = llm_adapter.generate_hypothesis_rationales(top_k)
@@ -105,10 +114,12 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         curated_ptr = state["dataset_uri"]
         if curated_ptr is not None:
             lead_seeds = select_parent_seeds_from_curated(
-                curated_ptr, constraints, max_parents=1
+                curated_ptr, constraints, max_parents=1, tool_config=tool_config
             )
             if lead_seeds:
-                lead_reference = evaluate_lead_reference(lead_seeds[0], constraints)
+                lead_reference = evaluate_lead_reference(
+                    lead_seeds[0], constraints, tool_config=tool_config
+                )
 
     duration_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -140,9 +151,36 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         duration_ms=round(duration_ms, 2),
     )
 
+    node_telemetry = dict(state.get("node_telemetry", {}))
+    node_telemetry["evaluation"] = {
+        "active_params": {
+            "active_filter_catalogs": list(tool_config.active_filter_catalogs),
+            "custom_ban_smarts": list(tool_config.custom_ban_smarts),
+            "brics_min_fragment_size": tool_config.brics_min_fragment_size,
+            "brics_only_leaf_nodes": tool_config.brics_only_leaf_nodes,
+            "admet_backend": tool_config.admet_backend,
+            "cns_profile_mode": tool_config.cns_profile_mode,
+            "alert_penalty_mode": tool_config.alert_penalty_mode,
+            "alert_soft_multiplier": tool_config.alert_soft_multiplier,
+            "mpo_weights": dict(tool_config.mpo_weights),
+            "extra_rdkit_descriptors": list(tool_config.extra_rdkit_descriptors),
+            "top_k_output": top_k_limit,
+        },
+        "stats": {
+            "iteration": iteration,
+            "raw_candidates_count": len(raw_candidates),
+            "evaluated_pool_count": len(evaluated_pool),
+            "top_k_count": len(enriched_top),
+            "valid_top_k_count": valid_count,
+            "max_harrington_d": round(top_score, 4),
+            "duration_ms": round(duration_ms, 2),
+        },
+    }
+
     result_dict: dict[str, Any] = {
         "candidates_table_uri": main_cand_pointer,
         "top_candidates": enriched_top,
+        "node_telemetry": node_telemetry,
         "last_executed_stage": "evaluation",
         "trace_log": [trace_event],
     }

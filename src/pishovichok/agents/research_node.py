@@ -19,7 +19,11 @@ from typing import Any
 
 from pishovichok.agents.llm_adapter import LLMAdapter
 from pishovichok.core.curation import curate_chembl_or_csv
-from pishovichok.state.graph_state import SARGraphState
+from pishovichok.state.graph_state import (
+    SARGraphState,
+    resolve_tool_config,
+    update_param_sources,
+)
 from pishovichok.state.schemas import TraceEvent
 
 
@@ -40,14 +44,27 @@ def research_node(state: SARGraphState) -> dict[str, Any]:
     session_dir = _resolve_session_dir(state["workspace_dir"], state["session_id"])
     llm_adapter = LLMAdapter()
 
-    # 1. Семантический разбор запроса при начальной инициализации
+    tool_config = resolve_tool_config(state)
+    param_sources = dict(state.get("param_sources", {}))
+    nl_overrides_applied: list[str] = []
+
+    # 1. Семантический разбор запроса и параметров ToolConfig при начальной инициализации
     fallback_triggered: str | None = None
     if state.get("last_executed_stage") == "init":
-        parsed_constraints, fallback_triggered = llm_adapter.parse_query_constraints(
-            user_query=state["user_query"],
-            uploaded_csv_path=state.get("uploaded_csv_path"),
+        parsed_constraints, nl_overrides, fallback_triggered = (
+            llm_adapter.parse_query_with_tool_config(
+                user_query=state["user_query"],
+                uploaded_csv_path=state.get("uploaded_csv_path"),
+            )
         )
         constraints = parsed_constraints
+        if nl_overrides:
+            tool_config, nl_overrides_applied = tool_config.apply_overrides(nl_overrides)
+            param_sources = update_param_sources(
+                param_sources,
+                nl_overrides_applied,
+                "nl_query",
+            )
     else:
         constraints = state["query_constraints"]
 
@@ -65,6 +82,7 @@ def research_node(state: SARGraphState) -> dict[str, Any]:
         uploaded_csv_path=state.get("uploaded_csv_path"),
         assay_filter_strict=assay_filter_strict,
         active_bao_filter=active_bao_filter,
+        tool_config=tool_config,
     )
 
     duration_ms = (time.perf_counter() - start_time) * 1000.0
@@ -105,8 +123,39 @@ def research_node(state: SARGraphState) -> dict[str, Any]:
         duration_ms=round(duration_ms, 2),
     )
 
+    node_telemetry = dict(state.get("node_telemetry", {}))
+    node_telemetry["research"] = {
+        "active_params": {
+            "allowed_bao_formats": list(tool_config.allowed_bao_formats),
+            "standard_types": list(tool_config.standard_types),
+            "relation_mode": tool_config.relation_mode,
+            "pchembl_min_cutoff": tool_config.pchembl_min_cutoff,
+            "duplicate_agg_method": tool_config.duplicate_agg_method,
+            "max_duplicate_std": tool_config.max_duplicate_std,
+            "strip_salts": tool_config.strip_salts,
+            "neutralize_charges": tool_config.neutralize_charges,
+            "canonicalize_tautomers": tool_config.canonicalize_tautomers,
+            "keep_chirality": tool_config.keep_chirality,
+            "scaffold_mode": tool_config.scaffold_mode,
+            "fp_type": tool_config.fp_type,
+            "neighborhood_tanimoto": tool_config.neighborhood_tanimoto,
+            "assay_filter_strict": assay_filter_strict,
+            "active_bao_filter": active_bao_filter,
+        },
+        "stats": {
+            "nl_overrides_applied": nl_overrides_applied,
+            "curated_molecules_count": summary.curated_molecules_count,
+            "dominant_bao_format": summary.dominant_bao_format,
+            "is_dataset_assay_homogeneous": summary.is_dataset_assay_homogeneous,
+            "duration_ms": round(duration_ms, 2),
+        },
+    }
+
     return {
         "query_constraints": constraints,
+        "tool_config": tool_config,
+        "param_sources": param_sources,
+        "node_telemetry": node_telemetry,
         "raw_dataset_uri": raw_ptr,
         "dataset_uri": curated_ptr,
         "curation_summary": summary,

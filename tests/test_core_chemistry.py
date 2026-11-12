@@ -793,3 +793,180 @@ def test_clean_brics_fragment_smiles_no_isolated_h_warning(
     captured = capfd.readouterr()
     assert "not removing hydrogen atom without neighbors" not in captured.err
     assert "not removing hydrogen atom without neighbors" not in captured.out
+
+
+def test_tool_config_controls_core_modules(tmp_path: Path) -> None:
+    """Проверяет реальное влияние параметров ToolConfig на все вычислительные модули core/*.py."""
+    from pishovichok.core.rendering import generate_3d_conformer_molblock
+    from pishovichok.state import ToolConfig
+
+    # 1. Curation & Standardization: strip_salts=False и scaffold_mode="generic_framework"
+    salt_smi = "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1.Cl"
+    no_strip_cfg = ToolConfig(strip_salts=False, scaffold_mode="generic_framework")
+    res_no_strip = standardize_molecule_detailed(salt_smi, tool_config=no_strip_cfg)
+    assert res_no_strip is not None
+    assert res_no_strip.salts_stripped is False
+    assert "." in res_no_strip.canonical_smiles
+    assert "N" not in res_no_strip.scaffold_smiles  # generic framework replaces heteroatoms with C
+
+    # 2. Curation CSV: relation_mode="exact_only" отбрасывает цензурированные записи
+    _, sess_csv = create_session_workspace(base_workspace_dir=tmp_path, session_id="cfg_csv")
+    csv_path = settings.samples_dir / "custom_wetlab_series.csv"
+    cfg_exact = ToolConfig(relation_mode="exact_only", duplicate_agg_method="max")
+    _, curated_exact_ptr, sum_exact = curate_chembl_or_csv(
+        session_dir=sess_csv,
+        constraints=QueryConstraints(scenario_type="custom_csv_analysis"),
+        uploaded_csv_path=csv_path,
+        tool_config=cfg_exact,
+    )
+    assert sum_exact.curated_molecules_count == 25  # 27 - 2 censored
+    assert curated_exact_ptr.row_count == 25
+
+    # 3. Fingerprints & SAR: смена метрики (dice), fp_type (fcfp), sali_epsilon и max_cuts
+    cfg_sar = ToolConfig(
+        fp_type="fcfp",
+        similarity_metric="dice",
+        sali_epsilon=0.01,
+        mmpa_max_cuts=1,
+        min_support_pairs=1,
+        cliff_similarity_cutoff=0.80,
+    )
+    _, rules_dice, cliffs_dice = extract_mmp_and_cliffs(
+        curated_pointer=curated_exact_ptr,
+        session_dir=sess_csv,
+        tool_config=cfg_sar,
+    )
+    assert len(rules_dice) >= 5
+    assert len(cliffs_dice) >= 1
+
+    # 4. Evaluation, custom_ban_smarts, extra_rdkit_descriptors, admet_backend & soft_penalty
+    nitro_alert_smi = "O=[N+]([O-])c1ccc(Nc2ncnc3ccccc23)cc1"
+    cfg_eval = ToolConfig(
+        active_filter_catalogs=["PAINS_A", "Glaxo"],
+        custom_ban_smarts=["[N+](=O)[O-]"],
+        extra_rdkit_descriptors=["RingCount", "HeavyAtomCount"],
+        admet_backend="empirical_only",
+        alert_penalty_mode="soft_penalty",
+        alert_soft_multiplier=0.5,
+        brics_min_fragment_size=4,
+    )
+    rdkit_m = calculate_rdkit_metrics(nitro_alert_smi, tool_config=cfg_eval)
+    assert rdkit_m.extra_alerts_count >= 1
+    assert any(n.startswith("CUSTOM_") for n in rdkit_m.extra_alerts_matched_names)
+    assert "RingCount" in rdkit_m.extra_descriptors
+    assert rdkit_m.extra_descriptors["RingCount"] >= 3.0
+    assert "HeavyAtomCount" in rdkit_m.extra_descriptors
+
+    admet_m = predict_admet_metrics(
+        nitro_alert_smi,
+        rdkit_m,
+        parent_exp_pic50=7.0,
+        tool_config=cfg_eval,
+    )
+    assert admet_m.model_source == "rdkit_analytical_qsar"
+
+    mpo_soft = calculate_harrington_mpo_score(
+        rdkit_m,
+        admet_m,
+        parent_exp_pic50=7.0,
+        constraints=QueryConstraints(scenario_type="target_based_sar"),
+        tool_config=cfg_eval,
+    )
+    assert mpo_soft > 0.0
+
+    cfg_veto = cfg_eval.model_copy(update={"alert_penalty_mode": "veto"})
+    mpo_veto = calculate_harrington_mpo_score(
+        rdkit_m,
+        admet_m,
+        parent_exp_pic50=7.0,
+        constraints=QueryConstraints(scenario_type="target_based_sar"),
+        tool_config=cfg_veto,
+    )
+    assert mpo_veto == 0.0
+
+    # 5. Generation engine="crem_only" & protected_smarts
+    seeds = select_parent_seeds_from_curated(
+        curated_exact_ptr,
+        QueryConstraints(scenario_type="custom_csv_analysis"),
+        max_parents=2,
+        tool_config=cfg_eval,
+    )
+    cfg_crem = ToolConfig(
+        generation_engine="crem_only",
+        crem_mode="mutate",
+        crem_context_radius=3,
+        crem_max_replacements=10,
+        max_candidates_pool=10,
+    )
+    crem_cands = generate_candidate_structures(
+        parent_molecules=seeds,
+        sar_rules=rules_dice,
+        constraints=QueryConstraints(scenario_type="custom_csv_analysis"),
+        tool_config=cfg_crem,
+    )
+    assert len(crem_cands) >= 1
+    assert all(
+        c.generation_origin == "crem_fragment_replacement" for c in crem_cands
+    )
+
+    # 6. 3D Rendering: ETKDGv2 + UFF / none
+    mb_uff, highlights_uff = generate_3d_conformer_molblock(
+        nitro_alert_smi,
+        tool_config=ToolConfig(etkdg_variant="ETKDGv2", force_field="UFF", num_conformers=2),
+    )
+    assert isinstance(highlights_uff, list) and mb_uff and "M  END" in mb_uff
+    mb_none, highlights_none = generate_3d_conformer_molblock(
+        nitro_alert_smi,
+        tool_config=ToolConfig(etkdg_variant="ETKDGv2", force_field="none", num_conformers=2),
+    )
+    assert isinstance(highlights_none, list) and mb_none and "M  END" in mb_none
+
+
+def test_agent_nodes_track_param_sources_and_telemetry(tmp_path: Path) -> None:
+    """Проверяет запись node_telemetry и param_sources ('nl_query' и 'critic_loop') в узлах графа."""
+    from pishovichok.agents.critic_node import critic_node
+    from pishovichok.agents.design_node import design_node
+    from pishovichok.agents.evaluation_node import evaluation_node
+    from pishovichok.agents.research_node import research_node
+    from pishovichok.agents.sar_node import sar_node
+    from pishovichok.state import create_initial_graph_state
+
+    _, session_dir = create_session_workspace(
+        base_workspace_dir=tmp_path, session_id="node_tele_test"
+    )
+    state = create_initial_graph_state(
+        user_query=(
+            "Найди ингибиторы CHEMBL5251 (BTK) через FCFP4, метрика dice, "
+            "empirical only, ETKDGv2, топ 4"
+        ),
+        session_id="node_tele_test",
+        workspace_dir=session_dir,
+    )
+    state.update(research_node(state))
+    assert state["param_sources"].get("fp_type") == "nl_query"
+    assert state["param_sources"].get("similarity_metric") == "nl_query"
+    assert state["param_sources"].get("admet_backend") == "nl_query"
+    assert state["param_sources"].get("top_k_output") == "nl_query"
+    assert "research" in state["node_telemetry"]
+    assert state["node_telemetry"]["research"]["active_params"]["fp_type"] == "fcfp"
+
+    state.update(sar_node(state))
+    assert "sar" in state["node_telemetry"]
+    assert state["node_telemetry"]["sar"]["active_params"]["similarity_metric"] == "dice"
+
+    state.update(critic_node(state))
+    assert "critic" in state["node_telemetry"]
+    if state["critic_verdict"] == "refilter_data":
+        assert state["param_sources"].get("allowed_bao_formats") == "critic_loop"
+        state.update(research_node(state))
+        state.update(sar_node(state))
+        state.update(critic_node(state))
+
+    state.update(design_node(state))
+    assert "design" in state["node_telemetry"]
+
+    state.update(evaluation_node(state))
+    assert "evaluation" in state["node_telemetry"]
+    assert state["node_telemetry"]["evaluation"]["active_params"]["admet_backend"] == "empirical_only"
+    assert len(state["top_candidates"]) <= 4
+

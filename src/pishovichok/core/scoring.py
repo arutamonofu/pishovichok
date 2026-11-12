@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Literal
 
 from rdkit import Chem
 
@@ -26,6 +25,7 @@ from pishovichok.core.admet import predict_admet_metrics
 from pishovichok.core.evaluation import calculate_rdkit_metrics
 from pishovichok.core.generation import verify_scaffold_preservation
 from pishovichok.state.schemas import (
+    ADMETBackendLiteral,
     CalcRDKitMetrics,
     CandidateMolecule,
     GeneratedRawCandidate,
@@ -34,6 +34,7 @@ from pishovichok.state.schemas import (
     PredADMETMetrics,
     QueryConstraints,
     SARHypothesisRationale,
+    ToolConfig,
 )
 from pishovichok.state.storage import write_candidates_parquet
 
@@ -59,68 +60,168 @@ def harrington_one_sided_desirability(
     return max(1e-6, min(1.0, d_val))
 
 
+def compute_harrington_mpo_breakdown(
+    *,
+    predicted_pic50: float,
+    parent_exp_pic50: float,
+    clogp: float,
+    sa_score: float,
+    qed: float,
+    tpsa: float,
+    herg_liability_prob: float,
+    log_s_aq: float,
+    has_alerts: bool,
+    min_logp: float | None,
+    max_logp: float,
+    max_sa_score: float,
+    max_herg_prob: float,
+    min_tpsa: float | None = None,
+    tool_config: ToolConfig | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Единый детерминированный расчёт индекса Харрингтона D и частных желательностей d1..d7."""
+    cfg = tool_config or ToolConfig()
+
+    # d1: Максимизация прогнозной активности pIC50 относительно родителя
+    d_pic50 = harrington_one_sided_desirability(
+        value=predicted_pic50,
+        bad_limit=parent_exp_pic50 + cfg.harrington_activity_low_delta,
+        good_target=parent_exp_pic50 + cfg.harrington_activity_high_delta,
+    )
+
+    # d2: Липофильность cLogP в целевом коридоре [min_logp, max_logp]
+    d2_upper = harrington_one_sided_desirability(
+        value=clogp,
+        bad_limit=max_logp + 0.60,
+        good_target=max_logp - 0.50,
+    )
+    if min_logp is not None:
+        d2_lower = harrington_one_sided_desirability(
+            value=clogp,
+            bad_limit=min_logp - 0.50,
+            good_target=min_logp + 0.40,
+        )
+        d_logp = min(d2_upper, d2_lower)
+    else:
+        d_logp = d2_upper
+
+    # d3: Минимизация индекса синтетической доступности SAscore (<= max_sa_score)
+    d_sa = harrington_one_sided_desirability(
+        value=sa_score,
+        bad_limit=max_sa_score + 0.80,
+        good_target=max(cfg.harrington_sa_min - 0.50, max_sa_score - 0.90),
+    )
+
+    # d4: Максимизация индекса лекарственного сходства QED
+    d_qed = harrington_one_sided_desirability(
+        value=qed,
+        bad_limit=cfg.harrington_qed_min,
+        good_target=cfg.harrington_qed_target,
+    )
+
+    # d5: Минимизация вероятности кардиотоксичности hERG (<= max_herg_prob)
+    d_herg = harrington_one_sided_desirability(
+        value=herg_liability_prob,
+        bad_limit=min(0.90, max_herg_prob + 0.15),
+        good_target=max(0.15, max_herg_prob - 0.22),
+    )
+
+    # d6: Профиль полярной площади TPSA с учетом cns_profile_mode
+    if cfg.cns_profile_mode == "cns_high_bbb":
+        d_tpsa = harrington_one_sided_desirability(
+            value=tpsa,
+            bad_limit=95.0,
+            good_target=55.0,
+        )
+    elif cfg.cns_profile_mode == "neutral":
+        d_tpsa = harrington_one_sided_desirability(
+            value=tpsa,
+            bad_limit=20.0,
+            good_target=75.0,
+        )
+    else:
+        target_tpsa = min_tpsa if min_tpsa is not None else 80.0
+        d_tpsa = harrington_one_sided_desirability(
+            value=tpsa,
+            bad_limit=max(35.0, target_tpsa - 25.0),
+            good_target=max(85.0, target_tpsa + 15.0),
+        )
+
+    # d7: Водная растворимость LogS
+    d_logs = harrington_one_sided_desirability(
+        value=log_s_aq,
+        bad_limit=cfg.logs_poor_cutoff,
+        good_target=cfg.logs_soluble_cutoff,
+    )
+
+    desirabilities = {
+        "pic50": d_pic50,
+        "logp": d_logp,
+        "sascore": d_sa,
+        "qed": d_qed,
+        "tpsa": d_tpsa,
+        "logs": d_logs,
+        "herg": d_herg,
+    }
+
+    if cfg.alert_penalty_mode == "veto" and has_alerts:
+        return 0.0, desirabilities
+
+    weights = cfg.mpo_weights or {}
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for key, d_val in desirabilities.items():
+        w = max(0.0, float(weights.get(key, 0.0)))
+        if w > 0.0:
+            weighted_sum += w * math.log(max(1e-9, d_val))
+            total_weight += w
+
+    if total_weight > 0.0:
+        geom_mean = math.exp(weighted_sum / total_weight)
+    else:
+        geom_mean = (d_pic50 * d_logp * d_sa * d_qed * d_herg) ** (1.0 / 5.0)
+
+    if cfg.alert_penalty_mode == "soft_penalty" and has_alerts:
+        geom_mean *= float(cfg.alert_soft_multiplier)
+
+    return round(max(0.0, min(1.0, geom_mean)), 4), desirabilities
+
+
 def calculate_harrington_mpo_score(
     calc_rdkit: CalcRDKitMetrics,
     pred_admet: PredADMETMetrics,
     parent_exp_pic50: float,
     constraints: QueryConstraints,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> float:
     """Вычисляет обобщенный многопараметрический индекс желательности Харрингтона $D \\in [0, 1]$.
 
-    Формула (Раздел 6.1.4 ARCHITECTURE.md):
-        D = I_veto * (d_1 * d_2 * d_3 * d_4 * d_5) ** (1/5)
-    При срабатывании любого структурного алерта PAINS или Brenk накладывается жесткое вето: D = 0.0.
+    Учитывает `mpo_weights`, `cns_profile_mode`, `alert_penalty_mode`, `alert_soft_multiplier`
+    и пороги желательности из `ToolConfig`.
     """
-    if calc_rdkit.pains_alerts_count > 0 or calc_rdkit.brenk_alerts_count > 0:
-        return 0.0
-
-    # d1: Максимизация прогнозной активности pIC50 относительно родителя
-    d1_pic50 = harrington_one_sided_desirability(
-        value=pred_admet.predicted_pic50,
-        bad_limit=parent_exp_pic50 - 0.20,
-        good_target=parent_exp_pic50 + 0.55,
+    has_alerts = (
+        calc_rdkit.pains_alerts_count > 0
+        or calc_rdkit.brenk_alerts_count > 0
+        or calc_rdkit.extra_alerts_count > 0
     )
-
-    # d2: Липофильность cLogP в целевом коридоре [min_logp, max_logp]
-    d2_upper = harrington_one_sided_desirability(
-        value=calc_rdkit.clogp,
-        bad_limit=constraints.max_logp + 0.60,
-        good_target=constraints.max_logp - 0.50,
+    score, _ = compute_harrington_mpo_breakdown(
+        predicted_pic50=pred_admet.predicted_pic50,
+        parent_exp_pic50=parent_exp_pic50,
+        clogp=calc_rdkit.clogp,
+        sa_score=calc_rdkit.sa_score,
+        qed=calc_rdkit.qed,
+        tpsa=calc_rdkit.tpsa,
+        herg_liability_prob=pred_admet.herg_liability_prob,
+        log_s_aq=pred_admet.log_s_aq,
+        has_alerts=has_alerts,
+        min_logp=constraints.min_logp,
+        max_logp=constraints.max_logp,
+        max_sa_score=constraints.max_sa_score,
+        max_herg_prob=constraints.max_herg_prob,
+        min_tpsa=constraints.min_tpsa,
+        tool_config=tool_config,
     )
-    if constraints.min_logp is not None:
-        d2_lower = harrington_one_sided_desirability(
-            value=calc_rdkit.clogp,
-            bad_limit=constraints.min_logp - 0.50,
-            good_target=constraints.min_logp + 0.40,
-        )
-        d2_clogp = min(d2_upper, d2_lower)
-    else:
-        d2_clogp = d2_upper
-
-    # d3: Минимизация индекса синтетической доступности SAscore (<= max_sa_score)
-    d3_sa = harrington_one_sided_desirability(
-        value=calc_rdkit.sa_score,
-        bad_limit=constraints.max_sa_score + 0.80,
-        good_target=max(1.50, constraints.max_sa_score - 0.90),
-    )
-
-    # d4: Максимизация индекса лекарственного сходства QED (>= 0.55)
-    d4_qed = harrington_one_sided_desirability(
-        value=calc_rdkit.qed,
-        bad_limit=0.35,
-        good_target=0.65,
-    )
-
-    # d5: Минимизация вероятности кардиотоксичности hERG (<= max_herg_prob)
-    d5_herg = harrington_one_sided_desirability(
-        value=pred_admet.herg_liability_prob,
-        bad_limit=min(0.90, constraints.max_herg_prob + 0.15),
-        good_target=max(0.15, constraints.max_herg_prob - 0.22),
-    )
-
-    product = d1_pic50 * d2_clogp * d3_sa * d4_qed * d5_herg
-    geom_mean = product ** (1.0 / 5.0)
-    return round(max(0.0, min(1.0, geom_mean)), 4)
+    return score
 
 
 def check_candidate_constraints(
@@ -129,11 +230,11 @@ def check_candidate_constraints(
     candidate_mol: Chem.Mol,
     parent_mol: Chem.Mol,
     constraints: QueryConstraints,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[bool, list[str]]:
-    """Проверяет выполнение всех целевых ограничений пользователя из `QueryConstraints`.
-
-    Возвращает `(passes_all_constraints, constraint_violations)`.
-    """
+    """Проверяет выполнение всех целевых ограничений пользователя из `QueryConstraints` и `ToolConfig`."""
+    cfg = tool_config or ToolConfig()
     violations: list[str] = []
 
     if calc_rdkit.clogp > constraints.max_logp:
@@ -166,7 +267,7 @@ def check_candidate_constraints(
             f"hERG prob = {pred_admet.herg_liability_prob:.2f} > порога max_herg_prob ({constraints.max_herg_prob:.2f})"
         )
 
-    if constraints.require_no_pains:
+    if constraints.require_no_pains and cfg.alert_penalty_mode != "ignore":
         if calc_rdkit.pains_alerts_count > 0:
             violations.append(
                 f"PAINS alerts = {calc_rdkit.pains_alerts_count} ({', '.join(calc_rdkit.pains_matched_names)})"
@@ -175,12 +276,22 @@ def check_candidate_constraints(
             violations.append(
                 f"Brenk alerts = {calc_rdkit.brenk_alerts_count} ({', '.join(calc_rdkit.brenk_matched_names)})"
             )
+        if calc_rdkit.extra_alerts_count > 0:
+            violations.append(
+                f"Extra alerts = {calc_rdkit.extra_alerts_count} ({', '.join(calc_rdkit.extra_alerts_matched_names)})"
+            )
 
-    if constraints.freeze_scaffold:
+    eff_freeze = (
+        tool_config.freeze_murcko_core
+        if tool_config is not None
+        else constraints.freeze_scaffold
+    )
+    if eff_freeze:
         preserved, _scaf = verify_scaffold_preservation(
             parent_mol=parent_mol,
             candidate_mol=candidate_mol,
             freeze_scaffold=True,
+            tool_config=cfg,
         )
         if not preserved:
             violations.append("Нарушено сохранение базового скаффолда Bemis-Murcko")
@@ -236,20 +347,18 @@ def evaluate_lead_reference(
     lead_seed: ParentSeed,
     constraints: QueryConstraints,
     *,
-    preferred_admet_backend: Literal[
-        "auto",
-        "admet_ai_dmpnn",
-        "catboost_local_qsar",
-        "rdkit_analytical_qsar",
-    ]
-    | None = None,
+    preferred_admet_backend: ADMETBackendLiteral | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> CandidateMolecule:
     """Формирует референсную карточку `CandidateMolecule` для исходного соединения-лидера (Сценарий 2)."""
+    cfg = tool_config or ToolConfig()
     lead_mol = Chem.MolFromSmiles(lead_seed.canonical_smiles)
     if lead_mol is None:
         raise ValueError(f"Invalid lead SMILES: {lead_seed.canonical_smiles}")
 
-    calc_metrics = calculate_rdkit_metrics(lead_mol, parent_mol_or_smiles=lead_mol)
+    calc_metrics = calculate_rdkit_metrics(
+        lead_mol, parent_mol_or_smiles=lead_mol, tool_config=cfg
+    )
     admet_metrics = predict_admet_metrics(
         mol_or_smiles=lead_mol,
         rdkit_metrics=calc_metrics,
@@ -259,12 +368,14 @@ def evaluate_lead_reference(
         assay_homogeneous=True,
         generation_origin="mmp_smirks_rule",
         preferred_backend=preferred_admet_backend,
+        tool_config=cfg,
     )
     mpo_score = calculate_harrington_mpo_score(
         calc_rdkit=calc_metrics,
         pred_admet=admet_metrics,
         parent_exp_pic50=lead_seed.exp_pic50,
         constraints=constraints,
+        tool_config=cfg,
     )
     passes_all, violations = check_candidate_constraints(
         calc_rdkit=calc_metrics,
@@ -272,6 +383,7 @@ def evaluate_lead_reference(
         candidate_mol=lead_mol,
         parent_mol=lead_mol,
         constraints=constraints,
+        tool_config=cfg,
     )
     rationale = SARHypothesisRationale(
         generation_origin="mmp_smirks_rule",
@@ -305,6 +417,7 @@ def evaluate_lead_reference(
         passes_all_constraints=passes_all,
         constraint_violations=violations,
         highlighted_atom_indices=[],
+        alert_penalty_mode=cfg.alert_penalty_mode,
     )
 
 
@@ -314,13 +427,8 @@ def evaluate_and_rank_candidates(
     session_dir: Path | str,
     *,
     filename: str = "evaluated_candidates.parquet",
-    preferred_admet_backend: Literal[
-        "auto",
-        "admet_ai_dmpnn",
-        "catboost_local_qsar",
-        "rdkit_analytical_qsar",
-    ]
-    | None = None,
+    preferred_admet_backend: ADMETBackendLiteral | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[ParquetPointer, list[CandidateMolecule]]:
     """Оценивает пул сгенерированных кандидатов, сохраняет `evaluated_candidates.parquet` и ранжирует их.
 
@@ -330,6 +438,7 @@ def evaluate_and_rank_candidates(
     3. `pred_admet.predicted_pic50` (по убыванию)
     4. `-calc_rdkit.clogp` (при равном скоре предпочтение более гидрофильным структурам)
     """
+    cfg = tool_config or ToolConfig()
     resolved_session_dir = Path(session_dir).resolve()
     resolved_session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,6 +453,7 @@ def evaluate_and_rank_candidates(
         calc_metrics = calculate_rdkit_metrics(
             mol_or_smiles=cand_mol,
             parent_mol_or_smiles=parent_mol,
+            tool_config=cfg,
         )
         admet_metrics = predict_admet_metrics(
             mol_or_smiles=cand_mol,
@@ -354,12 +464,14 @@ def evaluate_and_rank_candidates(
             assay_homogeneous=raw_cand.assay_homogeneous,
             generation_origin=raw_cand.generation_origin,
             preferred_backend=preferred_admet_backend,
+            tool_config=cfg,
         )
         mpo_score = calculate_harrington_mpo_score(
             calc_rdkit=calc_metrics,
             pred_admet=admet_metrics,
             parent_exp_pic50=raw_cand.parent_seed.exp_pic50,
             constraints=constraints,
+            tool_config=cfg,
         )
         passes_all, violations = check_candidate_constraints(
             calc_rdkit=calc_metrics,
@@ -367,6 +479,7 @@ def evaluate_and_rank_candidates(
             candidate_mol=cand_mol,
             parent_mol=parent_mol,
             constraints=constraints,
+            tool_config=cfg,
         )
         rationale = build_hypothesis_rationale(
             raw_cand=raw_cand,
@@ -395,6 +508,7 @@ def evaluate_and_rank_candidates(
                 passes_all_constraints=passes_all,
                 constraint_violations=violations,
                 highlighted_atom_indices=raw_cand.highlighted_atom_indices,
+                alert_penalty_mode=cfg.alert_penalty_mode,
             )
         )
 
@@ -414,5 +528,10 @@ def evaluate_and_rank_candidates(
         filename=filename,
     )
 
-    top_k = evaluated_list[: constraints.top_k_candidates]
+    top_limit = (
+        int(tool_config.top_k_output)
+        if tool_config is not None
+        else int(constraints.top_k_candidates)
+    )
+    top_k = evaluated_list[:top_limit]
     return (candidates_pointer, top_k)

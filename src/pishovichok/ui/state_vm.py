@@ -9,24 +9,147 @@
 
 from __future__ import annotations
 
-import math
+from collections.abc import Iterable
 from typing import Any, Literal
 
-import numpy as np
 from pydantic import BaseModel, Field
 
-from pishovichok.core.scoring import harrington_one_sided_desirability
-from pishovichok.state.schemas import CandidateMolecule, QueryConstraints
+from pishovichok.core.scoring import compute_harrington_mpo_breakdown
+from pishovichok.state.schemas import (
+    CandidateMolecule,
+    ParamSourceLiteral,
+    QueryConstraints,
+    ToolConfig,
+)
+
+ApplyModeLiteral = Literal["instant_mpo", "evaluation", "design", "sar", "research"]
+
+PARAM_SOURCE_BADGE_META: dict[ParamSourceLiteral, tuple[str, str]] = {
+    "default": ("default", "slate"),
+    "nl_query": ("Из NL-запроса", "sky"),
+    "ui_manual": ("Manual UI", "purple"),
+    "critic_loop": ("Critic Auto-Tune", "amber"),
+}
+
+_RESEARCH_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "allowed_bao_formats",
+        "standard_types",
+        "relation_mode",
+        "pchembl_min_cutoff",
+        "duplicate_agg_method",
+        "max_duplicate_std",
+        "strip_salts",
+        "neutralize_charges",
+        "canonicalize_tautomers",
+        "keep_chirality",
+        "scaffold_mode",
+        "chembl_api_limit",
+        "min_neighborhood_rows_fallback",
+        "top_scaffolds_limit",
+        "neighborhood_tanimoto",
+        "strict_assay_homogeneity",
+        "max_refilter_iterations",
+    }
+)
+
+_SAR_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "mmpa_max_cuts",
+        "mmpa_max_cut_bonds",
+        "mmpa_min_core_heavy_atoms",
+        "min_support_pairs",
+        "min_mean_delta_pic50",
+        "max_rgroup_heavy_atoms",
+        "fp_type",
+        "fp_radius",
+        "fp_nbits",
+        "similarity_metric",
+        "cliff_similarity_cutoff",
+        "cliff_delta_pic50_cutoff",
+        "sali_epsilon",
+        "min_rules_before_enrichment",
+        "background_target_id",
+        "prioritize_positive_rules",
+    }
+)
+
+_DESIGN_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "generation_engine",
+        "crem_mode",
+        "crem_context_radius",
+        "crem_min_rel_atoms",
+        "crem_max_rel_atoms",
+        "crem_max_replacements",
+        "crem_max_fragment_heavy_atoms",
+        "freeze_murcko_core",
+        "protected_smarts",
+        "modifiable_atom_indices",
+        "max_candidates_pool",
+        "max_parent_seeds",
+        "use_bioisostere_catalog",
+        "bioisostere_fallback_threshold",
+        "max_iterations",
+        "strict_property_thresholds",
+        "critic_fallback_min_tpsa",
+        "critic_logp_step_reduction",
+    }
+)
+
+_EVALUATION_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "active_filter_catalogs",
+        "brenk_ignore_long_chain",
+        "custom_ban_smarts",
+        "extra_rdkit_descriptors",
+        "brics_min_fragment_size",
+        "brics_only_leaf_nodes",
+        "admet_backend",
+        "lipinski_mw_cutoff",
+        "lipinski_logp_cutoff",
+        "lipinski_hbd_cutoff",
+        "lipinski_hba_cutoff",
+        "herg_low_cutoff",
+        "herg_high_cutoff",
+        "logs_soluble_cutoff",
+        "logs_moderate_cutoff",
+        "logs_poor_cutoff",
+        "top_k_output",
+    }
+)
+
+
+def classify_tool_config_change_impact(changed_keys: Iterable[str]) -> ApplyModeLiteral:
+    """Определяет минимально достаточный режим пересчёта по набору изменённых полей `ToolConfig`."""
+    key_set = set(changed_keys)
+    if key_set & _RESEARCH_STAGE_KEYS:
+        return "research"
+    if key_set & _SAR_STAGE_KEYS:
+        return "sar"
+    if key_set & _DESIGN_STAGE_KEYS:
+        return "design"
+    if key_set & _EVALUATION_STAGE_KEYS:
+        return "evaluation"
+    return "instant_mpo"
 
 
 class MPOWeightsAndThresholds(BaseModel):
     """Интерактивные веса и пороги MPO-панели (управляются ползунками без перезапуска графа)."""
 
-    w_activity: float = Field(default=1.0, ge=0.0, le=5.0)
+    w_activity: float = Field(default=1.5, ge=0.0, le=5.0)
     w_logp: float = Field(default=1.0, ge=0.0, le=5.0)
     w_sa: float = Field(default=1.0, ge=0.0, le=5.0)
     w_qed: float = Field(default=1.0, ge=0.0, le=5.0)
-    w_herg: float = Field(default=1.0, ge=0.0, le=5.0)
+    w_tpsa: float = Field(default=0.8, ge=0.0, le=5.0)
+    w_logs: float = Field(default=0.8, ge=0.0, le=5.0)
+    w_herg: float = Field(default=1.2, ge=0.0, le=5.0)
+
+    cns_profile_mode: Literal["peripheral_low_bbb", "cns_high_bbb", "neutral"] = (
+        "peripheral_low_bbb"
+    )
+    alert_penalty_mode: Literal["veto", "soft_penalty", "ignore"] = "veto"
+    alert_soft_multiplier: float = Field(default=0.5, ge=0.0, le=1.0)
 
     min_logp: float | None = Field(default=None)
     max_logp: float = Field(default=4.5, ge=-2.0, le=8.0)
@@ -44,6 +167,23 @@ class MPOWeightsAndThresholds(BaseModel):
             max_herg_prob=constraints.max_herg_prob,
             max_mw=constraints.max_mw,
         )
+
+    def to_tool_config_overrides(self) -> dict[str, Any]:
+        """Преобразует UI-настройки MPO в словарь переопределений `ToolConfig`."""
+        return {
+            "mpo_weights": {
+                "pic50": self.w_activity,
+                "logp": self.w_logp,
+                "sascore": self.w_sa,
+                "qed": self.w_qed,
+                "tpsa": self.w_tpsa,
+                "logs": self.w_logs,
+                "herg": self.w_herg,
+            },
+            "cns_profile_mode": self.cns_profile_mode,
+            "alert_penalty_mode": self.alert_penalty_mode,
+            "alert_soft_multiplier": self.alert_soft_multiplier,
+        }
 
 
 class CandidateRowVM(BaseModel):
@@ -66,8 +206,12 @@ class CandidateRowVM(BaseModel):
     herg_prob: float
     herg_risk_level: str
     delta_herg: float
+    log_s_aq: float = -3.0
+    bbb_permeability_prob: float = 0.5
     pains_count: int
     brenk_count: int
+    extra_alerts_count: int = 0
+    alert_penalty_mode: Literal["veto", "soft_penalty", "ignore"] = "veto"
     rule_id: str
     applied_smirks: str
     generation_origin: str
@@ -79,6 +223,8 @@ class CandidateRowVM(BaseModel):
     desirability_d3_sa: float = 0.0
     desirability_d4_qed: float = 0.0
     desirability_d5_herg: float = 0.0
+    desirability_d6_tpsa: float = 0.0
+    desirability_d7_logs: float = 0.0
     pinned: bool = False
     excluded: bool = False
     pca_x: float = 0.0
@@ -86,7 +232,8 @@ class CandidateRowVM(BaseModel):
 
     @property
     def status_label(self) -> str:
-        if self.pains_count > 0 or self.brenk_count > 0:
+        has_alert = (self.pains_count + self.brenk_count + self.extra_alerts_count) > 0
+        if has_alert and self.alert_penalty_mode == "veto":
             return "⛔ Veto"
         if self.passes_all:
             return "✅ OK"
@@ -140,6 +287,8 @@ class StateViewModel:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.weights = MPOWeightsAndThresholds()
+        self.tool_config: ToolConfig = ToolConfig()
+        self.min_tpsa: float | None = None
         self.candidates_by_id: dict[str, CandidateMolecule] = {}
         self.rows_by_id: dict[str, CandidateRowVM] = {}
         self.row_order: list[str] = []
@@ -160,6 +309,24 @@ class StateViewModel:
         self.weights.max_sa_score = constraints.max_sa_score
         self.weights.max_herg_prob = constraints.max_herg_prob
         self.weights.max_mw = constraints.max_mw
+        self.min_tpsa = constraints.min_tpsa
+
+    def sync_tool_config(self, tool_config: ToolConfig | None) -> None:
+        """Синхронизирует веса MPO и полную конфигурацию ядра из `ToolConfig`."""
+        if tool_config is None:
+            return
+        self.tool_config = tool_config
+        mw = tool_config.mpo_weights
+        self.weights.w_activity = mw.get("pic50", self.weights.w_activity)
+        self.weights.w_logp = mw.get("logp", self.weights.w_logp)
+        self.weights.w_sa = mw.get("sascore", self.weights.w_sa)
+        self.weights.w_qed = mw.get("qed", self.weights.w_qed)
+        self.weights.w_tpsa = mw.get("tpsa", self.weights.w_tpsa)
+        self.weights.w_logs = mw.get("logs", self.weights.w_logs)
+        self.weights.w_herg = mw.get("herg", self.weights.w_herg)
+        self.weights.cns_profile_mode = tool_config.cns_profile_mode
+        self.weights.alert_penalty_mode = tool_config.alert_penalty_mode
+        self.weights.alert_soft_multiplier = tool_config.alert_soft_multiplier
 
     def upsert_candidates(
         self,
@@ -209,8 +376,12 @@ class StateViewModel:
                 herg_prob=cand.pred_admet.herg_liability_prob,
                 herg_risk_level=cand.pred_admet.herg_risk_level,
                 delta_herg=delta_herg,
+                log_s_aq=cand.pred_admet.log_s_aq,
+                bbb_permeability_prob=cand.pred_admet.bbb_permeability_prob,
                 pains_count=cand.calc_rdkit.pains_alerts_count,
                 brenk_count=cand.calc_rdkit.brenk_alerts_count,
+                extra_alerts_count=cand.calc_rdkit.extra_alerts_count,
+                alert_penalty_mode=self.weights.alert_penalty_mode,
                 rule_id=cand.hypothesis_rationale.rule_id,
                 applied_smirks=cand.hypothesis_rationale.applied_smirks,
                 generation_origin=cand.hypothesis_rationale.generation_origin,
@@ -245,77 +416,54 @@ class StateViewModel:
                     ref.pca_x, ref.pca_y = ref_coords[ref.mol_id]
 
     def recalculate_mpo(
-        self, weights: MPOWeightsAndThresholds | None = None
+        self,
+        weights: MPOWeightsAndThresholds | None = None,
+        *,
+        tool_config: ToolConfig | None = None,
     ) -> list[CandidateRowVM]:
-        """Мгновенно векторно пересчитывает MPO-скоры и статусы ограничений без вызова графа агентов."""
+        """Мгновенно пересчитывает MPO-скоры через `core/scoring.py` без вызова графа агентов."""
+        if tool_config is not None:
+            self.sync_tool_config(tool_config)
         if weights is not None:
             self.weights = weights
 
         if not self.row_order:
             return []
 
-        w_vec = np.array(
-            [
-                self.weights.w_activity,
-                self.weights.w_logp,
-                self.weights.w_sa,
-                self.weights.w_qed,
-                self.weights.w_herg,
-            ],
-            dtype=np.float64,
+        effective_tc, _ = self.tool_config.apply_overrides(
+            self.weights.to_tool_config_overrides()
         )
-        w_sum = float(np.sum(w_vec))
-        if w_sum <= 1e-9:
-            w_vec = np.ones(5, dtype=np.float64)
-            w_sum = 5.0
-
         rows = [self.rows_by_id[cid] for cid in self.row_order if cid in self.rows_by_id]
-        n = len(rows)
-        d_matrix = np.zeros((n, 5), dtype=np.float64)
-        veto_mask = np.ones(n, dtype=np.float64)
 
-        for i, row in enumerate(rows):
-            if row.pains_count > 0 or row.brenk_count > 0:
-                veto_mask[i] = 0.0
-
-            d1 = harrington_one_sided_desirability(
-                row.predicted_pic50,
-                row.parent_exp_pic50 - 0.20,
-                row.parent_exp_pic50 + 0.55,
-            )
-            d2_up = harrington_one_sided_desirability(
-                row.clogp,
-                self.weights.max_logp + 0.60,
-                self.weights.max_logp - 0.50,
-            )
-            if self.weights.min_logp is not None:
-                d2_low = harrington_one_sided_desirability(
-                    row.clogp,
-                    self.weights.min_logp - 0.50,
-                    self.weights.min_logp + 0.40,
-                )
-                d2 = min(d2_up, d2_low)
-            else:
-                d2 = d2_up
-
-            d3 = harrington_one_sided_desirability(
-                row.sa_score,
-                self.weights.max_sa_score + 0.80,
-                max(1.50, self.weights.max_sa_score - 0.90),
-            )
-            d4 = harrington_one_sided_desirability(row.qed, 0.35, 0.65)
-            d5 = harrington_one_sided_desirability(
-                row.herg_prob,
-                min(0.90, self.weights.max_herg_prob + 0.15),
-                max(0.15, self.weights.max_herg_prob - 0.22),
+        for row in rows:
+            has_alert = (row.pains_count + row.brenk_count + row.extra_alerts_count) > 0
+            score, desirabilities = compute_harrington_mpo_breakdown(
+                predicted_pic50=row.predicted_pic50,
+                parent_exp_pic50=row.parent_exp_pic50,
+                clogp=row.clogp,
+                sa_score=row.sa_score,
+                qed=row.qed,
+                tpsa=row.tpsa,
+                herg_liability_prob=row.herg_prob,
+                log_s_aq=row.log_s_aq,
+                has_alerts=has_alert,
+                min_logp=self.weights.min_logp,
+                max_logp=self.weights.max_logp,
+                max_sa_score=self.weights.max_sa_score,
+                max_herg_prob=self.weights.max_herg_prob,
+                min_tpsa=self.min_tpsa,
+                tool_config=effective_tc,
             )
 
-            d_matrix[i] = [d1, d2, d3, d4, d5]
-            row.desirability_d1_activity = round(d1, 4)
-            row.desirability_d2_clogp = round(d2, 4)
-            row.desirability_d3_sa = round(d3, 4)
-            row.desirability_d4_qed = round(d4, 4)
-            row.desirability_d5_herg = round(d5, 4)
+            row.mpo_score = score
+            row.alert_penalty_mode = effective_tc.alert_penalty_mode
+            row.desirability_d1_activity = round(desirabilities["pic50"], 4)
+            row.desirability_d2_clogp = round(desirabilities["logp"], 4)
+            row.desirability_d3_sa = round(desirabilities["sascore"], 4)
+            row.desirability_d4_qed = round(desirabilities["qed"], 4)
+            row.desirability_d5_herg = round(desirabilities["herg"], 4)
+            row.desirability_d6_tpsa = round(desirabilities["tpsa"], 4)
+            row.desirability_d7_logs = round(desirabilities["logs"], 4)
 
             # Пересчёт нарушений по текущим порогам слайдеров
             violations: list[str] = []
@@ -337,24 +485,18 @@ class StateViewModel:
                 )
             if row.mw > self.weights.max_mw:
                 violations.append(f"MW = {row.mw:.1f} > {self.weights.max_mw:.1f}")
-            if row.pains_count > 0:
-                violations.append(f"PAINS = {row.pains_count}")
-            if row.brenk_count > 0:
-                violations.append(f"Brenk = {row.brenk_count}")
+            if self.min_tpsa is not None and row.tpsa < self.min_tpsa:
+                violations.append(f"TPSA = {row.tpsa:.2f} < {self.min_tpsa:.2f}")
+            if effective_tc.alert_penalty_mode != "ignore":
+                if row.pains_count > 0:
+                    violations.append(f"PAINS = {row.pains_count}")
+                if row.brenk_count > 0:
+                    violations.append(f"Brenk = {row.brenk_count}")
+                if row.extra_alerts_count > 0:
+                    violations.append(f"ExtraAlerts = {row.extra_alerts_count}")
 
             row.violations = violations
             row.passes_all = len(violations) == 0
-
-        # Векторизованное взвешенное среднее геометрическое в log-пространстве
-        safe_d = np.clip(d_matrix, 1e-9, 1.0)
-        log_scores = np.sum(np.log(safe_d) * w_vec, axis=1) / w_sum
-        scores = np.where(veto_mask > 0.0, np.exp(log_scores), 0.0)
-
-        for i, row in enumerate(rows):
-            val = float(scores[i])
-            if math.isnan(val) or math.isinf(val):
-                val = 0.0
-            row.mpo_score = round(max(0.0, min(1.0, val)), 4)
 
         return rows
 

@@ -28,7 +28,7 @@ from rdkit.Chem import AllChem, Descriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from pishovichok.config import settings
-from pishovichok.core.bioisosteres import CURATED_BIOISOSTERE_CATALOG
+from pishovichok.core.bioisosteres import select_bioisostere_rules
 from pishovichok.core.curation import standardize_molecule_detailed
 from pishovichok.core.sar_analysis import (
     canonicalize_substituent_smiles,
@@ -40,6 +40,7 @@ from pishovichok.state.schemas import (
     ParquetPointer,
     QueryConstraints,
     SARRule,
+    ToolConfig,
 )
 from pishovichok.state.storage import read_parquet_pointer
 
@@ -212,32 +213,48 @@ def verify_scaffold_preservation(
     parent_mol: Chem.Mol,
     candidate_mol: Chem.Mol,
     freeze_scaffold: bool = True,
+    *,
+    scaffold_mode: str = "bemis_murcko",
+    tool_config: ToolConfig | None = None,
 ) -> tuple[bool, str]:
-    """Проверяет сохранение целевого каркаса Bemis-Murcko родительской молекулы в кандидате.
+    """Проверяет сохранение целевого каркаса Bemis-Murcko (или generic_framework) родительской молекулы.
 
     Возвращает `(is_preserved, candidate_scaffold_smiles)`.
     """
-    cand_scaf_mol = MurckoScaffold.GetScaffoldForMol(candidate_mol)
+    eff_mode = tool_config.scaffold_mode if tool_config is not None else scaffold_mode
+    use_isomeric = tool_config.keep_chirality if tool_config is not None else True
+
+    def _extract_scaf_mol(m: Chem.Mol) -> Chem.Mol | None:
+        scaf = MurckoScaffold.GetScaffoldForMol(m)
+        if (
+            eff_mode == "generic_framework"
+            and scaf is not None
+            and scaf.GetNumAtoms() > 0
+        ):
+            scaf = MurckoScaffold.MakeScaffoldGeneric(scaf)
+        return scaf
+
+    cand_scaf_mol = _extract_scaf_mol(candidate_mol)
     cand_scaf_smi = (
-        Chem.MolToSmiles(cand_scaf_mol, canonical=True, isomericSmiles=True)
+        Chem.MolToSmiles(cand_scaf_mol, canonical=True, isomericSmiles=use_isomeric)
         if cand_scaf_mol is not None and cand_scaf_mol.GetNumAtoms() > 0
-        else Chem.MolToSmiles(candidate_mol, canonical=True, isomericSmiles=True)
+        else Chem.MolToSmiles(candidate_mol, canonical=True, isomericSmiles=use_isomeric)
     )
     if not freeze_scaffold:
         return (True, cand_scaf_smi)
 
-    parent_scaf_mol = MurckoScaffold.GetScaffoldForMol(parent_mol)
+    parent_scaf_mol = _extract_scaf_mol(parent_mol)
     if parent_scaf_mol is None or parent_scaf_mol.GetNumAtoms() == 0:
         return (True, cand_scaf_smi)
 
     parent_scaf_smi = Chem.MolToSmiles(
-        parent_scaf_mol, canonical=True, isomericSmiles=True
+        parent_scaf_mol, canonical=True, isomericSmiles=use_isomeric
     )
     if cand_scaf_smi == parent_scaf_smi:
         return (True, cand_scaf_smi)
 
     # Если заместитель сам содержал небольшое периферийное кольцо, проверяем, что родительский
-    # каркас Bemis-Murcko полностью сохранен как неизменная подструктура и число колец не уменьшилось
+    # каркас полностью сохранен как неизменная подструктура и число колец не уменьшилось
     if (
         cand_scaf_mol is not None
         and cand_scaf_mol.GetNumAtoms() >= parent_scaf_mol.GetNumAtoms()
@@ -248,39 +265,130 @@ def verify_scaffold_preservation(
     return (False, cand_scaf_smi)
 
 
+def _strip_dummy_atoms(core_smiles: str) -> Chem.Mol | None:
+    core_mol = Chem.MolFromSmiles(core_smiles)
+    if core_mol is None:
+        return None
+    rw_core = Chem.RWMol(core_mol)
+    for d_idx in sorted(
+        [a.GetIdx() for a in rw_core.GetAtoms() if a.GetAtomicNum() == 0],
+        reverse=True,
+    ):
+        rw_core.RemoveAtom(d_idx)
+    clean_core = rw_core.GetMol()
+    try:
+        Chem.SanitizeMol(clean_core)
+        return clean_core
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_cut_allowed(
+    parent_mol: Chem.Mol,
+    core_smi: str,
+    protected_atoms: set[int],
+    modifiable_atoms: set[int] | None,
+) -> bool:
+    """Проверяет, что разрез не затрагивает protected_smarts и попадает в modifiable_atom_indices."""
+    if not protected_atoms and modifiable_atoms is None:
+        return True
+    clean_core = _strip_dummy_atoms(core_smi)
+    if clean_core is None:
+        return False
+    matches = parent_mol.GetSubstructMatches(clean_core)
+    if not matches:
+        return False
+    all_parent_indices = set(range(parent_mol.GetNumAtoms()))
+    for match in matches:
+        replaced_indices = all_parent_indices - set(match)
+        if not replaced_indices:
+            continue
+        if protected_atoms and (replaced_indices & protected_atoms):
+            continue
+        if modifiable_atoms is not None and not (replaced_indices & modifiable_atoms):
+            continue
+        return True
+    return False
+
+
 def apply_smirks_to_molecule(
     parent_mol: Chem.Mol,
     from_fragment: str,
     to_fragment: str,
     freeze_scaffold: bool = True,
+    *,
+    protected_smarts: str | None = None,
+    modifiable_atom_indices: list[int] | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> list[tuple[str, str, list[int]]]:
     """Применяет трансформацию `from_fragment >> to_fragment` к `parent_mol` с гарантией 100% валидности.
 
-    Использует два взаимодополняющих механизма:
-    1. Реакционный движок `AllChem.ReactionFromSmarts` со строгими SMARTS-ограничениями валентности.
-    2. Точную замену периферийного радикала по разрезам `fragment_molecule_mmpa(parent_mol)` через
-       `Chem.ReplaceSubstructs` на метке `[*:1]`.
-
-    Возвращает список кортежей `(canonical_product_smiles, scaffold_smiles, highlighted_atom_indices)`.
+    Учитывает `protected_smarts`, `modifiable_atom_indices`, `freeze_murcko_core`, `mmpa_max_cuts`
+    и `scaffold_mode` из `tool_config`.
     """
+    cfg = tool_config
     canon_from = canonicalize_substituent_smiles(from_fragment)
     canon_to = canonicalize_substituent_smiles(to_fragment)
     if canon_from == canon_to:
         return []
 
+    eff_protected = (
+        protected_smarts
+        if protected_smarts is not None
+        else (cfg.protected_smarts if cfg is not None else None)
+    )
+    eff_modifiable = (
+        modifiable_atom_indices
+        if modifiable_atom_indices is not None
+        else (cfg.modifiable_atom_indices if cfg is not None else None)
+    )
+    eff_freeze = (
+        cfg.freeze_murcko_core
+        if (cfg is not None and freeze_scaffold)
+        else freeze_scaffold
+    )
+    if cfg is not None and not cfg.freeze_murcko_core:
+        eff_freeze = False
+
+    prot_mol: Chem.Mol | None = None
+    protected_atoms: set[int] = set()
+    if eff_protected:
+        prot_mol = Chem.MolFromSmarts(eff_protected) or Chem.MolFromSmiles(
+            eff_protected
+        )
+        if prot_mol is not None:
+            for m in parent_mol.GetSubstructMatches(prot_mol):
+                protected_atoms.update(m)
+
+    modifiable_set: set[int] | None = (
+        set(eff_modifiable) if eff_modifiable is not None else None
+    )
+
     parent_smiles = Chem.MolToSmiles(parent_mol, canonical=True, isomericSmiles=True)
-    mmpa_cuts = fragment_molecule_mmpa(parent_mol, max_cuts=1)
+    mmpa_cuts = fragment_molecule_mmpa(
+        parent_mol,
+        max_cuts=cfg.mmpa_max_cuts if cfg is not None else 1,
+        max_rgroup_heavy_atoms=cfg.max_rgroup_heavy_atoms if cfg is not None else 13,
+        min_core_heavy_atoms=cfg.mmpa_min_core_heavy_atoms if cfg is not None else 6,
+        max_cut_bonds=cfg.mmpa_max_cut_bonds if cfg is not None else 20,
+    )
     matching_cores = [
         core_smi
         for core_smi, rg_smi, _ring, _heavy in mmpa_cuts
         if rg_smi == canon_from
+        and _is_cut_allowed(parent_mol, core_smi, protected_atoms, modifiable_set)
     ]
 
     raw_product_mols: list[tuple[Chem.Mol, str]] = []
 
-    # Способ 1: Прямой запуск AllChem.ReactionFromSmarts со строгим SMARTS уходящей группы
+    # Способ 1: Прямой запуск AllChem.ReactionFromSmarts (если не заданы точечные ограничения)
     constrained_smirks = build_constrained_reaction_smarts(canon_from, canon_to)
-    if constrained_smirks is not None and matching_cores:
+    if (
+        constrained_smirks is not None
+        and matching_cores
+        and not eff_protected
+        and modifiable_set is None
+    ):
         with contextlib.suppress(Exception):
             rxn = AllChem.ReactionFromSmarts(constrained_smirks)
             if rxn is not None:
@@ -318,8 +426,9 @@ def apply_smirks_to_molecule(
         with contextlib.suppress(Exception):
             mol_copy = Chem.Mol(prod_mol)
             Chem.SanitizeMol(mol_copy)
+            use_iso = cfg.keep_chirality if cfg is not None else True
             canon_prod_smi = Chem.MolToSmiles(
-                mol_copy, canonical=True, isomericSmiles=True
+                mol_copy, canonical=True, isomericSmiles=use_iso
             )
             if not canon_prod_smi or "." in canon_prod_smi or "*" in canon_prod_smi:
                 continue
@@ -331,10 +440,14 @@ def apply_smirks_to_molecule(
             if verified_mol is None or verified_mol.GetNumAtoms() == 0:
                 continue
 
+            if prot_mol is not None and not verified_mol.HasSubstructMatch(prot_mol):
+                continue
+
             preserved, scaf_smi = verify_scaffold_preservation(
                 parent_mol=parent_mol,
                 candidate_mol=verified_mol,
-                freeze_scaffold=freeze_scaffold,
+                freeze_scaffold=eff_freeze,
+                tool_config=cfg,
             )
             if not preserved:
                 continue
@@ -349,19 +462,32 @@ def apply_smirks_to_molecule(
 def _load_crem_replacements_from_db(
     crem_db_path: Path | None = None,
     max_sa_score: float = 3.2,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> list[_TransformationCandidateSpec]:
-    """Загружает контекстные замены фрагментов ($r=3$) из локальной SQLite БД CReM (`replacements_sa2.db`)."""
+    """Загружает контекстные замены фрагментов из локальной SQLite БД CReM (`replacements_sa2.db`)."""
+    cfg = tool_config or ToolConfig()
     db_path = Path(crem_db_path) if crem_db_path is not None else settings.crem_db_path
     if not db_path.is_file():
         return []
 
     specs: list[_TransformationCandidateSpec] = []
+    target_table = f"radius{int(cfg.crem_context_radius)}"
     try:
         with sqlite3.connect(db_path) as conn:
+            tables = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            table_name = target_table if target_table in tables else "radius3"
+            if table_name not in tables:
+                return []
             rows = conn.execute(
-                """
+                f"""
                 SELECT context, from_smarts, to_smarts, radius, sa_score, delta_clogp, delta_tpsa
-                FROM radius3
+                FROM {table_name}
                 WHERE sa_score <= ?
                 ORDER BY delta_tpsa DESC, sa_score ASC
                 """,
@@ -370,10 +496,24 @@ def _load_crem_replacements_from_db(
     except Exception:  # noqa: BLE001
         return []
 
+    min_rel = (
+        max(1, int(cfg.crem_min_rel_atoms))
+        if cfg.crem_mode == "grow"
+        else int(cfg.crem_min_rel_atoms)
+    )
+    max_rel = int(cfg.crem_max_rel_atoms)
+
     for idx, row in enumerate(rows, start=1):
-        _ctx, from_s, to_s, _rad, sa_val, d_logp, d_tpsa = row
+        _ctx, from_s, to_s, rad, sa_val, d_logp, d_tpsa = row
         canon_from = canonicalize_substituent_smiles(str(from_s))
         canon_to = canonicalize_substituent_smiles(str(to_s))
+        from_heavy = _fragment_heavy_atoms(canon_from)
+        to_heavy = _fragment_heavy_atoms(canon_to)
+        rel_atoms = to_heavy - from_heavy
+        if cfg.crem_mode == "grow" and rel_atoms <= 0:
+            continue
+        if rel_atoms < min_rel or rel_atoms > max_rel:
+            continue
         smirks = f"{canon_from}>>{canon_to}"
         # Оценочный прирост активности для изостерных замен CReM на основе полярного и липофильного баланса
         est_delta_pic50 = round(
@@ -381,7 +521,7 @@ def _load_crem_replacements_from_db(
         )
         specs.append(
             _TransformationCandidateSpec(
-                rule_id=f"CREM_R3_{idx:02d}",
+                rule_id=f"CREM_R{int(rad)}_{idx:02d}",
                 smirks=smirks,
                 from_fragment=canon_from,
                 to_fragment=canon_to,
@@ -394,9 +534,11 @@ def _load_crem_replacements_from_db(
                 delta_tpsa=float(d_tpsa),
                 sa_score_estimate=float(sa_val),
                 contains_halogen=fragment_contains_halogen(canon_to),
-                heavy_atoms_to=_fragment_heavy_atoms(canon_to),
+                heavy_atoms_to=to_heavy,
             )
         )
+        if len(specs) >= int(cfg.crem_max_replacements):
+            break
     return specs
 
 
@@ -406,8 +548,11 @@ def _filter_and_rank_transformation_specs(
     parent_clogp: float,
     parent_tpsa: float,
     generation_iteration: int,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> list[_TransformationCandidateSpec]:
     """Фильтрует и ранжирует трансформации с учетом базовых и корректирующих ограничений."""
+    cfg = tool_config or ToolConfig()
     pref_types = set(constraints.preferred_substituent_types or ["any"])
     want_exclude_halogens = "exclude_halogens" in pref_types
     want_polar = "polar" in pref_types or (
@@ -430,7 +575,7 @@ def _filter_and_rank_transformation_specs(
                 continue
             if want_polar and spec.delta_tpsa < 0.0:
                 continue
-            # Если липофильность родителя существенно превышает целевой порог (например, гефитиниб 4.28 vs 3.5),
+            # Если липофильность родителя существенно превышает целевой порог,
             # отсекаем слабые замены, которые не дают достаточного снижения cLogP
             required_logp_drop = parent_clogp - constraints.max_logp
             if required_logp_drop > 0.30 and spec.delta_clogp > -0.20:
@@ -449,10 +594,6 @@ def _filter_and_rank_transformation_specs(
 
     def _sort_key(s: _TransformationCandidateSpec) -> tuple[float, ...]:
         if is_corrective_mode:
-            # В режиме самокоррекции приоритет отдается:
-            # 1) Выходам за пределы порога max_logp (ожидаемый cLogP <= max_logp)
-            # 2) Выходам на целевую полярную площадь min_tpsa
-            # 3) Снижению cLogP и росту TPSA при высокой ожидаемой активности и компактности радикала
             projected_clogp = parent_clogp + s.delta_clogp
             projected_tpsa = parent_tpsa + s.delta_tpsa
             meets_logp = 1.0 if projected_clogp <= constraints.max_logp else 0.0
@@ -464,7 +605,11 @@ def _filter_and_rank_transformation_specs(
                 )
                 else 0.0
             )
-            compact_bonus = 1.0 if s.heavy_atoms_to <= 4 else 0.0
+            compact_bonus = (
+                1.0
+                if s.heavy_atoms_to <= int(cfg.crem_max_fragment_heavy_atoms)
+                else 0.0
+            )
             polar_score = (
                 (-s.delta_clogp * 1.5) + (s.delta_tpsa / 20.0) + s.mean_delta_pic50
             )
@@ -496,7 +641,9 @@ def _filter_and_rank_transformation_specs(
 def select_parent_seeds_from_curated(
     curated_pointer: ParquetPointer,
     constraints: QueryConstraints,
-    max_parents: int = 5,
+    max_parents: int | None = None,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> list[ParentSeed]:
     """Выбирает родительские молекулы `ParentSeed` из `curated_dataset.parquet`.
 
@@ -504,6 +651,8 @@ def select_parent_seeds_from_curated(
       саму молекулу-лидера (например, гефитиниб `CHEMBL939`) на первой позиции.
     - Для Сценариев 1 и 3 выбирает топ активных нецензурированных соединений из доминирующего скаффолда.
     """
+    cfg = tool_config or ToolConfig()
+    eff_max_parents = max_parents if max_parents is not None else cfg.max_parent_seeds
     rows = read_parquet_pointer(curated_pointer).to_pylist()
     active_rows = [r for r in rows if not bool(r.get("is_censored", False))]
     if not active_rows:
@@ -513,7 +662,9 @@ def select_parent_seeds_from_curated(
     seen_smiles: set[str] = set()
 
     if constraints.lead_smiles:
-        std_lead = standardize_molecule_detailed(constraints.lead_smiles)
+        std_lead = standardize_molecule_detailed(
+            constraints.lead_smiles, tool_config=cfg
+        )
         lead_canon = (
             std_lead.canonical_smiles
             if std_lead is not None
@@ -557,8 +708,7 @@ def select_parent_seeds_from_curated(
             )
         seen_smiles.add(lead_canon)
 
-        # В режиме оптимизации конкретного лидера с замороженным скаффолдом генерируем аналоги
-        # непосредственно от молекулы-лидера, чтобы все дельты считались относительно него
+        # В режиме оптимизации конкретного лидера генерируем аналоги непосредственно от лидера
         if constraints.scenario_type == "lead_optimization":
             return seeds
 
@@ -567,10 +717,12 @@ def select_parent_seeds_from_curated(
         mol = Chem.MolFromSmiles(csmi)
         pains_clean = 1.0
         if constraints.require_no_pains and mol is not None:
-            from pishovichok.core.evaluation import check_structural_alerts
+            from pishovichok.core.evaluation import check_structural_alerts_detailed
 
-            p, _, b, _, _ = check_structural_alerts(mol)
-            if p > 0 or b > 0:
+            p, _, b, _, _, extra_cnt, _ = check_structural_alerts_detailed(
+                mol, tool_config=cfg
+            )
+            if p > 0 or b > 0 or extra_cnt > 0:
                 pains_clean = 0.0
 
         return (
@@ -608,7 +760,7 @@ def select_parent_seeds_from_curated(
                 source_dataset=src_label,
             )
         )
-        if len(seeds) >= max_parents:
+        if len(seeds) >= eff_max_parents:
             break
 
     return seeds
@@ -622,94 +774,92 @@ def generate_candidate_structures(
     max_candidates_pool: int | None = None,
     *,
     crem_db_path: Path | str | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> list[GeneratedRawCandidate]:
-    """Генерирует пул валидных молекул-кандидатов по 3-уровневому каскаду (SMIRKS -> CReM -> Биоизостеры).
-
-    Параметры:
-    - `parent_molecules`: список родительских соединений `ParentSeed`.
-    - `sar_rules`: извлеченные правила `SARRule` из `sar_analysis.py`.
-    - `constraints`: целевые и корректирующие ограничения `QueryConstraints`.
-    - `generation_iteration`: номер итерации дизайна (1 — первичный дизайн, 2+ — самокоррекция).
-    - `max_candidates_pool`: максимальный размер возвращаемого пула кандидатов.
-    """
+    """Генерирует пул валидных молекул-кандидатов по 3-уровневому каскаду (SMIRKS -> CReM -> Биоизостеры)."""
+    cfg = tool_config or ToolConfig()
     pool_limit = (
         int(max_candidates_pool)
         if max_candidates_pool is not None
-        else settings.max_candidates_pool
+        else (
+            tool_config.max_candidates_pool
+            if tool_config is not None
+            else settings.max_candidates_pool
+        )
     )
     if not parent_molecules:
         return []
 
-    # 1. Собираем единый список правил из 3 эшелонов каскада:
-    # Эшелон 1: Экспериментальные правила rdMMPA (SARRule)
+    # 1. Собираем правила согласно generation_engine ('mmp_and_crem', 'mmp_only', 'crem_only')
     mmp_specs: list[_TransformationCandidateSpec] = []
-    for r in sar_rules:
-        canon_from = canonicalize_substituent_smiles(r.from_fragment)
-        canon_to = canonicalize_substituent_smiles(r.to_fragment)
-        mmp_specs.append(
-            _TransformationCandidateSpec(
-                rule_id=r.rule_id,
-                smirks=f"{canon_from}>>{canon_to}",
-                from_fragment=canon_from,
-                to_fragment=canon_to,
-                generation_origin="mmp_smirks_rule",
-                mean_delta_pic50=float(r.mean_delta_pic50),
-                std_delta_pic50=float(r.std_delta_pic50),
-                support_pairs_count=int(r.support_pairs_count),
-                assay_homogeneous=bool(r.assay_homogeneous),
-                delta_clogp=float(r.mean_delta_clogp),
-                delta_tpsa=float(r.mean_delta_tpsa),
-                sa_score_estimate=2.2,
-                contains_halogen=fragment_contains_halogen(canon_to),
-                heavy_atoms_to=_fragment_heavy_atoms(canon_to),
+    if cfg.generation_engine in ("mmp_and_crem", "mmp_only"):
+        for r in sar_rules:
+            canon_from = canonicalize_substituent_smiles(r.from_fragment)
+            canon_to = canonicalize_substituent_smiles(r.to_fragment)
+            mmp_specs.append(
+                _TransformationCandidateSpec(
+                    rule_id=r.rule_id,
+                    smirks=f"{canon_from}>>{canon_to}",
+                    from_fragment=canon_from,
+                    to_fragment=canon_to,
+                    generation_origin="mmp_smirks_rule",
+                    mean_delta_pic50=float(r.mean_delta_pic50),
+                    std_delta_pic50=float(r.std_delta_pic50),
+                    support_pairs_count=int(r.support_pairs_count),
+                    assay_homogeneous=bool(r.assay_homogeneous),
+                    delta_clogp=float(r.mean_delta_clogp),
+                    delta_tpsa=float(r.mean_delta_tpsa),
+                    sa_score_estimate=2.2,
+                    contains_halogen=fragment_contains_halogen(canon_to),
+                    heavy_atoms_to=_fragment_heavy_atoms(canon_to),
+                )
             )
+
+    crem_specs: list[_TransformationCandidateSpec] = []
+    if cfg.generation_engine in ("mmp_and_crem", "crem_only"):
+        resolved_crem_path = (
+            Path(crem_db_path) if crem_db_path is not None else settings.crem_db_path
+        )
+        crem_specs = _load_crem_replacements_from_db(
+            crem_db_path=resolved_crem_path,
+            max_sa_score=constraints.max_sa_score,
+            tool_config=cfg,
         )
 
-    # Эшелон 2: Контекстные замены из локальной БД CReM (data/crem/replacements_sa2.db)
-    resolved_crem_path = (
-        Path(crem_db_path) if crem_db_path is not None else settings.crem_db_path
-    )
-    crem_specs = _load_crem_replacements_from_db(
-        crem_db_path=resolved_crem_path,
-        max_sa_score=constraints.max_sa_score,
-    )
-
-    # Эшелон 3: Курированный каталог медико-химических биоизостеров (48 правил)
-    # Подключается на итерации самокоррекции (iteration >= 2), при специфических директивах
-    # либо при малом числе экспериментальных правил SAR (< 5)
     include_bioisosteres = (
-        generation_iteration >= 2
-        or len(sar_rules) < 5
-        or "polar" in (constraints.preferred_substituent_types or [])
-        or "less_lipophilic" in (constraints.preferred_substituent_types or [])
-        or "exclude_halogens" in (constraints.preferred_substituent_types or [])
+        cfg.generation_engine == "mmp_and_crem"
+        and cfg.use_bioisostere_catalog
+        and (
+            generation_iteration >= 2
+            or len(sar_rules) < int(cfg.bioisostere_fallback_threshold)
+            or "polar" in (constraints.preferred_substituent_types or [])
+            or "less_lipophilic" in (constraints.preferred_substituent_types or [])
+            or "exclude_halogens" in (constraints.preferred_substituent_types or [])
+        )
     )
 
-    bio_specs: list[_TransformationCandidateSpec] = (
-        [
-            _TransformationCandidateSpec(
-                rule_id=b.rule_id,
-                smirks=b.smirks,
-                from_fragment=canonicalize_substituent_smiles(b.from_fragment),
-                to_fragment=canonicalize_substituent_smiles(b.to_fragment),
-                generation_origin="bioisostere_catalog",
-                mean_delta_pic50=b.expected_delta_pic50,
-                std_delta_pic50=0.20,
-                support_pairs_count=0,
-                assay_homogeneous=True,
-                delta_clogp=b.delta_clogp,
-                delta_tpsa=b.delta_tpsa,
-                sa_score_estimate=b.sa_score,
-                contains_halogen=b.contains_halogen,
-                heavy_atoms_to=max(1, _fragment_heavy_atoms(b.to_fragment)),
-            )
-            for b in CURATED_BIOISOSTERE_CATALOG
-        ]
-        if include_bioisosteres
-        else []
-    )
+    bio_rules = select_bioisostere_rules(cfg) if include_bioisosteres else []
+    bio_specs: list[_TransformationCandidateSpec] = [
+        _TransformationCandidateSpec(
+            rule_id=b.rule_id,
+            smirks=b.smirks,
+            from_fragment=canonicalize_substituent_smiles(b.from_fragment),
+            to_fragment=canonicalize_substituent_smiles(b.to_fragment),
+            generation_origin="bioisostere_catalog",
+            mean_delta_pic50=b.expected_delta_pic50,
+            std_delta_pic50=0.20,
+            support_pairs_count=0,
+            assay_homogeneous=True,
+            delta_clogp=b.delta_clogp,
+            delta_tpsa=b.delta_tpsa,
+            sa_score_estimate=b.sa_score,
+            contains_halogen=b.contains_halogen,
+            heavy_atoms_to=max(1, _fragment_heavy_atoms(b.to_fragment)),
+        )
+        for b in bio_rules
+    ]
 
-    # Объединяем все 3 уровня без потери приоритета экспериментальных правил для одинаковых SMIRKS
+    # Объединяем эшелоны без потери приоритета экспериментальных правил для одинаковых SMIRKS
     combined_specs_by_smirks: dict[str, _TransformationCandidateSpec] = {}
     for spec in [*mmp_specs, *crem_specs, *bio_specs]:
         if spec.smirks not in combined_specs_by_smirks:
@@ -719,6 +869,11 @@ def generate_candidate_structures(
 
     generated_candidates: list[GeneratedRawCandidate] = []
     global_seen_smiles: set[str] = {p.canonical_smiles for p in parent_molecules}
+    eff_freeze = (
+        tool_config.freeze_murcko_core
+        if tool_config is not None
+        else constraints.freeze_scaffold
+    )
 
     for parent in parent_molecules:
         parent_mol = Chem.MolFromSmiles(parent.canonical_smiles)
@@ -734,6 +889,7 @@ def generate_candidate_structures(
             parent_clogp=parent_clogp,
             parent_tpsa=parent_tpsa,
             generation_iteration=generation_iteration,
+            tool_config=cfg,
         )
 
         for spec in ranked_specs:
@@ -741,7 +897,8 @@ def generate_candidate_structures(
                 parent_mol=parent_mol,
                 from_fragment=spec.from_fragment,
                 to_fragment=spec.to_fragment,
-                freeze_scaffold=constraints.freeze_scaffold,
+                freeze_scaffold=eff_freeze,
+                tool_config=cfg,
             )
             for prod_smi, scaf_smi, highlights in products:
                 if prod_smi in global_seen_smiles:

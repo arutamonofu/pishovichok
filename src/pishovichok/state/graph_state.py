@@ -15,9 +15,11 @@ from pishovichok.state.schemas import (
     ActivityCliff,
     CandidateMolecule,
     DatasetCurationSummary,
+    ParamSourceLiteral,
     ParquetPointer,
     QueryConstraints,
     SARRule,
+    ToolConfig,
     TraceEvent,
 )
 
@@ -45,6 +47,9 @@ class SARGraphState(TypedDict):
 
     # Распознанные ограничения и параметры фильтрации
     query_constraints: QueryConstraints
+    tool_config: ToolConfig
+    param_sources: dict[str, ParamSourceLiteral]
+    node_telemetry: dict[str, dict[str, Any]]
     assay_filter_strict: (
         bool  # Флаг строгой стратификации по BAO (включается Петлей №1)
     )
@@ -93,17 +98,58 @@ class SARGraphState(TypedDict):
     final_report_markdown: str | None
 
 
+def resolve_tool_config(state: dict[str, Any] | SARGraphState) -> ToolConfig:
+    """Безопасно извлекает ToolConfig из состояния графа (с fallback к дефолтному)."""
+    raw = state.get("tool_config") if isinstance(state, dict) else None
+    if isinstance(raw, ToolConfig):
+        return raw
+    if isinstance(raw, dict):
+        return ToolConfig.model_validate(raw)
+    return ToolConfig()
+
+
+def update_param_sources(
+    existing: dict[str, ParamSourceLiteral] | None,
+    changed_keys: list[str] | tuple[str, ...] | set[str],
+    source: ParamSourceLiteral,
+) -> dict[str, ParamSourceLiteral]:
+    """Возвращает обновленный словарь источников параметров с дефолтами для всех полей ToolConfig."""
+    sources: dict[str, ParamSourceLiteral] = {
+        field_name: "default" for field_name in ToolConfig.model_fields
+    }
+    if existing:
+        sources.update(existing)
+    for key in changed_keys:
+        if key in ToolConfig.model_fields:
+            sources[key] = source
+    return sources
+
+
 def create_initial_graph_state(
     user_query: str,
     session_id: str,
     workspace_dir: str | Path,
     query_constraints: QueryConstraints | None = None,
     uploaded_csv_path: str | Path | None = None,
+    tool_config: ToolConfig | None = None,
+    param_sources: dict[str, ParamSourceLiteral] | None = None,
 ) -> SARGraphState:
     """Создает валидированное начальное состояние графа для новой вычислительной сессии."""
     default_constraints = query_constraints or QueryConstraints(
         scenario_type="custom_csv_analysis" if uploaded_csv_path else "target_based_sar"
     )
+    resolved_config = tool_config or ToolConfig()
+    default_dump = ToolConfig().model_dump(mode="python")
+    resolved_dump = resolved_config.model_dump(mode="python")
+    initial_sources: dict[str, ParamSourceLiteral] = {
+        k: ("ui_manual" if resolved_dump.get(k) != default_dump.get(k) else "default")
+        for k in ToolConfig.model_fields
+    }
+    if param_sources:
+        for k, v in param_sources.items():
+            if k in ToolConfig.model_fields:
+                initial_sources[k] = v
+
     return SARGraphState(
         session_id=session_id,
         workspace_dir=str(Path(workspace_dir)),
@@ -112,6 +158,9 @@ def create_initial_graph_state(
         if uploaded_csv_path is not None
         else None,
         query_constraints=default_constraints,
+        tool_config=resolved_config,
+        param_sources=initial_sources,
+        node_telemetry={},
         assay_filter_strict=False,
         active_bao_filter=None,
         last_executed_stage="init",

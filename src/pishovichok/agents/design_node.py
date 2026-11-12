@@ -23,7 +23,7 @@ from pishovichok.core.generation import (
     generate_candidate_structures,
     select_parent_seeds_from_curated,
 )
-from pishovichok.state.graph_state import SARGraphState
+from pishovichok.state.graph_state import SARGraphState, resolve_tool_config
 from pishovichok.state.schemas import TraceEvent
 
 
@@ -45,12 +45,14 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
 
     design_iteration = int(state.get("design_iteration", 0)) + 1
     constraints = state["query_constraints"]
+    tool_config = resolve_tool_config(state)
 
     # 1. Отбор родительских затравок из очищенной выборки
     parent_seeds = select_parent_seeds_from_curated(
         curated_pointer=curated_ptr,
         constraints=constraints,
-        max_parents=5,
+        max_parents=tool_config.max_parent_seeds,
+        tool_config=tool_config,
     )
 
     # 2. Направленная генерация сырых структур-кандидатов
@@ -60,7 +62,8 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
         sar_rules=sar_rules,
         constraints=constraints,
         generation_iteration=design_iteration,
-        max_candidates_pool=50,
+        max_candidates_pool=tool_config.max_candidates_pool,
+        tool_config=tool_config,
     )
 
     # 3. Сохранение сырого пула на диск сессии для изоляции памяти графа (Fat Pointer)
@@ -97,8 +100,33 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
         duration_ms=round(duration_ms, 2),
     )
 
+    node_telemetry = dict(state.get("node_telemetry", {}))
+    node_telemetry["design"] = {
+        "active_params": {
+            "generation_engine": tool_config.generation_engine,
+            "crem_mode": tool_config.crem_mode,
+            "crem_context_radius": tool_config.crem_context_radius,
+            "crem_min_rel_atoms": tool_config.crem_min_rel_atoms,
+            "crem_max_rel_atoms": tool_config.crem_max_rel_atoms,
+            "crem_max_replacements": tool_config.crem_max_replacements,
+            "freeze_murcko_core": tool_config.freeze_murcko_core,
+            "protected_smarts": tool_config.protected_smarts,
+            "modifiable_atom_indices": tool_config.modifiable_atom_indices,
+            "max_parent_seeds": tool_config.max_parent_seeds,
+            "max_candidates_pool": tool_config.max_candidates_pool,
+            "use_bioisostere_catalog": tool_config.use_bioisostere_catalog,
+        },
+        "stats": {
+            "design_iteration": design_iteration,
+            "parent_seeds_count": len(parent_seeds),
+            "raw_candidates_count": len(raw_candidates),
+            "duration_ms": round(duration_ms, 2),
+        },
+    }
+
     return {
         "design_iteration": design_iteration,
+        "node_telemetry": node_telemetry,
         "last_executed_stage": "design",
         "trace_log": [trace_event],
     }

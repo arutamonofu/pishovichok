@@ -22,7 +22,12 @@ from rdkit import Chem
 from rdkit.Chem import QED, Descriptors, rdFingerprintGenerator, rdMolDescriptors
 
 from pishovichok.config import settings
-from pishovichok.state.schemas import CalcRDKitMetrics, PredADMETMetrics
+from pishovichok.state.schemas import (
+    ADMETBackendLiteral,
+    CalcRDKitMetrics,
+    PredADMETMetrics,
+    ToolConfig,
+)
 
 _MORGAN_FP_GEN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
@@ -64,22 +69,30 @@ def build_catboost_feature_vector(mol: Chem.Mol) -> np.ndarray:
 
 def classify_solubility(
     log_s: float,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> Literal["high", "moderate", "poor", "insoluble"]:
     """Классифицирует молярную водную растворимость по шкале LogS (моль/л)."""
-    if log_s >= -2.0:
+    cfg = tool_config or ToolConfig()
+    if log_s >= cfg.logs_soluble_cutoff:
         return "high"
-    if log_s >= -4.0:
+    if log_s >= cfg.logs_moderate_cutoff:
         return "moderate"
-    if log_s >= -6.0:
+    if log_s >= cfg.logs_poor_cutoff:
         return "poor"
     return "insoluble"
 
 
-def classify_herg_risk(herg_prob: float) -> Literal["low", "moderate", "high"]:
-    """Классифицирует вероятность блокады каналов hERG (<0.30 low, 0.30-0.60 moderate, >0.60 high)."""
-    if herg_prob < 0.30:
+def classify_herg_risk(
+    herg_prob: float,
+    *,
+    tool_config: ToolConfig | None = None,
+) -> Literal["low", "moderate", "high"]:
+    """Классифицирует вероятность блокады каналов hERG."""
+    cfg = tool_config or ToolConfig()
+    if herg_prob < cfg.herg_low_cutoff:
         return "low"
-    if herg_prob <= 0.60:
+    if herg_prob <= cfg.herg_high_cutoff:
         return "moderate"
     return "high"
 
@@ -111,6 +124,8 @@ def _calculate_analytical_qsar_admet(
     support_pairs_count: int,
     assay_homogeneous: bool,
     generation_origin: str,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> PredADMETMetrics:
     """Уровень 3 каскада (`rdkit_analytical_qsar`): аналитические QSAR-модели на дескрипторах RDKit."""
     mw = rdkit_metrics.mw
@@ -132,7 +147,7 @@ def _calculate_analytical_qsar_admet(
         - 0.74 * aromatic_proportion,
         4,
     )
-    sol_class = classify_solubility(log_s_aq)
+    sol_class = classify_solubility(log_s_aq, tool_config=tool_config)
 
     # 2. Проницаемость ГЭБ (Egan BOILED-Egg / Clark logBB): оптимум при TPSA < 78 Å² и 1.5 <= cLogP <= 4.0
     tpsa_term = (75.0 - tpsa) / 18.0
@@ -153,7 +168,7 @@ def _calculate_analytical_qsar_admet(
         - 0.032 * max(0.0, tpsa - 65.0)
     )
     herg_prob = round(_sigmoid(z_herg), 4)
-    herg_level = classify_herg_risk(herg_prob)
+    herg_level = classify_herg_risk(herg_prob, tool_config=tool_config)
 
     # 4. Вероятность ингибирования цитохрома CYP3A4 (зависит от MW, cLogP и гетероароматических азотов)
     heme_n_matches = (
@@ -204,6 +219,8 @@ def _try_predict_catboost_local(
     assay_homogeneous: bool,
     generation_origin: str,
     models_dir: Path,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> PredADMETMetrics | None:
     """Уровень 2 каскада (`catboost_local_qsar`): загрузка локальных весов `.cbm` при их наличии."""
     herg_path = models_dir / "herg_catboost.cbm"
@@ -249,10 +266,10 @@ def _try_predict_catboost_local(
         return PredADMETMetrics(
             model_source="catboost_local_qsar",
             log_s_aq=log_s_val,
-            solubility_class=classify_solubility(log_s_val),
+            solubility_class=classify_solubility(log_s_val, tool_config=tool_config),
             bbb_permeability_prob=bbb_prob,
             herg_liability_prob=herg_prob,
-            herg_risk_level=classify_herg_risk(herg_prob),
+            herg_risk_level=classify_herg_risk(herg_prob, tool_config=tool_config),
             cyp3a4_inhibition_prob=cyp_prob,
             predicted_pic50=predicted_pic50,
             prediction_confidence=determine_prediction_confidence(
@@ -273,6 +290,8 @@ def _try_predict_admet_ai(
     support_pairs_count: int,
     assay_homogeneous: bool,
     generation_origin: str,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> PredADMETMetrics | None:
     """Уровень 1 каскада (`admet_ai_dmpnn`): вызов пакета `admet_ai` при его наличии в окружении."""
     try:
@@ -291,10 +310,10 @@ def _try_predict_admet_ai(
         return PredADMETMetrics(
             model_source="admet_ai_dmpnn",
             log_s_aq=log_s_val,
-            solubility_class=classify_solubility(log_s_val),
+            solubility_class=classify_solubility(log_s_val, tool_config=tool_config),
             bbb_permeability_prob=bbb_prob,
             herg_liability_prob=herg_prob,
-            herg_risk_level=classify_herg_risk(herg_prob),
+            herg_risk_level=classify_herg_risk(herg_prob, tool_config=tool_config),
             cyp3a4_inhibition_prob=cyp_prob,
             predicted_pic50=predicted_pic50,
             prediction_confidence=determine_prediction_confidence(
@@ -316,14 +335,9 @@ def predict_admet_metrics(
     assay_homogeneous: bool = True,
     generation_origin: str = "mmp_smirks_rule",
     *,
-    preferred_backend: Literal[
-        "auto",
-        "admet_ai_dmpnn",
-        "catboost_local_qsar",
-        "rdkit_analytical_qsar",
-    ]
-    | None = None,
+    preferred_backend: ADMETBackendLiteral | None = None,
     models_dir: Path | str | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> PredADMETMetrics:
     """Выполняет прогноз ADMET-профиля кандидата с автоматическим каскадным фолбэком."""
     mol = (
@@ -335,7 +349,15 @@ def predict_admet_metrics(
         raise ValueError(f"Cannot predict ADMET for invalid molecule: {mol_or_smiles}")
 
     smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
-    backend = preferred_backend or settings.preferred_admet_backend
+    raw_backend = preferred_backend or (
+        tool_config.admet_backend
+        if tool_config is not None
+        else settings.preferred_admet_backend
+    )
+    backend = {
+        "auto_catboost": "auto",
+        "empirical_only": "rdkit_analytical_qsar",
+    }.get(raw_backend, raw_backend)
     resolved_models_dir = (
         Path(models_dir) if models_dir is not None else settings.models_dir
     )
@@ -350,6 +372,7 @@ def predict_admet_metrics(
             support_pairs_count=support_pairs_count,
             assay_homogeneous=assay_homogeneous,
             generation_origin=generation_origin,
+            tool_config=tool_config,
         )
         if res_l1 is not None:
             return res_l1
@@ -365,6 +388,7 @@ def predict_admet_metrics(
             assay_homogeneous=assay_homogeneous,
             generation_origin=generation_origin,
             models_dir=resolved_models_dir,
+            tool_config=tool_config,
         )
         if res_l2 is not None:
             return res_l2
@@ -378,4 +402,5 @@ def predict_admet_metrics(
         support_pairs_count=support_pairs_count,
         assay_homogeneous=assay_homogeneous,
         generation_origin=generation_origin,
+        tool_config=tool_config,
     )

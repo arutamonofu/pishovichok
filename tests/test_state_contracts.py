@@ -452,3 +452,130 @@ def test_auxiliary_sar_and_curation_schemas() -> None:
         validation_errors_log=[],
     )
     assert summary.is_dataset_assay_homogeneous is False
+
+
+def test_tool_config_defaults_extra_forbid_and_state_tracking(tmp_path: Path) -> None:
+    """Проверяет схему ToolConfig, запрет лишних полей, частичное слияние mpo_weights и трекинг источников."""
+    from pishovichok.state import (
+        ToolConfig,
+        resolve_tool_config,
+        update_param_sources,
+    )
+
+    cfg = ToolConfig()
+    assert cfg.allowed_bao_formats == ["BAO_0000357", "BAO_0000219"]
+    assert cfg.standard_types == ["IC50", "Ki"]
+    assert cfg.relation_mode == "include_censored"
+    assert cfg.mmpa_max_cuts == 1
+    assert cfg.fp_type == "ecfp"
+    assert cfg.generation_engine == "mmp_and_crem"
+    assert cfg.active_filter_catalogs == ["PAINS_A", "PAINS_B", "PAINS_C", "Brenk"]
+    assert cfg.admet_backend == "auto_catboost"
+    assert cfg.cns_profile_mode == "peripheral_low_bbb"
+    assert cfg.alert_penalty_mode == "veto"
+    assert cfg.etkdg_variant == "ETKDGv3"
+    assert cfg.force_field == "MMFF94s"
+    assert cfg.max_iterations == 2
+    assert cfg.mpo_weights["pic50"] == 1.5
+    assert cfg.mpo_weights["herg"] == 1.2
+
+    with pytest.raises(ValidationError):
+        ToolConfig(unknown_param_xyz=123)  # type: ignore[call-arg]
+
+    updated, changed = cfg.apply_overrides(
+        {
+            "mpo_weights": {"logp": 2.4},
+            "fp_type": "fcfp",
+            "max_iterations": 3,
+        }
+    )
+    assert updated.fp_type == "fcfp"
+    assert updated.max_iterations == 3
+    assert updated.mpo_weights["logp"] == 2.4
+    assert updated.mpo_weights["pic50"] == 1.5
+    assert set(changed) == {"mpo_weights", "fp_type", "max_iterations"}
+
+    state = create_initial_graph_state(
+        user_query="Тест конфигурации",
+        session_id="cfg_sess",
+        workspace_dir=tmp_path,
+        tool_config=updated,
+        param_sources=update_param_sources({}, changed, "nl_query"),
+    )
+    resolved = resolve_tool_config(state)
+    assert resolved.fp_type == "fcfp"
+    assert state["param_sources"]["fp_type"] == "nl_query"
+    assert state["param_sources"]["mpo_weights"] == "nl_query"
+    assert state["param_sources"]["allowed_bao_formats"] == "default"
+    assert state["node_telemetry"] == {}
+
+    ps2 = update_param_sources(state["param_sources"], ["max_candidates_pool"], "critic_loop")
+    assert ps2["max_candidates_pool"] == "critic_loop"
+    ps3 = update_param_sources(ps2, ["protected_smarts"], "ui_manual")
+    assert ps3["protected_smarts"] == "ui_manual"
+
+
+def test_nl_tool_config_parsing_across_subsystems() -> None:
+    """Проверяет детерминированный разбор NL-настроек ToolConfig и сохранение триггера Петли 1."""
+    from pishovichok.agents.llm_adapter import LLMAdapter
+
+    adapter = LLMAdapter()
+    nl_query = (
+        "Оптимизируй Гефитиниб для CHEMBL203 (EGFR) по Ki на BAO_0000357 без цензурированных данных, "
+        "не удалять соли, без канонизации таутомеров, generic framework, pchembl >= 5.5, "
+        "2 cuts, FCFP4, метрика dice, cliff sim >= 0.90, sali epsilon 0.01, "
+        "crem only, grow, radius 2, не замораживать скаффолд, protected smarts c1ccc2ncncc2c1, топ 8, "
+        "каталоги Glaxo и SureChEMBL, empirical only, ЦНС ГТБ, soft penalty 0.4, "
+        "ETKDGv2, UFF, 7 конформеров, max_iterations=3, дескрипторы RingCount, HeavyAtomCount"
+    )
+    overrides = adapter._deterministic_parse_tool_config(nl_query)
+
+    assert overrides["allowed_bao_formats"] == ["BAO_0000357"]
+    assert "Ki" in overrides["standard_types"]
+    assert overrides["relation_mode"] == "exact_only"
+    assert overrides["strip_salts"] is False
+    assert overrides["canonicalize_tautomers"] is False
+    assert overrides["scaffold_mode"] == "generic_framework"
+    assert overrides["pchembl_min_cutoff"] == 5.5
+    assert overrides["mmpa_max_cuts"] == 2
+    assert overrides["fp_type"] == "fcfp"
+    assert overrides["fp_radius"] == 2
+    assert overrides["similarity_metric"] == "dice"
+    assert overrides["cliff_similarity_cutoff"] == 0.9
+    assert overrides["sali_epsilon"] == 0.01
+    assert overrides["generation_engine"] == "crem_only"
+    assert overrides["crem_mode"] == "grow"
+    assert overrides["crem_context_radius"] == 2
+    assert overrides["freeze_murcko_core"] is False
+    assert overrides["protected_smarts"] == "c1ccc2ncncc2c1"
+    assert overrides["top_k_output"] == 8
+    assert "Glaxo" in overrides["active_filter_catalogs"]
+    assert "SureChEMBL" in overrides["active_filter_catalogs"]
+    assert overrides["admet_backend"] == "empirical_only"
+    assert overrides["cns_profile_mode"] == "cns_high_bbb"
+    assert overrides["alert_penalty_mode"] == "soft_penalty"
+    assert overrides["alert_soft_multiplier"] == 0.4
+    assert overrides["etkdg_variant"] == "ETKDGv2"
+    assert overrides["force_field"] == "UFF"
+    assert overrides["num_conformers"] == 7
+    assert overrides["max_iterations"] == 3
+    assert "RingCount" in overrides["extra_rdkit_descriptors"]
+    assert "HeavyAtomCount" in overrides["extra_rdkit_descriptors"]
+
+    # Защита Сценария 1: общая фраза про однородные биохимические тесты не должна форсировать BAO заранее
+    sc1_query = (
+        "Найди наиболее активные скаффолды и SAR-правила для мишени CHEMBL5251 (BTK) "
+        "на однородных биохимических тестах и выдели activity cliffs"
+    )
+    sc1_overrides = adapter._deterministic_parse_tool_config(sc1_query)
+    assert "allowed_bao_formats" not in sc1_overrides
+
+    constraints, parsed_overrides, _ = adapter.parse_query_with_tool_config(
+        "Найди ингибиторы CHEMBL203 через FCFP4 и метрику dice, empirical only, UFF"
+    )
+    assert constraints.target_chembl_id == "CHEMBL203"
+    assert parsed_overrides.get("fp_type") == "fcfp"
+    assert parsed_overrides.get("similarity_metric") == "dice"
+    assert parsed_overrides.get("admet_backend") == "empirical_only"
+    assert parsed_overrides.get("force_field") == "UFF"
+

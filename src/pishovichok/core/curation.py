@@ -30,24 +30,24 @@ from typing import Any, Literal, NamedTuple
 
 import duckdb
 import numpy as np
-from rdkit import Chem, DataStructs
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit import Chem
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from pishovichok.config import settings
+from pishovichok.core.fingerprints import compute_fp_similarity, compute_mol_fingerprint
 from pishovichok.state.schemas import (
     DatasetCurationSummary,
     ParquetPointer,
     QueryConstraints,
+    ToolConfig,
 )
 from pishovichok.state.storage import write_parquet_pointer
 
-# Инициализируем синглтоны стандартизатора RDKit и генератора отпечатков Моргана (r=2, 2048 бит)
+# Инициализируем синглтоны стандартизатора RDKit
 _LARGEST_FRAGMENT_CHOOSER = rdMolStandardize.LargestFragmentChooser()
 _UNCHARGER = rdMolStandardize.Uncharger()
 _TAUTOMER_ENUMERATOR = rdMolStandardize.TautomerEnumerator()
-_MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 _RELATION_VALUE_RE = re.compile(
     r"^\s*(>=|<=|>|<|=)?\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$"
@@ -78,17 +78,15 @@ def standardize_molecule_detailed(
     raw_smiles: str,
     errors_log: list[str] | None = None,
     row_label: str = "",
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> StandardizedMoleculeResult | None:
     """Выполняет полную стандартизацию молекулы в RDKit и выделяет скаффолд Bemis-Murcko.
 
-    Конвейер:
-    1. Парсинг и базовая санитаризация `Chem.MolFromSmiles(raw_smiles, sanitize=True)`.
-    2. Нормализация функциональных групп `rdMolStandardize.Cleanup`.
-    3. Удаление противоионов, солей и растворителей `LargestFragmentChooser().choose`.
-    4. Нейтрализация ионизированных центров `Uncharger().uncharge`.
-    5. Канонизация таутомеров `TautomerEnumerator().Canonicalize` с фолбэком при `None`/ошибке.
-    6. Генерация канонического SMILES, InChIKey и каркаса Bemis-Murcko.
+    Параметры `strip_salts`, `neutralize_charges`, `canonicalize_tautomers`, `keep_chirality`
+    и `scaffold_mode` управляются через `tool_config`.
     """
+    cfg = tool_config or ToolConfig()
     prefix = f"[{row_label}] " if row_label else ""
     if not isinstance(raw_smiles, str) or not raw_smiles.strip():
         if errors_log is not None:
@@ -112,32 +110,54 @@ def standardize_molecule_detailed(
         if clean_mol is None:
             clean_mol = mol
 
-        parent_mol = _LARGEST_FRAGMENT_CHOOSER.choose(clean_mol)
-        if parent_mol is None:
+        if cfg.strip_salts:
+            parent_mol = _LARGEST_FRAGMENT_CHOOSER.choose(clean_mol)
+            if parent_mol is None:
+                parent_mol = clean_mol
+            salts_stripped = has_dot_fragments or (
+                parent_mol.GetNumAtoms() < initial_atoms
+            )
+        else:
             parent_mol = clean_mol
+            salts_stripped = False
 
-        salts_stripped = has_dot_fragments or (parent_mol.GetNumAtoms() < initial_atoms)
-
-        neutral_mol = _UNCHARGER.uncharge(parent_mol)
-        if neutral_mol is None:
+        if cfg.neutralize_charges:
+            neutral_mol = _UNCHARGER.uncharge(parent_mol)
+            if neutral_mol is None:
+                neutral_mol = parent_mol
+        else:
             neutral_mol = parent_mol
 
-        try:
-            canon_mol = _TAUTOMER_ENUMERATOR.Canonicalize(neutral_mol)
-            if canon_mol is None:
+        if cfg.canonicalize_tautomers:
+            try:
+                canon_mol = _TAUTOMER_ENUMERATOR.Canonicalize(neutral_mol)
+                if canon_mol is None:
+                    canon_mol = neutral_mol
+            except Exception:  # noqa: BLE001
                 canon_mol = neutral_mol
-        except Exception:  # noqa: BLE001
+        else:
             canon_mol = neutral_mol
 
+        if not cfg.keep_chirality:
+            canon_mol = Chem.Mol(canon_mol)
+            Chem.RemoveStereochemistry(canon_mol)
+
         Chem.SanitizeMol(canon_mol)
+        use_isomeric = bool(cfg.keep_chirality)
         canonical_smiles = Chem.MolToSmiles(
-            canon_mol, canonical=True, isomericSmiles=True
+            canon_mol, canonical=True, isomericSmiles=use_isomeric
         )
         inchi_key = Chem.MolToInchiKey(canon_mol)
 
         scaffold_mol = MurckoScaffold.GetScaffoldForMol(canon_mol)
+        if (
+            cfg.scaffold_mode == "generic_framework"
+            and scaffold_mol is not None
+            and scaffold_mol.GetNumAtoms() > 0
+        ):
+            scaffold_mol = MurckoScaffold.MakeScaffoldGeneric(scaffold_mol)
         scaffold_smiles = (
-            Chem.MolToSmiles(scaffold_mol, canonical=True, isomericSmiles=True)
+            Chem.MolToSmiles(scaffold_mol, canonical=True, isomericSmiles=use_isomeric)
             if scaffold_mol is not None and scaffold_mol.GetNumAtoms() > 0
             else canonical_smiles
         )
@@ -162,13 +182,18 @@ def standardize_smiles(
     raw_smiles: str,
     errors_log: list[str] | None = None,
     row_label: str = "",
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[str, str, str] | None:
     """Контракт стандартизации из Раздела 3.2 ARCHITECTURE.md.
 
     Возвращает `(canonical_smiles, inchi_key, scaffold_smiles)` при успехе либо `None` при ошибке.
     """
     res = standardize_molecule_detailed(
-        raw_smiles, errors_log=errors_log, row_label=row_label
+        raw_smiles,
+        errors_log=errors_log,
+        row_label=row_label,
+        tool_config=tool_config,
     )
     if res is None:
         return None
@@ -219,12 +244,14 @@ def convert_to_pchembl(
     value: float,
     units: str = "nM",
     relation: str = "=",
+    *,
+    censored_floor: float | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[float, bool]:
     """Конвертирует концентрацию IC50/Ki/Kd/EC50 в шкалу pChEMBL = -log10(C [M]).
 
     Для правоцензурированных неактивных значений (`>` или `>=`, например `> 100 uM`)
-    возвращает `is_censored = True` и фиксирует верхнюю оценку активности `pChEMBL = 4.0`
-    (либо `-log10(C [M])`, если концентрация выше 100 uM).
+    возвращает `is_censored = True` и фиксирует верхнюю оценку активности `pChEMBL = censored_floor`.
     """
     if value <= 0.0 or math.isnan(value) or math.isinf(value):
         raise ValueError(
@@ -240,11 +267,14 @@ def convert_to_pchembl(
     raw_pchembl = -math.log10(molar_conc)
     norm_rel = (relation or "=").strip()
     is_censored = norm_rel in (">", ">=")
+    floor = (
+        censored_floor
+        if censored_floor is not None
+        else (tool_config.pchembl_min_cutoff if tool_config is not None else 4.0)
+    )
 
     if is_censored:
-        # Согласно Разделу 6.1.1 ARCHITECTURE.md цензурированные неактивные измерения (> 100 uM, > 50 uM)
-        # маркируются is_censored=True с базовым уровнем pIC50 = 4.0
-        pchembl_val = min(4.0, round(raw_pchembl, 4))
+        pchembl_val = min(float(floor), round(raw_pchembl, 4))
     else:
         pchembl_val = round(raw_pchembl, 4)
 
@@ -255,12 +285,15 @@ def _load_chembl_target_rows(
     target_chembl_id: str,
     data_dir: Path,
     errors_log: list[str],
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[list[dict[str, Any]], Literal["chembl_parquet", "chembl_api"]]:
     """Реализует 3-уровневый каскад загрузки данных ChEMBL (Раздел 1.2 ARCHITECTURE.md):
     Уровень 1: Локальный кэш `/data/chembl/<target>.parquet` через DuckDB.
     Уровень 2: REST API `chembl_webresource_client` (опционально, при наличии сети).
     Уровень 3: Резервный слепок `/data/chembl/fallback_targets.parquet`.
     """
+    cfg = tool_config or ToolConfig()
     chembl_dir = data_dir / "chembl"
     target_id = (target_chembl_id or "CHEMBL203").strip().upper()
     local_parquet = chembl_dir / f"{target_id}.parquet"
@@ -281,10 +314,11 @@ def _load_chembl_target_rows(
         from chembl_webresource_client.new_client import new_client  # type: ignore[import-not-found]
 
         activity_client = new_client.activity
+        std_types = list(cfg.standard_types) or ["IC50", "Ki"]
         query_res = list(
             activity_client.filter(
                 target_chembl_id=target_id,
-                standard_type__in=["IC50", "Ki"],
+                standard_type__in=std_types,
                 standard_units="nM",
             ).only(
                 [
@@ -300,7 +334,7 @@ def _load_chembl_target_rows(
                     "target_chembl_id",
                     "target_organism",
                 ]
-            )[:350]
+            )[: int(cfg.chembl_api_limit)]
         )
         if query_res:
             api_rows: list[dict[str, Any]] = []
@@ -453,6 +487,11 @@ def _load_custom_csv_rows(
     return raw_rows
 
 
+def _sql_in_list(values: list[str]) -> str:
+    escaped = ["'" + v.replace("'", "''") + "'" for v in values if v]
+    return ", ".join(escaped)
+
+
 def curate_chembl_or_csv(
     session_dir: Path | str,
     constraints: QueryConstraints,
@@ -462,11 +501,13 @@ def curate_chembl_or_csv(
     active_bao_filter: str | None = None,
     data_dir: Path | str | None = None,
     lead_neighborhood_tanimoto: float | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> tuple[ParquetPointer, ParquetPointer, DatasetCurationSummary]:
     """Выполняет сбор, курацию, стандартизацию, дедупликацию и фильтрацию данных биоактивности.
 
     Возвращает кортеж `(raw_dataset_uri, curated_dataset_uri, curation_summary)`.
     """
+    cfg = tool_config or ToolConfig()
     resolved_session_dir = Path(session_dir).resolve()
     resolved_session_dir.mkdir(parents=True, exist_ok=True)
     resolved_data_dir = (
@@ -500,6 +541,7 @@ def curate_chembl_or_csv(
             target_chembl_id=target_id,
             data_dir=resolved_data_dir,
             errors_log=validation_errors_log,
+            tool_config=cfg,
         )
 
     initial_rows_count = len(raw_rows)
@@ -529,13 +571,33 @@ def curate_chembl_or_csv(
         raw_stype_counter.most_common(1)[0][0] if raw_stype_counter else "IC50"
     )
 
-    # 4. Фильтрация по однородности протоколов (базовый vs строгий режим через DuckDB)
+    # 4. Фильтрация по однородности протоколов, форматам BAO, standard_types и relation_mode через DuckDB
     target_bao = active_bao_filter or dominant_bao_format
-    if assay_filter_strict and raw_pointer.row_count > 0:
+    if raw_pointer.row_count > 0:
         conn = duckdb.connect(database=":memory:")
+        where_clauses: list[str] = []
+        if assay_filter_strict:
+            safe_bao = target_bao.replace("'", "''")
+            safe_stype = dominant_standard_type.replace("'", "''")
+            where_clauses.append(
+                f"bao_format = '{safe_bao}' AND standard_type = '{safe_stype}'"
+            )
+        else:
+            if cfg.allowed_bao_formats:
+                bao_in = _sql_in_list(cfg.allowed_bao_formats)
+                if bao_in:
+                    where_clauses.append(f"bao_format IN ({bao_in})")
+            if cfg.standard_types:
+                stype_in = _sql_in_list(cfg.standard_types)
+                if stype_in:
+                    where_clauses.append(f"standard_type IN ({stype_in})")
+        if cfg.relation_mode == "exact_only":
+            where_clauses.append("COALESCE(TRIM(standard_relation), '=') IN ('=', '==')")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)} " if where_clauses else ""
         filtered_sql = (
             f"SELECT * FROM read_parquet('{Path(raw_pointer.uri).as_posix()}') "
-            f"WHERE bao_format = '{target_bao}' AND standard_type = '{dominant_standard_type}' "
+            f"{where_sql}"
             "ORDER BY raw_row_id"
         )
         active_rows = conn.sql(filtered_sql).to_arrow_table().to_pylist()
@@ -569,6 +631,7 @@ def curate_chembl_or_csv(
             raw_smiles=raw_smi,
             errors_log=validation_errors_log,
             row_label=row_label,
+            tool_config=cfg,
         )
         if std_res is None:
             invalid_smiles_dropped += 1
@@ -585,10 +648,23 @@ def curate_chembl_or_csv(
                 value=raw_val_float,
                 units=units_str,
                 relation=rel_str,
+                tool_config=cfg,
             )
         except ValueError as exc:
             validation_errors_log.append(f"[{row_label}] {exc}")
             invalid_smiles_dropped += 1
+            continue
+
+        if cfg.relation_mode == "exact_only" and is_censored:
+            validation_errors_log.append(
+                f"[{row_label}] Censored measurement dropped (relation_mode='exact_only')."
+            )
+            continue
+
+        if pchembl_val < cfg.pchembl_min_cutoff:
+            validation_errors_log.append(
+                f"[{row_label}] pChEMBL={pchembl_val:.2f} below pchembl_min_cutoff={cfg.pchembl_min_cutoff:.2f}."
+            )
             continue
 
         if is_censored:
@@ -613,10 +689,12 @@ def curate_chembl_or_csv(
             }
         )
 
-    # 6. Агрегация дубликатов по медиане и расчет сходства Танимото к лидеру (Сценарий 2)
+    # 6. Агрегация дубликатов и расчет сходства к лидеру (Сценарий 2)
     lead_fp = None
     if constraints.lead_smiles:
-        lead_std = standardize_molecule_detailed(constraints.lead_smiles)
+        lead_std = standardize_molecule_detailed(
+            constraints.lead_smiles, tool_config=cfg
+        )
         lead_smi_for_fp = (
             lead_std.canonical_smiles
             if lead_std is not None
@@ -624,7 +702,19 @@ def curate_chembl_or_csv(
         )
         lead_mol = Chem.MolFromSmiles(lead_smi_for_fp)
         if lead_mol is not None:
-            lead_fp = _MORGAN_FP_GENERATOR.GetFingerprint(lead_mol)
+            lead_fp = compute_mol_fingerprint(
+                lead_mol,
+                fp_type=cfg.fp_type,
+                fp_radius=cfg.fp_radius,
+                fp_nbits=cfg.fp_nbits,
+            )
+
+    def _aggregate_values(vals: list[float]) -> float:
+        if cfg.duplicate_agg_method == "mean":
+            return float(np.mean(vals))
+        if cfg.duplicate_agg_method == "max":
+            return float(np.max(vals))
+        return float(np.median(vals))
 
     duplicates_merged_count = 0
     all_curated_rows: list[dict[str, Any]] = []
@@ -635,30 +725,59 @@ def curate_chembl_or_csv(
             duplicates_merged_count += rep_count - 1
 
         first = items[0]
+        same_mol_id_group = len({str(x["mol_id"]) for x in items}) == 1
         uncensored_vals = [
             float(x["pchembl_value"]) for x in items if not x["is_censored"]
         ]
         if uncensored_vals:
-            median_pic50 = float(np.median(uncensored_vals))
+            agg_pic50 = _aggregate_values(uncensored_vals)
             std_pic50 = (
                 float(np.std(uncensored_vals, ddof=1))
                 if len(uncensored_vals) > 1
                 else 0.0
             )
+            if (
+                same_mol_id_group
+                and len(uncensored_vals) > 1
+                and std_pic50 > cfg.max_duplicate_std
+            ):
+                validation_errors_log.append(
+                    f"[mol_id={first['mol_id']}] Replicate group dropped: std={std_pic50:.3f} > max_duplicate_std={cfg.max_duplicate_std:.3f}"
+                )
+                continue
             group_is_censored = False
         else:
             all_vals = [float(x["pchembl_value"]) for x in items]
-            median_pic50 = float(np.median(all_vals))
-            std_pic50 = 0.0
+            agg_pic50 = _aggregate_values(all_vals)
+            std_pic50 = (
+                float(np.std(all_vals, ddof=1)) if len(all_vals) > 1 else 0.0
+            )
+            if (
+                same_mol_id_group
+                and len(all_vals) > 1
+                and std_pic50 > cfg.max_duplicate_std
+            ):
+                validation_errors_log.append(
+                    f"[mol_id={first['mol_id']}] Censored replicate group dropped: std={std_pic50:.3f} > max_duplicate_std={cfg.max_duplicate_std:.3f}"
+                )
+                continue
             group_is_censored = True
 
         tanimoto_to_lead = 1.0
         if lead_fp is not None:
             mol_obj = Chem.MolFromSmiles(first["canonical_smiles"])
             if mol_obj is not None:
-                mol_fp = _MORGAN_FP_GENERATOR.GetFingerprint(mol_obj)
+                mol_fp = compute_mol_fingerprint(
+                    mol_obj,
+                    fp_type=cfg.fp_type,
+                    fp_radius=cfg.fp_radius,
+                    fp_nbits=cfg.fp_nbits,
+                )
                 tanimoto_to_lead = round(
-                    float(DataStructs.TanimotoSimilarity(lead_fp, mol_fp)), 4
+                    compute_fp_similarity(
+                        lead_fp, mol_fp, metric=cfg.similarity_metric
+                    ),
+                    4,
                 )
 
         all_curated_rows.append(
@@ -667,7 +786,7 @@ def curate_chembl_or_csv(
                 "canonical_smiles": first["canonical_smiles"],
                 "inchi_key": first["inchi_key"],
                 "scaffold_smiles": first["scaffold_smiles"],
-                "pchembl_value": round(median_pic50, 4),
+                "pchembl_value": round(agg_pic50, 4),
                 "pchembl_std": round(std_pic50, 4),
                 "replicate_count": int(rep_count),
                 "is_censored": bool(group_is_censored),
@@ -678,18 +797,24 @@ def curate_chembl_or_csv(
             }
         )
 
-    # Для Сценария 2 (при заданном lead_smiles) отбираем локальную окрестность Tanimoto >= 0.60
+    # Для Сценария 2 (при заданном lead_smiles) отбираем локальную окрестность
     if lead_fp is not None:
         thresh = (
             lead_neighborhood_tanimoto
             if lead_neighborhood_tanimoto is not None
-            else settings.lead_neighborhood_tanimoto
+            else (
+                tool_config.neighborhood_tanimoto
+                if tool_config is not None
+                else settings.lead_neighborhood_tanimoto
+            )
         )
         neighborhood_rows = [
             r for r in all_curated_rows if r["tanimoto_to_lead"] >= thresh
         ]
         curated_rows = (
-            neighborhood_rows if len(neighborhood_rows) >= 5 else all_curated_rows
+            neighborhood_rows
+            if len(neighborhood_rows) >= cfg.min_neighborhood_rows_fallback
+            else all_curated_rows
         )
     else:
         curated_rows = all_curated_rows
@@ -702,7 +827,7 @@ def curate_chembl_or_csv(
         filename="curated_dataset.parquet",
     )
 
-    # 8. Вычисление статистики топ-5 скаффолдов Bemis-Murcko
+    # 8. Вычисление статистики топ-скаффолдов
     scaffold_groups: dict[str, list[float]] = defaultdict(list)
     for r in curated_rows:
         if not r["is_censored"]:
@@ -719,7 +844,7 @@ def curate_chembl_or_csv(
         ),
         key=lambda item: (int(item["count"]), float(item["mean_pic50"])),
         reverse=True,
-    )[:5]
+    )[: int(cfg.top_scaffolds_limit)]
 
     summary = DatasetCurationSummary(
         source_type=source_type,

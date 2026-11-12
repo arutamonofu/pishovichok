@@ -199,6 +199,19 @@ class CalcRDKitMetrics(BaseModel):
     glaxo_alerts_count: int = Field(
         default=0, ge=0, description="Число структурных алертов каталога Glaxo"
     )
+    extra_alerts_count: int = Field(
+        default=0,
+        ge=0,
+        description="Число структурных алертов доп. каталогов (Glaxo/SureChEMBL/NIH/ZINC) и custom_ban_smarts",
+    )
+    extra_alerts_matched_names: list[str] = Field(
+        default_factory=list,
+        description="Названия сработавших доп. SMARTS-алертов и пользовательских паттернов",
+    )
+    extra_descriptors: dict[str, float] = Field(
+        default_factory=dict,
+        description="Дополнительные вычисленные дескрипторы RDKit (ToolConfig.extra_rdkit_descriptors)",
+    )
     brics_fragments: list[str] = Field(
         default_factory=list,
         description="Список канонических SMILES ретросинтетических строительных блоков (алгоритм BRICS)",
@@ -401,17 +414,26 @@ class CandidateMolecule(BaseModel):
         default_factory=list,
         description="Индексы атомов модифицированного заместителя для цветовой подсветки в rdMolDraw2D",
     )
+    alert_penalty_mode: Literal["veto", "soft_penalty", "ignore"] = Field(
+        default="veto",
+        description="Режим штрафа за структурные алерты при расчете индекса Харрингтона",
+    )
 
     @model_validator(mode="after")
     def _enforce_veto_invariant(self) -> CandidateMolecule:
-        """Проверяет инвариант вето Харрингтона: при наличии PAINS или Brenk индекс D обязан быть 0.0."""
+        """Проверяет инвариант вето Харрингтона: при режиме 'veto' и наличии PAINS/Brenk индекс D обязан быть 0.0."""
         if (
-            self.calc_rdkit.pains_alerts_count > 0
-            or self.calc_rdkit.brenk_alerts_count > 0
-        ) and self.mpo_harrington_score > 0.0:
+            self.alert_penalty_mode == "veto"
+            and (
+                self.calc_rdkit.pains_alerts_count > 0
+                or self.calc_rdkit.brenk_alerts_count > 0
+                or self.calc_rdkit.extra_alerts_count > 0
+            )
+            and self.mpo_harrington_score > 0.0
+        ):
             raise ValueError(
                 "Harrington Veto Invariant violated: mpo_harrington_score must be 0.0 "
-                "when pains_alerts_count > 0 or brenk_alerts_count > 0."
+                "when alerts > 0 under alert_penalty_mode='veto'."
             )
         return self
 
@@ -468,6 +490,7 @@ class CandidateMolecule(BaseModel):
             "applied_smirks": self.hypothesis_rationale.applied_smirks,
             "mpo_harrington_score": self.mpo_harrington_score,
             "passes_all_constraints": self.passes_all_constraints,
+            "alert_penalty_mode": self.alert_penalty_mode,
             # Полные JSON-слепки вложенных контрактов для 100% обратимой десериализации
             "calc_rdkit_json": self.calc_rdkit.model_dump_json(),
             "pred_admet_json": self.pred_admet.model_dump_json(),
@@ -500,6 +523,7 @@ class CandidateMolecule(BaseModel):
             ),
             mpo_harrington_score=float(row["mpo_harrington_score"]),
             passes_all_constraints=bool(row["passes_all_constraints"]),
+            alert_penalty_mode=row.get("alert_penalty_mode") or "veto",
             constraint_violations=json.loads(
                 row.get("constraint_violations_json") or "[]"
             ),
@@ -652,10 +676,10 @@ class ActivityCliff(BaseModel):
     pic50_active: float
     pic50_inactive: float
     abs_delta_pic50: float = Field(
-        ..., ge=1.5, description="Абсолютный перепад активности |ΔpIC50| >= 1.5"
+        ..., ge=0.0, description="Абсолютный перепад активности |ΔpIC50|"
     )
     tanimoto_similarity: float = Field(
-        ..., ge=0.85, le=1.0, description="Сходство Танимото >= 0.85"
+        ..., ge=0.0, le=1.0, description="Сходство по выбранной метрике фингерпринтов"
     )
     sali_index: float = Field(..., gt=0.0, description="Значение индекса SALI")
     smirks_difference: str = Field(
@@ -753,3 +777,177 @@ class GeneratedRawCandidate(BaseModel):
     support_pairs_count: int = Field(..., ge=0)
     assay_homogeneous: bool
     highlighted_atom_indices: list[int] = Field(default_factory=list)
+
+
+# ============================================================================
+# ЕДИНАЯ ПАРАМЕТРИЗАЦИЯ ИНСТРУМЕНТОВ И ОТСЛЕЖИВАНИЕ ИСТОЧНИКОВ (ToolConfig)
+# ============================================================================
+ParamSourceLiteral = Literal["default", "nl_query", "ui_manual", "critic_loop"]
+
+FilterCatalogLiteral = Literal[
+    "PAINS_A", "PAINS_B", "PAINS_C", "Brenk", "Glaxo", "SureChEMBL", "NIH", "ZINC"
+]
+
+ADMETBackendLiteral = Literal[
+    "auto",
+    "auto_catboost",
+    "admet_ai_dmpnn",
+    "catboost_local_qsar",
+    "rdkit_analytical_qsar",
+    "empirical_only",
+]
+
+
+def _default_mpo_weights() -> dict[str, float]:
+    return {
+        "pic50": 1.5,
+        "logp": 1.0,
+        "sascore": 1.0,
+        "qed": 1.0,
+        "tpsa": 0.8,
+        "logs": 0.8,
+        "herg": 1.2,
+    }
+
+
+class ToolConfig(BaseModel):
+    """Единая конфигурация всех вычислительных подсистем, фильтров, ADMET/MPO, 3D и оркестратора."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 1. Курация (curation.py)
+    allowed_bao_formats: list[str] = Field(
+        default_factory=lambda: ["BAO_0000357", "BAO_0000219"]
+    )
+    standard_types: list[str] = Field(default_factory=lambda: ["IC50", "Ki"])
+    relation_mode: Literal["exact_only", "include_censored"] = "include_censored"
+    pchembl_min_cutoff: float = Field(default=4.0, ge=0.0, le=15.0)
+    duplicate_agg_method: Literal["median", "mean", "max"] = "median"
+    max_duplicate_std: float = Field(default=0.5, ge=0.0)
+    strip_salts: bool = True
+    neutralize_charges: bool = True
+    canonicalize_tautomers: bool = True
+    keep_chirality: bool = True
+    scaffold_mode: Literal["bemis_murcko", "generic_framework"] = "bemis_murcko"
+    chembl_api_limit: int = Field(default=350, ge=10, le=5000)
+    min_neighborhood_rows_fallback: int = Field(default=5, ge=1)
+    top_scaffolds_limit: int = Field(default=5, ge=1, le=50)
+
+    # 2. Парный анализ и SALI (sar_analysis.py)
+    mmpa_max_cuts: Literal[1, 2, 3] = 1
+    mmpa_max_cut_bonds: int = Field(default=20, ge=1)
+    min_support_pairs: int = Field(default=2, ge=1)
+    min_mean_delta_pic50: float = 0.3
+    max_rgroup_heavy_atoms: int = Field(default=12, ge=1)
+    fp_type: Literal["ecfp", "fcfp", "rdkit", "maccs"] = "ecfp"
+    fp_radius: Literal[1, 2, 3] = 2
+    fp_nbits: Literal[1024, 2048, 4096] = 2048
+    similarity_metric: Literal["tanimoto", "dice", "cosine"] = "tanimoto"
+    cliff_similarity_cutoff: float = Field(default=0.85, ge=0.0, le=1.0)
+    cliff_delta_pic50_cutoff: float = Field(default=1.5, ge=0.0)
+    sali_epsilon: float = Field(default=0.05, gt=0.0)
+    mmpa_min_core_heavy_atoms: int = Field(default=6, ge=1)
+    min_rules_before_enrichment: int = Field(default=3, ge=0)
+    background_target_id: str = "CHEMBL203"
+    prioritize_positive_rules: bool = True
+
+    # 3. Генерация и биоизостеры (generation.py, bioisosteres.py, design_node.py)
+    generation_engine: Literal["mmp_and_crem", "mmp_only", "crem_only"] = (
+        "mmp_and_crem"
+    )
+    crem_mode: Literal["mutate", "grow"] = "mutate"
+    crem_context_radius: Literal[1, 2, 3] = 3
+    crem_min_rel_atoms: int = -3
+    crem_max_rel_atoms: int = 6
+    crem_max_replacements: int = Field(default=25, ge=1)
+    freeze_murcko_core: bool = True
+    protected_smarts: str | None = None
+    modifiable_atom_indices: list[int] | None = None
+    neighborhood_tanimoto: float = Field(default=0.60, ge=0.0, le=1.0)
+    max_candidates_pool: int = Field(default=25, ge=1)
+    top_k_output: int = Field(default=5, ge=1, le=50)
+    max_parent_seeds: int = Field(default=5, ge=1, le=50)
+    use_bioisostere_catalog: bool = True
+    bioisostere_fallback_threshold: int = Field(default=5, ge=0)
+    crem_max_fragment_heavy_atoms: int = Field(default=4, ge=1)
+
+    # 4. Оценка, дескрипторы, фильтры, BRICS, ADMET, MPO и 3D
+    active_filter_catalogs: list[FilterCatalogLiteral] = Field(
+        default_factory=lambda: ["PAINS_A", "PAINS_B", "PAINS_C", "Brenk"]
+    )
+    custom_ban_smarts: list[str] = Field(default_factory=list)
+    brics_min_fragment_size: int = Field(default=3, ge=1)
+    brics_only_leaf_nodes: bool = True
+    admet_backend: ADMETBackendLiteral = "auto_catboost"
+    cns_profile_mode: Literal["peripheral_low_bbb", "cns_high_bbb", "neutral"] = (
+        "peripheral_low_bbb"
+    )
+    alert_penalty_mode: Literal["veto", "soft_penalty", "ignore"] = "veto"
+    alert_soft_multiplier: float = Field(default=0.5, ge=0.0, le=1.0)
+    mpo_weights: dict[str, float] = Field(default_factory=_default_mpo_weights)
+    etkdg_variant: Literal["ETKDGv3", "ETKDGv2"] = "ETKDGv3"
+    force_field: Literal["MMFF94s", "MMFF94", "UFF", "none"] = "MMFF94s"
+    num_conformers: int = Field(default=5, ge=1, le=50)
+    extra_rdkit_descriptors: list[str] = Field(default_factory=list)
+    brenk_ignore_long_chain: bool = True
+    lipinski_mw_cutoff: float = Field(default=500.0, gt=0.0)
+    lipinski_logp_cutoff: float = 5.0
+    lipinski_hbd_cutoff: int = Field(default=5, ge=0)
+    lipinski_hba_cutoff: int = Field(default=10, ge=0)
+    harrington_activity_low_delta: float = -0.20
+    harrington_activity_high_delta: float = 0.55
+    harrington_qed_min: float = Field(default=0.35, ge=0.0, le=1.0)
+    harrington_qed_target: float = Field(default=0.65, ge=0.0, le=1.0)
+    harrington_sa_min: float = Field(default=2.0, ge=1.0, le=10.0)
+    herg_low_cutoff: float = Field(default=0.30, ge=0.0, le=1.0)
+    herg_high_cutoff: float = Field(default=0.60, ge=0.0, le=1.0)
+    logs_soluble_cutoff: float = -2.0
+    logs_moderate_cutoff: float = -4.0
+    logs_poor_cutoff: float = -6.0
+    conformer_opt_max_iters: int = Field(default=200, ge=0, le=5000)
+    conformer_random_seed: int = 42
+    pca_random_seed: int = 42
+
+    # 5. Оркестрация (critic_node.py, workflow.py)
+    max_iterations: int = Field(default=2, ge=0, le=10)
+    strict_assay_homogeneity: bool = True
+    strict_property_thresholds: bool = True
+    max_refilter_iterations: int = Field(default=1, ge=0, le=5)
+    critic_fallback_min_tpsa: float = Field(default=85.0, ge=0.0)
+    critic_logp_step_reduction: float = Field(default=0.7, ge=0.0)
+
+    def apply_overrides(
+        self,
+        overrides: dict[str, Any] | None,
+        *,
+        allow_none_keys: set[str] | frozenset[str] | None = None,
+    ) -> tuple[ToolConfig, list[str]]:
+        """Валидирует и применяет частичные переопределения, возвращая новый ToolConfig и список измененных ключей."""
+        if not overrides:
+            return self, []
+
+        current = self.model_dump(mode="python")
+        candidate = dict(current)
+        nullable = allow_none_keys or frozenset()
+        for key, raw_val in overrides.items():
+            if key not in ToolConfig.model_fields:
+                continue
+            if raw_val is None and key not in nullable:
+                continue
+            if key == "mpo_weights" and isinstance(raw_val, dict):
+                merged_weights = dict(current["mpo_weights"])
+                for wk, wv in raw_val.items():
+                    if wv is not None:
+                        merged_weights[str(wk)] = float(wv)
+                candidate["mpo_weights"] = merged_weights
+            else:
+                candidate[key] = raw_val
+
+        updated = ToolConfig.model_validate(candidate)
+        updated_dump = updated.model_dump(mode="python")
+        changed_keys = [
+            k
+            for k in ToolConfig.model_fields
+            if updated_dump.get(k) != current.get(k)
+        ]
+        return updated, changed_keys

@@ -34,7 +34,7 @@ from pishovichok.agents.evaluation_node import evaluation_node
 from pishovichok.agents.research_node import research_node
 from pishovichok.agents.sar_node import sar_node
 from pishovichok.state.graph_state import SARGraphState, create_initial_graph_state
-from pishovichok.state.schemas import CandidateMolecule, QueryConstraints
+from pishovichok.state.schemas import CandidateMolecule, QueryConstraints, ToolConfig
 from pishovichok.state.storage import create_session_workspace, export_trace_log
 
 
@@ -247,6 +247,7 @@ def run_sar_pipeline(
     workspace_dir: str | Path | None = None,
     uploaded_csv_path: str | Path | None = None,
     query_constraints: QueryConstraints | None = None,
+    tool_config: ToolConfig | None = None,
     export_artifacts: bool = True,
 ) -> tuple[SARGraphState, Path | None, Path | None, Path | None]:
     """Выполняет сквозной скрининг лекарственных кандидатов в графе LangGraph.
@@ -264,6 +265,7 @@ def run_sar_pipeline(
         workspace_dir=session_dir,
         query_constraints=query_constraints,
         uploaded_csv_path=uploaded_csv_path,
+        tool_config=tool_config,
     )
 
     compiled_graph = build_sar_graph()

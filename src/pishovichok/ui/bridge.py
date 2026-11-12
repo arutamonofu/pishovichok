@@ -26,9 +26,20 @@ from pishovichok.agents.workflow import (
     export_candidates_to_sdf,
 )
 from pishovichok.core.rendering import compute_chemical_space_projection
-from pishovichok.state.graph_state import SARGraphState, create_initial_graph_state
-from pishovichok.state.schemas import QueryConstraints, SARRule
+from pishovichok.state.graph_state import (
+    SARGraphState,
+    create_initial_graph_state,
+    resolve_tool_config,
+    update_param_sources,
+)
+from pishovichok.state.schemas import (
+    ParquetPointer,
+    QueryConstraints,
+    SARRule,
+    ToolConfig,
+)
 from pishovichok.state.storage import (
+    compute_file_sha256,
     create_session_workspace,
     export_trace_log,
     read_candidates_parquet,
@@ -42,6 +53,10 @@ from pishovichok.ui.session import (
 )
 from pishovichok.ui.state_vm import ReferencePointVM
 
+RestartStage = Literal["research", "sar", "design", "evaluation"]
+_NULLABLE_TOOL_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"protected_smarts", "modifiable_atom_indices"}
+)
 _ALL_GRAPH_NODES = ["research", "sar", "design", "evaluation", "critic"]
 
 _ALLOWED_CHECKPOINT_MODULES: list[tuple[str, str]] = [
@@ -58,6 +73,7 @@ _ALLOWED_CHECKPOINT_MODULES: list[tuple[str, str]] = [
     ("pishovichok.state.schemas", "TraceEvent"),
     ("pishovichok.state.schemas", "ParentSeed"),
     ("pishovichok.state.schemas", "GeneratedRawCandidate"),
+    ("pishovichok.state.schemas", "ToolConfig"),
 ]
 
 
@@ -133,8 +149,9 @@ def _apply_modifications_to_state(
     modified_lead_smiles: str | None = None,
     modified_smarts: str | None = None,
     constraints_patch: dict[str, Any] | None = None,
+    tool_config_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Формирует словарь обновлений `SARGraphState` из правок исследователя (скаффолд/SMARTS/пороги)."""
+    """Формирует словарь обновлений `SARGraphState` из правок исследователя (скаффолд/SMARTS/пороги/ToolConfig)."""
     patch: dict[str, Any] = {}
     constraints = state["query_constraints"]
     c_updates: dict[str, Any] = dict(constraints_patch or {})
@@ -149,32 +166,84 @@ def _apply_modifications_to_state(
         constraints = constraints.model_copy(update=c_updates)
         patch["query_constraints"] = constraints
 
-    if modified_smarts and ">>" in modified_smarts:
-        lhs, rhs = modified_smarts.split(">>", 1)
-        lhs_clean = lhs.strip()
-        rhs_clean = rhs.strip()
-        if lhs_clean and rhs_clean:
-            user_rule = SARRule(
-                rule_id="USER_SMARTS_01",
-                smirks=f"{lhs_clean}>>{rhs_clean}",
-                from_fragment=lhs_clean,
-                to_fragment=rhs_clean,
-                mean_delta_pic50=0.65,
-                std_delta_pic50=0.0,
-                support_pairs_count=1,
-                mean_delta_clogp=-0.2,
-                mean_delta_tpsa=10.0,
-                assay_homogeneous=True,
-                participating_bao_formats=["USER_CONSTRAINT"],
-                example_pair_ids=[],
-            )
-            existing_rules = [
-                r for r in state.get("extracted_sar_rules", [])
-                if r.rule_id != "USER_SMARTS_01"
-            ]
-            patch["extracted_sar_rules"] = [user_rule, *existing_rules]
+    tc_updates: dict[str, Any] = dict(tool_config_patch or {})
+    if modified_smarts and modified_smarts.strip():
+        smarts_clean = modified_smarts.strip()
+        if ">>" in smarts_clean:
+            lhs, rhs = smarts_clean.split(">>", 1)
+            lhs_clean = lhs.strip()
+            rhs_clean = rhs.strip()
+            if lhs_clean and rhs_clean:
+                user_rule = SARRule(
+                    rule_id="USER_SMARTS_01",
+                    smirks=f"{lhs_clean}>>{rhs_clean}",
+                    from_fragment=lhs_clean,
+                    to_fragment=rhs_clean,
+                    mean_delta_pic50=0.65,
+                    std_delta_pic50=0.0,
+                    support_pairs_count=1,
+                    mean_delta_clogp=-0.2,
+                    mean_delta_tpsa=10.0,
+                    assay_homogeneous=True,
+                    participating_bao_formats=["USER_CONSTRAINT"],
+                    example_pair_ids=[],
+                )
+                existing_rules = [
+                    r for r in state.get("extracted_sar_rules", [])
+                    if r.rule_id != "USER_SMARTS_01"
+                ]
+                patch["extracted_sar_rules"] = [user_rule, *existing_rules]
+        else:
+            tc_updates["protected_smarts"] = smarts_clean
+
+    if tc_updates:
+        current_tc = resolve_tool_config(state)
+        updated_tc, changed_keys = current_tc.apply_overrides(
+            tc_updates,
+            allow_none_keys=_NULLABLE_TOOL_CONFIG_KEYS,
+        )
+        patch["tool_config"] = updated_tc
+        patch["param_sources"] = update_param_sources(
+            state.get("param_sources"),
+            changed_keys,
+            "ui_manual",
+        )
 
     return patch
+
+
+def _recover_parquet_pointer_if_exists(
+    session_dir: Path,
+    filename: str,
+    table_type: Literal["curated_dataset", "mmp_pairs"],
+) -> ParquetPointer | None:
+    """Восстанавливает `ParquetPointer` с диска сессии, если он не сохранён в памяти состояния."""
+    path = session_dir / filename
+    if not path.is_file():
+        return None
+    import pyarrow.parquet as pq
+
+    meta = pq.read_metadata(path)
+    schema = pq.read_schema(path)
+    return ParquetPointer(
+        uri=str(path.resolve()),
+        table_type=table_type,
+        row_count=int(meta.num_rows),
+        columns=list(schema.names),
+        sha256_checksum=compute_file_sha256(path),
+    )
+
+
+def _find_latest_raw_candidates_iteration(session_dir: Path) -> int | None:
+    """Находит максимальный номер итерации `raw_candidates_it{n}.json` в директории сессии."""
+    best: int | None = None
+    for path in session_dir.glob("raw_candidates_it*.json"):
+        suffix = path.stem.removeprefix("raw_candidates_it")
+        if suffix.isdigit():
+            it_num = int(suffix)
+            if best is None or it_num > best:
+                best = it_num
+    return best
 
 
 class AgentUIBridge:
@@ -191,6 +260,8 @@ class AgentUIBridge:
         uploaded_csv_path: str | None = None,
         hitl_mode: HITLMode = "auto",
         query_constraints: QueryConstraints | None = None,
+        tool_config: ToolConfig | None = None,
+        param_sources: dict[str, Any] | None = None,
     ) -> SessionRuntime:
         """Запускает граф агентов в фоне через `nicegui.background_tasks.create`."""
         runtime = self.registry.get_or_create(
@@ -211,6 +282,8 @@ class AgentUIBridge:
             workspace_dir=session_dir,
             query_constraints=query_constraints,
             uploaded_csv_path=uploaded_csv_path,
+            tool_config=tool_config,
+            param_sources=param_sources,
         )
         runtime.hitl_mode = hitl_mode
         runtime.hitl_pause_reason = None
@@ -222,6 +295,7 @@ class AgentUIBridge:
         runtime.view_model.reference_points = []
         if query_constraints is not None:
             runtime.view_model.sync_constraints(query_constraints)
+        runtime.view_model.sync_tool_config(resolve_tool_config(runtime.state))
 
         runtime.status = "running"
         runtime.current_node = "research"
@@ -267,12 +341,13 @@ class AgentUIBridge:
         self,
         session_id: str,
         *,
-        target_stage: Literal["research", "design"] = "design",
+        target_stage: RestartStage = "design",
         modified_lead_smiles: str | None = None,
         modified_smarts: str | None = None,
         constraints_patch: dict[str, Any] | None = None,
+        tool_config_patch: dict[str, Any] | None = None,
     ) -> None:
-        """Отменяет текущую ветвь и перезапускает граф с модифицированными скаффолдами/SMARTS."""
+        """Отменяет текущую ветвь и перезапускает граф с заданного узла (`research`, `sar`, `design`, `evaluation`)."""
         runtime = self.registry.get(session_id)
         if runtime is None:
             return
@@ -284,12 +359,15 @@ class AgentUIBridge:
             modified_lead_smiles=modified_lead_smiles,
             modified_smarts=modified_smarts,
             constraints_patch=constraints_patch,
+            tool_config_patch=tool_config_patch,
         )
         for k, v in patch.items():
             runtime.state[k] = v  # type: ignore[literal-required]
 
         if "query_constraints" in patch:
             runtime.view_model.sync_constraints(patch["query_constraints"])
+        if "tool_config" in patch:
+            runtime.view_model.sync_tool_config(patch["tool_config"])
 
         runtime.status = "running"
         runtime.hitl_pause_reason = None
@@ -297,14 +375,59 @@ class AgentUIBridge:
         runtime.hitl_gate.clear()
         runtime.error_message = None
 
-        if target_stage == "design" and runtime.state.get("dataset_uri") is not None:
-            runtime.state["design_iteration"] = 0
-            runtime.state["critic_verdict"] = "proceed_to_design"
-            runtime.view_model.clear_candidates()
-            runtime.svg_cache.clear()
-            resume_stage: Literal["research", "design"] | None = "design"
-            runtime.current_node = "design"
-        else:
+        # Восстанавливаем указатели Parquet с диска, если сессия была загружена из workspace
+        if runtime.state.get("dataset_uri") is None:
+            recovered_ds = _recover_parquet_pointer_if_exists(
+                runtime.workspace_dir, "curated_dataset.parquet", "curated_dataset"
+            )
+            if recovered_ds is not None:
+                runtime.state["dataset_uri"] = recovered_ds
+        if runtime.state.get("mmp_table_uri") is None:
+            recovered_mmp = _recover_parquet_pointer_if_exists(
+                runtime.workspace_dir, "mmp_pairs.parquet", "mmp_pairs"
+            )
+            if recovered_mmp is not None:
+                runtime.state["mmp_table_uri"] = recovered_mmp
+
+        effective_stage: RestartStage = target_stage
+        if effective_stage == "evaluation":
+            cur_it = int(runtime.state.get("design_iteration") or 0)
+            raw_cur = runtime.workspace_dir / f"raw_candidates_it{cur_it}.json"
+            if cur_it >= 1 and raw_cur.is_file():
+                resolved_it = cur_it
+            else:
+                resolved_it = _find_latest_raw_candidates_iteration(runtime.workspace_dir) or 0
+            if resolved_it >= 1:
+                runtime.state["design_iteration"] = resolved_it
+                runtime.view_model.clear_candidates()
+                runtime.svg_cache.clear()
+                resume_stage: RestartStage = "evaluation"
+            elif runtime.state.get("dataset_uri") is not None:
+                effective_stage = "design"
+            else:
+                effective_stage = "research"
+
+        if effective_stage == "design":
+            if runtime.state.get("dataset_uri") is not None:
+                runtime.state["design_iteration"] = 0
+                runtime.state["critic_verdict"] = "proceed_to_design"
+                runtime.view_model.clear_candidates()
+                runtime.svg_cache.clear()
+                resume_stage = "design"
+            else:
+                effective_stage = "research"
+
+        if effective_stage == "sar":
+            if runtime.state.get("dataset_uri") is not None:
+                runtime.state["data_refilter_iteration"] = 0
+                runtime.state["design_iteration"] = 0
+                runtime.view_model.clear_candidates()
+                runtime.svg_cache.clear()
+                resume_stage = "sar"
+            else:
+                effective_stage = "research"
+
+        if effective_stage == "research":
             runtime.state["last_executed_stage"] = "init"
             runtime.state["data_refilter_iteration"] = 0
             runtime.state["design_iteration"] = 0
@@ -313,7 +436,8 @@ class AgentUIBridge:
             runtime.view_model.clear_candidates()
             runtime.svg_cache.clear()
             resume_stage = "research"
-            runtime.current_node = "research"
+
+        runtime.current_node = resume_stage
 
         task = background_tasks.create(
             self._run_graph_loop(runtime, resume_from_stage=resume_stage),
@@ -325,7 +449,7 @@ class AgentUIBridge:
             {
                 "type": "branch_restarted",
                 "session_id": session_id,
-                "target_stage": target_stage,
+                "target_stage": resume_stage,
             },
         )
 
@@ -343,7 +467,7 @@ class AgentUIBridge:
     async def _run_graph_loop(
         self,
         runtime: SessionRuntime,
-        resume_from_stage: Literal["research", "design"] | None = None,
+        resume_from_stage: RestartStage | None = None,
     ) -> None:
         """Основной цикл пошагового выполнения графа с поддержкой HITL и отмены."""
         session_id = runtime.session_id
@@ -359,16 +483,31 @@ class AgentUIBridge:
             )
             config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
 
-            # Если перезапускаем ветвь со стадии `design`, предварительно записываем
-            # актуальное состояние в checkpointer на входе в `design` (как после `critic`).
-            if resume_from_stage == "design":
+            # Подготовка чекпоинта для частичного перезапуска с указанного узла
+            if resume_from_stage == "sar":
+                await run.io_bound(
+                    compiled_graph.update_state,
+                    config,
+                    dict(runtime.state),
+                    "research",
+                )
+                next_input: dict[str, Any] | None = None
+            elif resume_from_stage == "design":
                 await run.io_bound(
                     compiled_graph.update_state,
                     config,
                     dict(runtime.state),
                     "critic",
                 )
-                next_input: dict[str, Any] | None = None
+                next_input = None
+            elif resume_from_stage == "evaluation":
+                await run.io_bound(
+                    compiled_graph.update_state,
+                    config,
+                    dict(runtime.state),
+                    "design",
+                )
+                next_input = None
             else:
                 next_input = dict(runtime.state)
 
@@ -536,8 +675,78 @@ class AgentUIBridge:
                 existing = list(state.get("trace_log", []))
                 existing.extend(val)
                 state["trace_log"] = existing
+            elif key == "param_sources" and isinstance(val, dict):
+                existing_ps = dict(state.get("param_sources", {}))
+                existing_ps.update(val)
+                state["param_sources"] = existing_ps
+            elif key == "node_telemetry" and isinstance(val, dict):
+                existing_nt = dict(state.get("node_telemetry", {}))
+                existing_nt.update(val)
+                state["node_telemetry"] = existing_nt
             else:
                 state[key] = val  # type: ignore[literal-required]
+
+    @staticmethod
+    def apply_ui_tool_overrides(
+        runtime: SessionRuntime,
+        overrides: dict[str, Any],
+    ) -> list[str]:
+        """Применяет ручные UI-настройки `ToolConfig` и помечает их источником `ui_manual`."""
+        if not overrides:
+            return []
+        current_tc = resolve_tool_config(runtime.state)
+        updated_tc, changed_keys = current_tc.apply_overrides(
+            overrides,
+            allow_none_keys=_NULLABLE_TOOL_CONFIG_KEYS,
+        )
+        if not changed_keys:
+            return []
+        runtime.state["tool_config"] = updated_tc
+        runtime.state["param_sources"] = update_param_sources(
+            runtime.state.get("param_sources"),
+            changed_keys,
+            "ui_manual",
+        )
+        runtime.view_model.sync_tool_config(updated_tc)
+        return changed_keys
+
+    async def apply_local_mpo_recalculation(
+        self,
+        runtime: SessionRuntime,
+        overrides: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Применяет UI-настройки MPO и мгновенно пересчитывает скоры без запуска графа."""
+        changed_keys = (
+            self.apply_ui_tool_overrides(runtime, overrides) if overrides else []
+        )
+        runtime.view_model.recalculate_mpo()
+        await self.registry.broadcast(
+            runtime.session_id,
+            {
+                "type": "mpo_recalculated",
+                "session_id": runtime.session_id,
+                "changed_keys": changed_keys,
+            },
+        )
+        return changed_keys
+
+    async def reset_tool_config_to_defaults(
+        self,
+        runtime: SessionRuntime,
+    ) -> None:
+        """Сбрасывает `ToolConfig` и `param_sources` к значениям по умолчанию и пересчитывает MPO."""
+        default_tc = ToolConfig()
+        runtime.state["tool_config"] = default_tc
+        runtime.state["param_sources"] = update_param_sources(None, (), "default")
+        runtime.view_model.sync_tool_config(default_tc)
+        runtime.view_model.recalculate_mpo()
+        await self.registry.broadcast(
+            runtime.session_id,
+            {
+                "type": "tool_config_reset",
+                "session_id": runtime.session_id,
+            },
+        )
 
     @staticmethod
     def _check_hitl_breakpoint(
@@ -572,6 +781,7 @@ class AgentUIBridge:
         session_id = runtime.session_id
         runtime.current_node = executed_node
         runtime.view_model.sync_constraints(runtime.state.get("query_constraints"))
+        runtime.view_model.sync_tool_config(resolve_tool_config(runtime.state))
 
         if executed_node == "research":
             dataset_ptr = runtime.state.get("dataset_uri")
@@ -609,7 +819,10 @@ class AgentUIBridge:
 
             if all_smiles:
                 coords = await run.cpu_bound(
-                    compute_chemical_space_projection, all_smiles
+                    compute_chemical_space_projection,
+                    all_smiles,
+                    None,
+                    resolve_tool_config(runtime.state),
                 )
                 n_cands = len(cand_ids)
                 cand_coord_map = {

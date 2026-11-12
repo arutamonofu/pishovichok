@@ -11,10 +11,17 @@ from typing import Any
 from nicegui import ui
 
 from pishovichok.config import settings
-from pishovichok.state.schemas import QueryConstraints, TraceEvent
+from pishovichok.state.graph_state import resolve_tool_config
+from pishovichok.state.schemas import (
+    ParamSourceLiteral,
+    QueryConstraints,
+    ToolConfig,
+    TraceEvent,
+)
 from pishovichok.ui.bridge import agent_bridge
 from pishovichok.ui.components.chem_widgets import create_sketcher
 from pishovichok.ui.session import HITLDecision, SessionRuntime, session_registry
+from pishovichok.ui.state_vm import PARAM_SOURCE_BADGE_META
 
 DEMO_SCENARIOS: dict[str, dict[str, str]] = {
     "scenario1_btk": {
@@ -54,6 +61,56 @@ _PIPELINE_STAGES: list[tuple[str, str]] = [
 ]
 
 
+def _compact_telemetry_val(val: Any) -> str:
+    """Компактно форматирует значение параметра или счётчика для чипов телеметрии."""
+    if isinstance(val, list):
+        if len(val) > 3:
+            return f"[{', '.join(str(x) for x in val[:2])}, +{len(val) - 2}]"
+        return f"[{', '.join(str(x) for x in val)}]"
+    if isinstance(val, dict):
+        return f"{{{len(val)} items}}"
+    if isinstance(val, float):
+        return f"{val:.2f}" if abs(val) < 100 else f"{val:.0f}"
+    return str(val)
+
+
+def format_node_telemetry_chips(
+    telemetry: dict[str, Any] | None,
+    param_sources: dict[str, ParamSourceLiteral] | None = None,
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+    """Преобразует `node_telemetry[node]` в структурированные чипы параметров (с учётом `param_sources`) и счётчиков."""
+    if not isinstance(telemetry, dict):
+        return [], []
+    sources = param_sources or {}
+    raw_params = telemetry.get("active_params") or {}
+    raw_stats = telemetry.get("stats") or {}
+
+    param_chips: list[dict[str, str]] = []
+    if isinstance(raw_params, dict):
+        for k, v in raw_params.items():
+            if v is None or v == [] or v == "":
+                continue
+            src: ParamSourceLiteral = sources.get(str(k), "default")
+            _, color = PARAM_SOURCE_BADGE_META.get(src, ("default", "slate"))
+            param_chips.append(
+                {
+                    "key": str(k),
+                    "label": f"{k}: {_compact_telemetry_val(v)}",
+                    "source": src,
+                    "color": color,
+                }
+            )
+
+    stat_chips: list[tuple[str, str]] = []
+    if isinstance(raw_stats, dict):
+        for k, v in raw_stats.items():
+            if k == "duration_ms" or v is None or v == []:
+                continue
+            stat_chips.append((str(k), _compact_telemetry_val(v)))
+
+    return param_chips, stat_chips
+
+
 class TopStatusBar:
     """Компактная верхняя панель статусов пайплайна, HITL-режима и загрузки сценариев."""
 
@@ -63,12 +120,16 @@ class TopStatusBar:
         *,
         on_session_switched: Callable[[str], Any] | None = None,
         on_csv_uploaded: Callable[[Path], Any] | None = None,
+        on_toggle_settings: Callable[[], Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self._on_session_switched = on_session_switched
         self._on_csv_uploaded = on_csv_uploaded
+        self._on_toggle_settings = on_toggle_settings
         self._stage_badges: dict[str, ui.badge] = {}
         self._counters_label: ui.label | None = None
+        self._settings_btn: ui.button | None = None
+        self._overrides_badge: ui.badge | None = None
         self._hitl_select: ui.select | None = None
         self._scenario_select: ui.select | None = None
         self._build()
@@ -129,8 +190,24 @@ class TopStatusBar:
                 ).props("dense flat color=slate").classes("text-xs").tooltip(
                     "Очистить рабочую область и начать новую сессию"
                 )
+                self._settings_btn = ui.button(
+                    "Ядро",
+                    icon="tune",
+                    on_click=self._handle_toggle_settings,
+                ).props("dense outline color=sky").classes("text-xs").tooltip(
+                    "Открыть конфигурацию вычислительного ядра (ToolConfig)"
+                )
+                with self._settings_btn:
+                    self._overrides_badge = ui.badge("0", color="purple").props(
+                        "floating"
+                    )
+                    self._overrides_badge.set_visibility(False)
 
         self.refresh()
+
+    def _handle_toggle_settings(self) -> None:
+        if self._on_toggle_settings is not None:
+            self._on_toggle_settings()
 
     def _handle_hitl_change(self, e: Any) -> None:
         val = str(e.value)
@@ -215,6 +292,11 @@ class TopStatusBar:
             self._counters_label.set_text(
                 f"Итер: {it} | Кандидаты: {total} (OK: {passed}) | Откл: {rejected}"
             )
+        if self._overrides_badge is not None:
+            sources = self.runtime.state.get("param_sources", {})
+            non_default = sum(1 for src in sources.values() if src != "default")
+            self._overrides_badge.set_text(str(non_default))
+            self._overrides_badge.set_visibility(non_default > 0)
 
 
 class AgentRail:
@@ -225,10 +307,14 @@ class AgentRail:
         runtime: SessionRuntime,
         *,
         on_scaffold_selected: Callable[[str], Any] | None = None,
+        on_tool_config_changed: Callable[[], Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self._on_scaffold_selected = on_scaffold_selected
+        self._on_tool_config_changed = on_tool_config_changed
         self.uploaded_csv_path: Path | None = None
+        self._syncing_smarts: bool = False
+        self._last_sketcher_smiles: str = ""
 
         self._query_input: ui.textarea | None = None
         self._smiles_input: ui.input | None = None
@@ -332,7 +418,14 @@ class AgentRail:
                         .classes("w-full text-xs font-mono")
                     )
                     self._smarts_input = (
-                        ui.input(label="SMARTS фиксации кора (опц.)")
+                        ui.input(
+                            label="SMARTS фиксации кора (опц.)",
+                            value=str(
+                                resolve_tool_config(self.runtime.state).protected_smarts
+                                or ""
+                            ),
+                            on_change=self._handle_smarts_input_change,
+                        )
                         .props("dense outlined dark clearable")
                         .classes("w-full text-xs font-mono")
                     )
@@ -369,12 +462,56 @@ class AgentRail:
         self.refresh()
 
     def _handle_sketcher_change(self, smiles: str) -> None:
+        self._last_sketcher_smiles = smiles
         if self._smiles_input is not None and smiles:
             self._smiles_input.set_value(smiles)
 
+    def get_sketcher_smiles(self) -> str:
+        """Возвращает текущий SMILES из скетчера или поля Lead / Scaffold SMILES."""
+        if self._last_sketcher_smiles:
+            return self._last_sketcher_smiles
+        if self._smiles_input is not None:
+            return str(self._smiles_input.value or "").strip()
+        return ""
+
+    def set_sketcher_smiles(self, smiles: str) -> None:
+        """Устанавливает SMILES в 2D-скетчер."""
+        self._last_sketcher_smiles = smiles
+        if self._sketcher is not None:
+            self._sketcher.set_smiles(smiles)
+
+    def set_protected_smarts(self, smarts: str) -> None:
+        """Синхронизирует поле `_smarts_input` со значением из `ToolSettingsDrawer`."""
+        if self._smarts_input is None:
+            return
+        self._syncing_smarts = True
+        try:
+            self._smarts_input.set_value(smarts)
+        finally:
+            self._syncing_smarts = False
+
+    def _handle_smarts_input_change(self, e: Any) -> None:
+        if self._syncing_smarts:
+            return
+        raw = str(e.value or "").strip()
+        if ">>" in raw:
+            return
+        if raw:
+            from rdkit import Chem
+
+            if Chem.MolFromSmarts(raw) is None:
+                return
+        changed = agent_bridge.apply_ui_tool_overrides(
+            self.runtime, {"protected_smarts": raw or None}
+        )
+        if changed and self._on_tool_config_changed is not None:
+            self._on_tool_config_changed()
+
     def _sync_smiles_to_sketcher(self) -> None:
         if self._sketcher is not None and self._smiles_input is not None:
-            self._sketcher.set_smiles(str(self._smiles_input.value or ""))
+            smi = str(self._smiles_input.value or "")
+            self._last_sketcher_smiles = smi
+            self._sketcher.set_smiles(smi)
 
     def _apply_preset(self, scenario_key: str) -> None:
         preset = DEMO_SCENARIOS.get(scenario_key)
@@ -409,12 +546,23 @@ class AgentRail:
                 lead_smiles=lead_smi,
                 freeze_scaffold=True,
             )
+        smarts_val = (
+            str(self._smarts_input.value or "").strip() if self._smarts_input else ""
+        )
+        tool_cfg: ToolConfig | None = None
+        param_srcs: dict[str, Any] | None = None
+        if smarts_val and ">>" not in smarts_val:
+            tool_cfg = ToolConfig(protected_smarts=smarts_val)
+            param_srcs = {"protected_smarts": "ui_manual"}
+
         await agent_bridge.start_pipeline(
             self.runtime.session_id,
             query,
             uploaded_csv_path=str(self.uploaded_csv_path) if self.uploaded_csv_path else None,
             hitl_mode=self.runtime.hitl_mode,
             query_constraints=constraints,
+            tool_config=tool_cfg,
+            param_sources=param_srcs,
         )
 
     async def _handle_cancel(self) -> None:
@@ -462,6 +610,14 @@ class AgentRail:
             self._run_btn.set_enabled(not is_running)
         if self._cancel_btn is not None:
             self._cancel_btn.set_enabled(is_running)
+
+        tc = resolve_tool_config(self.runtime.state)
+        if self._smarts_input is not None:
+            cur_input_val = str(self._smarts_input.value or "").strip()
+            if ">>" not in cur_input_val:
+                target_smarts = str(tc.protected_smarts or "")
+                if cur_input_val != target_smarts:
+                    self.set_protected_smarts(target_smarts)
 
         if self._scaffolds_box is not None:
             self._scaffolds_box.clear()
@@ -512,6 +668,8 @@ class AgentRail:
         if self._trace_box is not None:
             self._trace_box.clear()
             traces: list[TraceEvent] = list(self.runtime.state.get("trace_log", []))
+            node_telemetry = self.runtime.state.get("node_telemetry", {})
+            param_sources = self.runtime.state.get("param_sources", {})
             with self._trace_box:
                 if not traces:
                     ui.label("Ожидание запуска пайплайна...").classes(
@@ -519,8 +677,17 @@ class AgentRail:
                     )
                 for ev in reversed(traces[-12:]):
                     dot_color = "amber" if ev.fallback_triggered else "emerald"
+                    stage_key = _AGENT_TO_STAGE.get(ev.agent_name, ev.agent_name.lower())
+                    telemetry = (
+                        node_telemetry.get(stage_key)
+                        if isinstance(node_telemetry, dict)
+                        else None
+                    )
+                    param_chips, stat_chips = format_node_telemetry_chips(
+                        telemetry, param_sources
+                    )
                     with ui.card().classes(
-                        "w-full bg-slate-900/90 border border-slate-800 p-2 gap-0.5"
+                        "w-full bg-slate-900/90 border border-slate-800 p-2 gap-1"
                     ):
                         with ui.row().classes("w-full items-center justify-between"):
                             ui.badge(f"{ev.agent_name} · {ev.phase}", color=dot_color).props("dense")
@@ -530,3 +697,20 @@ class AgentRail:
                         ui.label(ev.output_summary or ev.action_taken).classes(
                             "text-xs text-slate-300"
                         )
+                        if stat_chips:
+                            with ui.row().classes("w-full gap-1 flex-wrap"):
+                                for sk, sv in stat_chips[:6]:
+                                    ui.badge(f"{sk}={sv}", color="emerald").props(
+                                        "dense outline"
+                                    ).classes("text-[10px] font-mono")
+                        if param_chips:
+                            with ui.row().classes("w-full gap-1 flex-wrap"):
+                                for chip in param_chips[:10]:
+                                    is_override = chip["source"] != "default"
+                                    props_s = "dense" if is_override else "dense outline"
+                                    ui.badge(
+                                        chip["label"],
+                                        color=chip["color"],
+                                    ).props(props_s).classes(
+                                        "text-[10px] font-mono"
+                                    ).tooltip(f"Источник: {chip['source']}")

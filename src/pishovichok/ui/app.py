@@ -14,6 +14,7 @@ from pishovichok.ui.components.agent_rail import AgentRail, TopStatusBar
 from pishovichok.ui.components.candidate_grid import CandidateGrid
 from pishovichok.ui.components.inspector import InspectorPane
 from pishovichok.ui.components.mpo_canvas import MPOCanvas
+from pishovichok.ui.components.tool_settings import ToolSettingsDrawer
 from pishovichok.ui.routes import router as api_router
 from pishovichok.ui.session import SessionRuntime, session_registry
 
@@ -72,6 +73,7 @@ async def chemical_ide_page(
     mpo_canvas: MPOCanvas | None = None
     candidate_grid: CandidateGrid | None = None
     inspector: InspectorPane | None = None
+    tool_settings: ToolSettingsDrawer | None = None
 
     def _select_candidate(cid: str) -> None:
         runtime.view_model.selected_candidate_id = cid
@@ -87,6 +89,36 @@ async def chemical_ide_page(
             candidate_grid.push_updated_rows()
         if inspector is not None:
             inspector.refresh()
+        if top_bar is not None:
+            top_bar.refresh()
+
+    def _on_drawer_local_mpo_updated() -> None:
+        if mpo_canvas is not None:
+            mpo_canvas.refresh(mark_pca_dirty=False)
+        _on_mpo_recalculated()
+
+    def _on_drawer_3d_pca_updated() -> None:
+        if inspector is not None:
+            inspector.invalidate_3d_cache()
+            inspector.refresh()
+        if mpo_canvas is not None:
+            mpo_canvas.refresh(mark_pca_dirty=True)
+
+    def _on_drawer_tool_config_changed() -> None:
+        if top_bar is not None:
+            top_bar.refresh()
+        if candidate_grid is not None:
+            candidate_grid.refresh_telemetry()
+        if inspector is not None:
+            inspector.refresh()
+
+    def _on_external_tool_config_changed() -> None:
+        if top_bar is not None:
+            top_bar.refresh()
+        if tool_settings is not None:
+            tool_settings.refresh()
+        if candidate_grid is not None:
+            candidate_grid.refresh_telemetry()
 
     def _on_row_updated(cid: str) -> None:
         if candidate_grid is not None:
@@ -102,10 +134,31 @@ async def chemical_ide_page(
         if agent_rail is not None:
             agent_rail.uploaded_csv_path = csv_path
 
+    def _toggle_settings() -> None:
+        if tool_settings is not None:
+            tool_settings.toggle()
+
     top_bar = TopStatusBar(
         runtime,
         on_session_switched=_on_session_switched,
         on_csv_uploaded=_on_csv_uploaded,
+        on_toggle_settings=_toggle_settings,
+    )
+
+    tool_settings = ToolSettingsDrawer(
+        runtime,
+        on_local_mpo_updated=_on_drawer_local_mpo_updated,
+        on_3d_pca_params_updated=_on_drawer_3d_pca_updated,
+        on_protected_smarts_changed=lambda sm: (
+            agent_rail.set_protected_smarts(sm) if agent_rail is not None else None
+        ),
+        get_sketcher_smiles=lambda: (
+            agent_rail.get_sketcher_smiles() if agent_rail is not None else ""
+        ),
+        set_sketcher_smiles=lambda smi: (
+            agent_rail.set_sketcher_smiles(smi) if agent_rail is not None else None
+        ),
+        on_tool_config_changed=_on_drawer_tool_config_changed,
     )
 
     with (
@@ -113,7 +166,10 @@ async def chemical_ide_page(
         ui.splitter(value=24, limits=(16, 42)).classes("w-full h-full") as outer_split,
     ):
         with outer_split.before:
-            agent_rail = AgentRail(runtime)
+            agent_rail = AgentRail(
+                runtime,
+                on_tool_config_changed=_on_external_tool_config_changed,
+            )
         with (
             outer_split.after,
             ui.splitter(value=62, limits=(38, 82)).classes("w-full h-full") as mid_split,
@@ -128,6 +184,7 @@ async def chemical_ide_page(
                                 runtime,
                                 on_candidate_selected=_select_candidate,
                                 on_mpo_recalculated=_on_mpo_recalculated,
+                                on_tool_config_changed=_on_external_tool_config_changed,
                             )
                         with center_split.after:
                             candidate_grid = CandidateGrid(
@@ -147,6 +204,10 @@ async def chemical_ide_page(
                 top_bar.refresh()
             if agent_rail is not None:
                 agent_rail.refresh()
+            if tool_settings is not None:
+                tool_settings.refresh()
+            if candidate_grid is not None:
+                candidate_grid.refresh_telemetry()
             if event_type in ("pipeline_started", "branch_restarted"):
                 if candidate_grid is not None:
                     candidate_grid.reset_rows()
@@ -165,6 +226,13 @@ async def chemical_ide_page(
                     candidate_grid.push_new_rows()
                 if mpo_canvas is not None:
                     mpo_canvas.refresh(mark_pca_dirty=True)
+                if inspector is not None:
+                    inspector.refresh()
+            elif event_type in ("mpo_recalculated", "tool_config_reset"):
+                if candidate_grid is not None:
+                    candidate_grid.push_updated_rows()
+                if mpo_canvas is not None:
+                    mpo_canvas.refresh(mark_pca_dirty=False)
                 if inspector is not None:
                     inspector.refresh()
             elif event_type == "pipeline_error":

@@ -12,6 +12,7 @@ from pishovichok.core.admet import (
 from pishovichok.core.bioisosteres import (
     CURATED_BIOISOSTERE_CATALOG,
     BioisostereRule,
+    select_bioisostere_rules,
 )
 from pishovichok.core.curation import (
     StandardizedMoleculeResult,
@@ -25,8 +26,14 @@ from pishovichok.core.evaluation import (
     calculate_rdkit_metrics,
     calculate_sa_score,
     check_structural_alerts,
+    check_structural_alerts_detailed,
+    compute_extra_rdkit_descriptors,
     count_lipinski_violations,
     decompose_brics_precursors,
+)
+from pishovichok.core.fingerprints import (
+    compute_fp_similarity,
+    compute_mol_fingerprint,
 )
 from pishovichok.core.generation import (
     apply_smirks_to_molecule,
@@ -85,10 +92,14 @@ __all__ = [
     "canonicalize_substituent_smiles",
     "check_candidate_constraints",
     "check_structural_alerts",
+    "check_structural_alerts_detailed",
     "classify_herg_risk",
     "classify_solubility",
     "compute_chemical_space_projection",
+    "compute_extra_rdkit_descriptors",
+    "compute_fp_similarity",
     "compute_highlighted_atoms",
+    "compute_mol_fingerprint",
     "convert_to_pchembl",
     "count_lipinski_violations",
     "curate_chembl_or_csv",
@@ -110,6 +121,7 @@ __all__ = [
     "render_mmp_pair_svg",
     "render_mmp_pair_svgs",
     "render_molecule_svg",
+    "select_bioisostere_rules",
     "select_parent_seeds_from_curated",
     "standardize_molecule_detailed",
     "standardize_smiles",

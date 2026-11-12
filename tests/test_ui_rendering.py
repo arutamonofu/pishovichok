@@ -523,3 +523,260 @@ class TestUIComponentAndCheckpointFixes:
         asyncio.run(_run())
         assert len(switched) == 1
         assert switched[0] != "sess_to_clear"
+
+
+class TestToolSettingsAndTelemetry:
+    """Тесты синхронизации ToolConfig <-> UI, 4 режимов перезапуска и телеметрии."""
+
+    def test_tool_config_ui_sync_and_mpo_parity_with_core_scoring(self) -> None:
+        import time
+
+        from pishovichok.core.scoring import calculate_harrington_mpo_score
+        from pishovichok.state.graph_state import resolve_tool_config
+        from pishovichok.state.schemas import QueryConstraints, ToolConfig
+
+        reg = SessionRegistry()
+        bridge = AgentUIBridge(registry=reg)
+        rt = reg.get_or_create("sess_sync_mpo")
+
+        cand_clean = _make_dummy_candidate("c_clean", pic50=8.4, clogp=2.7)
+        cand_alert = _make_dummy_candidate("c_alert", pains_count=1, pic50=8.8, clogp=2.5)
+        rt.view_model.upsert_candidates([cand_clean, cand_alert])
+
+        # Синхронизация весов и порогов Харрингтона в ToolConfig и обратно в ViewModel
+        overrides = {
+            "mpo_weights": {"pic50": 2.5, "herg": 1.8},
+            "cns_profile_mode": "cns_high_bbb",
+            "alert_penalty_mode": "soft_penalty",
+            "alert_soft_multiplier": 0.4,
+            "harrington_qed_min": 0.45,
+            "harrington_activity_high_delta": 0.85,
+            "protected_smarts": "c1ncnc2ccccc12",
+            "modifiable_atom_indices": [0, 3, 7],
+        }
+        changed = bridge.apply_ui_tool_overrides(rt, overrides)
+        assert set(overrides).issubset(set(changed))
+        for k in overrides:
+            assert rt.state["param_sources"][k] == "ui_manual"
+
+        tc = resolve_tool_config(rt.state)
+        assert tc.mpo_weights["pic50"] == 2.5
+        assert rt.view_model.weights.w_activity == 2.5
+        assert rt.view_model.weights.w_herg == 1.8
+        assert rt.view_model.weights.cns_profile_mode == "cns_high_bbb"
+        assert rt.view_model.weights.alert_penalty_mode == "soft_penalty"
+        assert rt.view_model.weights.alert_soft_multiplier == 0.4
+
+        # Локальный пересчёт MPO через core/scoring.py (< 50 мс) и точный паритет с calculate_harrington_mpo_score
+        t0 = time.perf_counter()
+        rt.view_model.recalculate_mpo()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        assert elapsed_ms < 50.0
+
+        constraints = QueryConstraints(scenario_type="target_based_sar")
+        expected_clean = calculate_harrington_mpo_score(
+            cand_clean.calc_rdkit,
+            cand_clean.pred_admet,
+            cand_clean.parent_exp_pic50,
+            constraints,
+            tool_config=tc,
+        )
+        expected_alert = calculate_harrington_mpo_score(
+            cand_alert.calc_rdkit,
+            cand_alert.pred_admet,
+            cand_alert.parent_exp_pic50,
+            constraints,
+            tool_config=tc,
+        )
+        assert rt.view_model.rows_by_id["c_clean"].mpo_score == pytest.approx(expected_clean)
+        assert rt.view_model.rows_by_id["c_alert"].mpo_score == pytest.approx(expected_alert)
+        assert rt.view_model.rows_by_id["c_alert"].mpo_score > 0.0
+
+        # Явная очистка опциональных полей (protected_smarts=None, modifiable_atom_indices=None)
+        cleared = bridge.apply_ui_tool_overrides(
+            rt, {"protected_smarts": None, "modifiable_atom_indices": None}
+        )
+        assert set(cleared) == {"protected_smarts", "modifiable_atom_indices"}
+        tc_after = resolve_tool_config(rt.state)
+        assert tc_after.protected_smarts is None
+        assert tc_after.modifiable_atom_indices is None
+
+        # Сброс к дефолтам
+        asyncio.run(bridge.reset_tool_config_to_defaults(rt))
+        assert resolve_tool_config(rt.state) == ToolConfig()
+        assert all(v == "default" for v in rt.state["param_sources"].values())
+        assert rt.view_model.rows_by_id["c_alert"].mpo_score == 0.0
+
+    def test_apply_mode_classification_and_all_tool_config_fields_covered(self) -> None:
+        from pishovichok.state.schemas import ToolConfig
+        from pishovichok.ui.state_vm import classify_tool_config_change_impact
+
+        assert classify_tool_config_change_impact(["mpo_weights", "harrington_qed_min"]) == "instant_mpo"
+        assert classify_tool_config_change_impact(["cns_profile_mode", "alert_penalty_mode"]) == "instant_mpo"
+        assert classify_tool_config_change_impact(["etkdg_variant", "force_field"]) == "instant_mpo"
+        assert classify_tool_config_change_impact(["active_filter_catalogs", "admet_backend"]) == "evaluation"
+        assert classify_tool_config_change_impact(["custom_ban_smarts", "extra_rdkit_descriptors"]) == "evaluation"
+        assert classify_tool_config_change_impact(["brics_min_fragment_size", "lipinski_mw_cutoff"]) == "evaluation"
+        assert classify_tool_config_change_impact(["crem_mode", "protected_smarts"]) == "design"
+        assert classify_tool_config_change_impact(["fp_type", "cliff_similarity_cutoff"]) == "sar"
+        assert classify_tool_config_change_impact(["allowed_bao_formats", "strip_salts"]) == "research"
+        # При смешанном изменении выбирается наиболее ранний узел графа
+        assert classify_tool_config_change_impact(["mpo_weights", "fp_type", "strip_salts"]) == "research"
+
+        # Проверка, что все 83 поля ToolConfig привязаны в tool_settings.py
+        ts_src = (_SRC_ROOT / "ui" / "components" / "tool_settings.py").read_text(encoding="utf-8")
+        missing = [
+            field_name
+            for field_name in ToolConfig.model_fields
+            if f'"{field_name}"' not in ts_src
+        ]
+        assert missing == []
+
+    def test_restart_branch_supports_four_stages(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pishovichok.ui.bridge as bridge_mod
+        from pishovichok.state.schemas import ParquetPointer
+
+        reg = SessionRegistry(base_workspace_dir=tmp_path)
+        bridge = AgentUIBridge(registry=reg)
+        rt = reg.get_or_create("sess_stages")
+
+        # Подготовка артефактов на диске для частичных перезапусков
+        curated_path = rt.workspace_dir / "curated_dataset.parquet"
+        curated_path.write_bytes(b"parquet-placeholder")
+        (rt.workspace_dir / "raw_candidates_it1.json").write_text("[]", encoding="utf-8")
+        rt.state["dataset_uri"] = ParquetPointer(
+            uri=str(curated_path),
+            table_type="curated_dataset",
+            row_count=1,
+            columns=[
+                "mol_id",
+                "canonical_smiles",
+                "inchi_key",
+                "scaffold_smiles",
+                "pchembl_value",
+                "pchembl_std",
+                "replicate_count",
+                "is_censored",
+                "assay_type",
+                "bao_format",
+                "standard_type",
+                "tanimoto_to_lead",
+            ],
+            sha256_checksum="0" * 64,
+        )
+
+        recorded: list[tuple[str, str | None]] = []
+
+        async def _fake_loop(runtime_arg: object, resume_from_stage: str | None = None) -> None:
+            recorded.append((getattr(runtime_arg, "session_id", ""), resume_from_stage))
+
+        def _fake_bg_create(coro: object, *, name: str = "") -> asyncio.Task[None]:
+            return asyncio.create_task(coro, name=name)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(bridge, "_run_graph_loop", _fake_loop)
+        monkeypatch.setattr(bridge_mod.background_tasks, "create", _fake_bg_create)
+
+        async def _run_all() -> None:
+            for stage in ("evaluation", "design", "sar", "research"):
+                await bridge.restart_branch(
+                    "sess_stages",
+                    target_stage=stage,  # type: ignore[arg-type]
+                    tool_config_patch={"admet_backend": "empirical_only"},
+                )
+                if rt.active_task is not None:
+                    await rt.active_task
+
+        asyncio.run(_run_all())
+        assert [st for _, st in recorded] == ["evaluation", "design", "sar", "research"]
+        assert rt.state["param_sources"]["admet_backend"] == "ui_manual"
+
+    def test_smarts_and_atom_indices_validation_and_descriptors_list(self) -> None:
+        from pishovichok.ui.components.tool_settings import (
+            ALL_RDKIT_DESCRIPTOR_NAMES,
+            format_modifiable_atom_indices,
+            parse_modifiable_atom_indices,
+            validate_smarts_pattern,
+        )
+
+        assert "MolWt" in ALL_RDKIT_DESCRIPTOR_NAMES
+        assert len(ALL_RDKIT_DESCRIPTOR_NAMES) > 150
+
+        ok_valid, cleaned = validate_smarts_pattern("  c1ncnc2ccccc12  ")
+        assert ok_valid is True and cleaned == "c1ncnc2ccccc12"
+        ok_empty, cleaned_empty = validate_smarts_pattern("   ")
+        assert ok_empty is True and cleaned_empty == ""
+        ok_bad, err_msg = validate_smarts_pattern("[invalid_smarts(((")
+        assert ok_bad is False and "SMARTS" in err_msg
+
+        ok_idx, parsed_idx, _ = parse_modifiable_atom_indices("0, 2, 5, 2")
+        assert ok_idx is True and parsed_idx == [0, 2, 5]
+        assert format_modifiable_atom_indices(parsed_idx) == "0, 2, 5"
+        ok_idx_empty, parsed_empty, _ = parse_modifiable_atom_indices("  ")
+        assert ok_idx_empty is True and parsed_empty is None
+        ok_idx_bad, _, err_idx = parse_modifiable_atom_indices("1, abc")
+        assert ok_idx_bad is False and "abc" in err_idx
+
+    def test_node_telemetry_and_panel_banners_rendering(self) -> None:
+        from pishovichok.state.schemas import ToolConfig
+        from pishovichok.ui.components.agent_rail import format_node_telemetry_chips
+        from pishovichok.ui.components.candidate_grid import build_grid_telemetry_badges
+        from pishovichok.ui.components.inspector import (
+            build_inspector_telemetry_summary,
+        )
+
+        telemetry = {
+            "active_params": {
+                "fp_type": "fcfp",
+                "similarity_metric": "dice",
+                "protected_smarts": "c1ccccc1",
+                "mmpa_max_cuts": 1,
+                "max_candidates_pool": 40,
+            },
+            "stats": {
+                "rules_count": 6,
+                "activity_cliffs_count": 2,
+                "duration_ms": 12.3,
+            },
+        }
+        param_sources = {
+            "fp_type": "nl_query",
+            "similarity_metric": "nl_query",
+            "protected_smarts": "ui_manual",
+            "max_candidates_pool": "critic_loop",
+            "mmpa_max_cuts": "default",
+        }
+        param_chips, stat_chips = format_node_telemetry_chips(telemetry, param_sources)  # type: ignore[arg-type]
+        chip_map = {c["key"]: c for c in param_chips}
+        assert chip_map["fp_type"]["color"] == "sky"
+        assert chip_map["protected_smarts"]["color"] == "purple"
+        assert chip_map["max_candidates_pool"]["color"] == "amber"
+        assert chip_map["mmpa_max_cuts"]["color"] == "slate"
+        assert ("rules_count", "6") in stat_chips
+        assert ("activity_cliffs_count", "2") in stat_chips
+
+        tc = ToolConfig(
+            fp_type="fcfp",
+            fp_radius=3,
+            fp_nbits=4096,
+            similarity_metric="dice",
+            admet_backend="empirical_only",
+            active_filter_catalogs=["PAINS_A", "Brenk", "Glaxo"],
+            alert_penalty_mode="soft_penalty",
+            brics_min_fragment_size=4,
+            etkdg_variant="ETKDGv2",
+            force_field="UFF",
+        )
+        grid_badges = build_grid_telemetry_badges(tc)
+        joined_grid = " | ".join(lbl for lbl, _ in grid_badges)
+        assert "fcfp/r3/4096" in joined_grid
+        assert "dice" in joined_grid
+        assert "empirical_only" in joined_grid
+        assert "Glaxo" in joined_grid
+        assert "soft_penalty" in joined_grid
+        assert "BRICS≥4" in joined_grid
+
+        insp_telem = build_inspector_telemetry_summary(tc)
+        assert "ETKDGv2 + UFF" in insp_telem["conformer_3d"]
+        assert "empirical_only" in insp_telem["admet"]
+        assert "fcfp/r3/4096" in insp_telem["sar_fp"]
+        assert "BRICS≥4" in insp_telem["rdkit_filters"]

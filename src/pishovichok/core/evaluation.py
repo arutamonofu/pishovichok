@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 import sys
 from pathlib import Path
@@ -29,16 +30,32 @@ from rdkit.Chem import (
     GraphDescriptors,
     rdMolDescriptors,
 )
+from rdkit.ML.Descriptors import MoleculeDescriptors
 
-from pishovichok.state.schemas import CalcRDKitMetrics
+from pishovichok.state.schemas import CalcRDKitMetrics, ToolConfig
 
 _SASCORER_MODULE: Any = None
 _SASCORER_LOAD_ATTEMPTED: bool = False
 
-# Предкомпилированные синглтоны каталогов подструктурных фильтров RDKit C++
-_PAINS_CATALOG: FilterCatalog.FilterCatalog | None = None
-_BRENK_CATALOG: FilterCatalog.FilterCatalog | None = None
-_GLAXO_CATALOG: FilterCatalog.FilterCatalog | None = None
+# Кэш каталогов подструктурных фильтров RDKit C++ и калькуляторов дескрипторов
+_CATALOG_BY_NAME: dict[str, FilterCatalog.FilterCatalog] = {}
+_DESCRIPTOR_CALC_CACHE: dict[
+    tuple[str, ...], MoleculeDescriptors.MolecularDescriptorCalculator
+] = {}
+_KNOWN_DESCRIPTOR_NAMES: frozenset[str] = frozenset(
+    name for name, _fn in Descriptors._descList
+)
+
+_CATALOG_ENUM_MAP: dict[str, Any] = {
+    "PAINS_A": FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS_A,
+    "PAINS_B": FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS_B,
+    "PAINS_C": FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS_C,
+    "Brenk": FilterCatalog.FilterCatalogParams.FilterCatalogs.BRENK,
+    "Glaxo": FilterCatalog.FilterCatalogParams.FilterCatalogs.CHEMBL_Glaxo,
+    "SureChEMBL": FilterCatalog.FilterCatalogParams.FilterCatalogs.CHEMBL_SureChEMBL,
+    "NIH": FilterCatalog.FilterCatalogParams.FilterCatalogs.NIH,
+    "ZINC": FilterCatalog.FilterCatalogParams.FilterCatalogs.ZINC,
+}
 
 _BRICS_DUMMY_REGEX = re.compile(r"\[\d+\*\]|\[\*\]")
 
@@ -65,34 +82,21 @@ def _get_sascorer() -> Any:
     return _SASCORER_MODULE
 
 
-def _init_filter_catalogs() -> tuple[
-    FilterCatalog.FilterCatalog | None,
-    FilterCatalog.FilterCatalog | None,
-    FilterCatalog.FilterCatalog | None,
-]:
-    """Инициализирует и кэширует каталоги PAINS, Brenk и Glaxo."""
-    global _PAINS_CATALOG, _BRENK_CATALOG, _GLAXO_CATALOG
-    if _PAINS_CATALOG is None:
-        with contextlib.suppress(Exception):
-            pains_params = FilterCatalog.FilterCatalogParams()
-            pains_params.AddCatalog(
-                FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS
-            )
-            _PAINS_CATALOG = FilterCatalog.FilterCatalog(pains_params)
-
-            brenk_params = FilterCatalog.FilterCatalogParams()
-            brenk_params.AddCatalog(
-                FilterCatalog.FilterCatalogParams.FilterCatalogs.BRENK
-            )
-            _BRENK_CATALOG = FilterCatalog.FilterCatalog(brenk_params)
-
-            glaxo_params = FilterCatalog.FilterCatalogParams()
-            glaxo_params.AddCatalog(
-                FilterCatalog.FilterCatalogParams.FilterCatalogs.CHEMBL_Glaxo
-            )
-            _GLAXO_CATALOG = FilterCatalog.FilterCatalog(glaxo_params)
-
-    return (_PAINS_CATALOG, _BRENK_CATALOG, _GLAXO_CATALOG)
+def _get_filter_catalog(catalog_name: str) -> FilterCatalog.FilterCatalog | None:
+    """Лениво инициализирует и кэширует каталог FilterCatalog по его имени из ToolConfig."""
+    cached = _CATALOG_BY_NAME.get(catalog_name)
+    if cached is not None:
+        return cached
+    enum_val = _CATALOG_ENUM_MAP.get(catalog_name)
+    if enum_val is None:
+        return None
+    with contextlib.suppress(Exception):
+        params = FilterCatalog.FilterCatalogParams()
+        params.AddCatalog(enum_val)
+        cat = FilterCatalog.FilterCatalog(params)
+        _CATALOG_BY_NAME[catalog_name] = cat
+        return cat
+    return None
 
 
 def calculate_sa_score(mol: Chem.Mol) -> float:
@@ -124,39 +128,79 @@ def calculate_sa_score(mol: Chem.Mol) -> float:
     return round(max(1.0, min(10.0, fallback_sa)), 4)
 
 
-def check_structural_alerts(
+def check_structural_alerts_detailed(
     mol: Chem.Mol,
-) -> tuple[int, list[str], int, list[str], int]:
-    """Проверяет молекулу по медико-химическим каталогам PAINS (A/B/C), Brenk и Glaxo.
+    *,
+    tool_config: ToolConfig | None = None,
+) -> tuple[int, list[str], int, list[str], int, int, list[str]]:
+    """Проверяет молекулу по активным каталогам из ToolConfig и custom_ban_smarts.
 
     Возвращает кортеж:
-        `(pains_count, pains_matched_names, brenk_count, brenk_matched_names, glaxo_count)`
+        `(pains_count, pains_names, brenk_count, brenk_names, glaxo_count, extra_count, extra_names)`
     """
-    pains_cat, brenk_cat, glaxo_cat = _init_filter_catalogs()
+    cfg = tool_config or ToolConfig()
+    active_cats = list(cfg.active_filter_catalogs)
 
     pains_names: list[str] = []
     brenk_names: list[str] = []
     glaxo_count = 0
+    extra_names: list[str] = []
 
-    if pains_cat is not None:
-        for entry in pains_cat.GetMatches(mol):
-            desc = str(entry.GetDescription())
-            if desc not in pains_names:
-                pains_names.append(desc)
+    for cat_name in active_cats:
+        cat = _get_filter_catalog(cat_name)
+        if cat is None:
+            continue
+        if cat_name in ("PAINS_A", "PAINS_B", "PAINS_C"):
+            for entry in cat.GetMatches(mol):
+                desc = str(entry.GetDescription())
+                if desc not in pains_names:
+                    pains_names.append(desc)
+        elif cat_name == "Brenk":
+            for entry in cat.GetMatches(mol):
+                desc = str(entry.GetDescription())
+                if cfg.brenk_ignore_long_chain and desc == "Aliphatic_long_chain":
+                    continue
+                if desc not in brenk_names:
+                    brenk_names.append(desc)
+        else:
+            matches = cat.GetMatches(mol)
+            if cat_name == "Glaxo":
+                glaxo_count = len(matches)
+            for entry in matches:
+                desc = f"{cat_name}:{entry.GetDescription()}"
+                if desc not in extra_names:
+                    extra_names.append(desc)
 
-    if brenk_cat is not None:
-        for entry in brenk_cat.GetMatches(mol):
-            desc = str(entry.GetDescription())
-            # Aliphatic_long_chain в каталоге Brenk — эвристика длины алкильной цепи, а не реакционноспособный токсикофор
-            if desc == "Aliphatic_long_chain":
-                continue
-            if desc not in brenk_names:
-                brenk_names.append(desc)
+    for ban_idx, smarts_str in enumerate(cfg.custom_ban_smarts, start=1):
+        if not smarts_str:
+            continue
+        pat_mol = Chem.MolFromSmarts(smarts_str) or Chem.MolFromSmiles(smarts_str)
+        if pat_mol is not None and mol.HasSubstructMatch(pat_mol):
+            label = f"CUSTOM_{ban_idx}:{smarts_str}"
+            if label not in extra_names:
+                extra_names.append(label)
 
-    if glaxo_cat is not None:
-        glaxo_count = len(glaxo_cat.GetMatches(mol))
+    return (
+        len(pains_names),
+        pains_names,
+        len(brenk_names),
+        brenk_names,
+        glaxo_count,
+        len(extra_names),
+        extra_names,
+    )
 
-    return (len(pains_names), pains_names, len(brenk_names), brenk_names, glaxo_count)
+
+def check_structural_alerts(
+    mol: Chem.Mol,
+    *,
+    tool_config: ToolConfig | None = None,
+) -> tuple[int, list[str], int, list[str], int]:
+    """Проверяет молекулу по медико-химическим каталогам из ToolConfig (совместимый 5-элементный контракт)."""
+    p_cnt, p_names, b_cnt, b_names, g_cnt, _e_cnt, _e_names = (
+        check_structural_alerts_detailed(mol, tool_config=tool_config)
+    )
+    return (p_cnt, p_names, b_cnt, b_names, g_cnt)
 
 
 def _strip_dummy_and_isolated_h(mol: Chem.Mol) -> Chem.Mol:
@@ -209,14 +253,16 @@ def _clean_brics_fragment_smiles(raw_frag_smiles: str) -> str | None:
     return None
 
 
-def decompose_brics_precursors(mol: Chem.Mol) -> tuple[list[str], int]:
+def decompose_brics_precursors(
+    mol: Chem.Mol,
+    *,
+    tool_config: ToolConfig | None = None,
+) -> tuple[list[str], int]:
     """Выполняет ретросинтетическую декомпозицию молекулы по алгоритму BRICS.
 
-    Возвращает `(brics_fragments, brics_bonds_broken)`:
-    - `brics_fragments`: отсортированный по убыванию размера список валидных канонических SMILES
-      исходных строительных блоков (без фиктивных меток `[n*]`).
-    - `brics_bonds_broken`: количество разорванных ретросинтетических связей BRICS.
+    Управляется параметрами `brics_min_fragment_size` и `brics_only_leaf_nodes` из `ToolConfig`.
     """
+    cfg = tool_config or ToolConfig()
     canon_full = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
     try:
         brics_bonds = list(BRICS.FindBRICSBonds(mol))
@@ -224,7 +270,14 @@ def decompose_brics_precursors(mol: Chem.Mol) -> tuple[list[str], int]:
         if bonds_broken == 0:
             return ([canon_full], 0)
 
-        raw_frags = set(BRICS.BRICSDecompose(mol, returnMols=False))
+        raw_frags = set(
+            BRICS.BRICSDecompose(
+                mol,
+                minFragmentSize=int(cfg.brics_min_fragment_size),
+                keepNonLeafNodes=not bool(cfg.brics_only_leaf_nodes),
+                returnMols=False,
+            )
+        )
     except Exception:  # noqa: BLE001
         return ([canon_full], 0)
 
@@ -237,11 +290,11 @@ def decompose_brics_precursors(mol: Chem.Mol) -> tuple[list[str], int]:
     if not cleaned_set:
         return ([canon_full], 0)
 
-    # Если есть содержательные строительные блоки (>= 2 тяжелых атомов), исключаем тривиальные одноатомные осколки (H2O, NH3, CH4)
+    min_keep = min(2, int(cfg.brics_min_fragment_size))
     substantial = [
         smi
         for smi in cleaned_set
-        if (m := Chem.MolFromSmiles(smi)) is not None and m.GetNumHeavyAtoms() >= 2
+        if (m := Chem.MolFromSmiles(smi)) is not None and m.GetNumHeavyAtoms() >= min_keep
     ]
     final_list = substantial if substantial else list(cleaned_set)
     final_list.sort(
@@ -253,25 +306,60 @@ def decompose_brics_precursors(mol: Chem.Mol) -> tuple[list[str], int]:
     return (final_list, bonds_broken)
 
 
-def count_lipinski_violations(mw: float, clogp: float, hbd: int, hba: int) -> int:
-    """Подсчитывает число нарушений классического правила пяти Липински (Ro5, от 0 до 4)."""
+def count_lipinski_violations(
+    mw: float,
+    clogp: float,
+    hbd: int,
+    hba: int,
+    *,
+    tool_config: ToolConfig | None = None,
+) -> int:
+    """Подсчитывает число нарушений правила пяти Липински (Ro5, от 0 до 4) по порогам ToolConfig."""
+    cfg = tool_config or ToolConfig()
     violations = 0
-    if mw > 500.0:
+    if mw > cfg.lipinski_mw_cutoff:
         violations += 1
-    if clogp > 5.0:
+    if clogp > cfg.lipinski_logp_cutoff:
         violations += 1
-    if hbd > 5:
+    if hbd > cfg.lipinski_hbd_cutoff:
         violations += 1
-    if hba > 10:
+    if hba > cfg.lipinski_hba_cutoff:
         violations += 1
     return violations
+
+
+def compute_extra_rdkit_descriptors(
+    mol: Chem.Mol,
+    descriptor_names: list[str] | tuple[str, ...],
+) -> dict[str, float]:
+    """Вычисляет запрошенные дополнительные дескрипторы RDKit через MolecularDescriptorCalculator."""
+    valid_names = tuple(
+        name for name in descriptor_names if name in _KNOWN_DESCRIPTOR_NAMES
+    )
+    if not valid_names:
+        return {}
+    calc = _DESCRIPTOR_CALC_CACHE.get(valid_names)
+    if calc is None:
+        calc = MoleculeDescriptors.MolecularDescriptorCalculator(list(valid_names))
+        _DESCRIPTOR_CALC_CACHE[valid_names] = calc
+    raw_vals = calc.CalcDescriptors(mol)
+    out: dict[str, float] = {}
+    for name, val in zip(valid_names, raw_vals, strict=False):
+        with contextlib.suppress(Exception):
+            fval = float(val)
+            if math.isfinite(fval):
+                out[name] = round(fval, 4)
+    return out
 
 
 def calculate_rdkit_metrics(
     mol_or_smiles: Chem.Mol | str,
     parent_mol_or_smiles: Chem.Mol | str | None = None,
+    *,
+    tool_config: ToolConfig | None = None,
 ) -> CalcRDKitMetrics:
     """Вычисляет полный детерминированный профиль `CalcRDKitMetrics` (Категория 2 данных кандидата)."""
+    cfg = tool_config or ToolConfig()
     mol = (
         Chem.MolFromSmiles(mol_or_smiles)
         if isinstance(mol_or_smiles, str)
@@ -299,12 +387,25 @@ def calculate_rdkit_metrics(
     fsp3 = round(max(0.0, min(1.0, float(Descriptors.FractionCSP3(mol)))), 4)
     qed_val = round(max(0.0, min(1.0, float(QED.qed(mol)))), 4)
     sa_score = calculate_sa_score(mol)
-    lipinski = count_lipinski_violations(mw=mw, clogp=clogp, hbd=hbd, hba=hba)
-
-    pains_count, pains_names, brenk_count, brenk_names, glaxo_count = (
-        check_structural_alerts(mol)
+    lipinski = count_lipinski_violations(
+        mw=mw, clogp=clogp, hbd=hbd, hba=hba, tool_config=cfg
     )
-    brics_fragments, brics_bonds_broken = decompose_brics_precursors(mol)
+
+    (
+        pains_count,
+        pains_names,
+        brenk_count,
+        brenk_names,
+        glaxo_count,
+        extra_count,
+        extra_names,
+    ) = check_structural_alerts_detailed(mol, tool_config=cfg)
+    brics_fragments, brics_bonds_broken = decompose_brics_precursors(
+        mol, tool_config=cfg
+    )
+    extra_descriptors = compute_extra_rdkit_descriptors(
+        mol, cfg.extra_rdkit_descriptors
+    )
 
     if parent_mol is not None:
         parent_clogp = float(Descriptors.MolLogP(parent_mol))
@@ -331,6 +432,9 @@ def calculate_rdkit_metrics(
         brenk_alerts_count=brenk_count,
         brenk_matched_names=brenk_names,
         glaxo_alerts_count=glaxo_count,
+        extra_alerts_count=extra_count,
+        extra_alerts_matched_names=extra_names,
+        extra_descriptors=extra_descriptors,
         brics_fragments=brics_fragments,
         brics_bonds_broken=brics_bonds_broken,
         delta_clogp_vs_parent=delta_clogp,

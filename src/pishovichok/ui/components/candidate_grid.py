@@ -7,7 +7,44 @@ from typing import Any
 
 from nicegui import ui
 
+from pishovichok.state.graph_state import resolve_tool_config
+from pishovichok.state.schemas import ToolConfig
 from pishovichok.ui.session import SessionRuntime
+
+
+def build_grid_telemetry_badges(tool_config: ToolConfig) -> list[tuple[str, str]]:
+    """Формирует компактные плашки активных параметров расчёта для панели таблицы кандидатов."""
+    cats = (
+        ", ".join(tool_config.active_filter_catalogs)
+        if tool_config.active_filter_catalogs
+        else "нет"
+    )
+    return [
+        (
+            f"FP: {tool_config.fp_type}/r{tool_config.fp_radius}/{tool_config.fp_nbits}",
+            "Отпечатки молекул (fp_type / fp_radius / fp_nbits)",
+        ),
+        (
+            f"Sim: {tool_config.similarity_metric}",
+            "Метрика сходства (similarity_metric)",
+        ),
+        (
+            f"Cliff: S≥{tool_config.cliff_similarity_cutoff:.2f} Δ≥{tool_config.cliff_delta_pic50_cutoff:.1f}",
+            "Пороги Activity Cliff (cliff_similarity_cutoff, cliff_delta_pic50_cutoff)",
+        ),
+        (
+            f"ADMET: {tool_config.admet_backend}",
+            "Выбранный бэкенд прогноза ADMET (admet_backend)",
+        ),
+        (
+            f"Filters: {cats} [{tool_config.alert_penalty_mode}]",
+            "Активные каталоги фильтров и режим штрафа алертов",
+        ),
+        (
+            f"BRICS≥{tool_config.brics_min_fragment_size}",
+            "Минимальный размер фрагмента BRICS (brics_min_fragment_size)",
+        ),
+    ]
 
 
 class CandidateGrid:
@@ -22,6 +59,7 @@ class CandidateGrid:
         self.runtime = runtime
         self._on_candidate_selected = on_candidate_selected
         self._grid: ui.aggrid | None = None
+        self._telemetry_row: ui.row | None = None
         self._build()
 
     def _build(self) -> None:
@@ -122,15 +160,30 @@ class CandidateGrid:
         }
 
         with ui.column().classes("w-full h-full gap-1 p-2 bg-slate-950"):
-            ui.label("Кандидаты и дескрипторы (AG Grid)").classes(
-                "text-xs uppercase tracking-wider font-semibold text-slate-400"
-            )
+            with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                ui.label("Кандидаты и дескрипторы (AG Grid)").classes(
+                    "text-xs uppercase tracking-wider font-semibold text-slate-400"
+                )
+                self._telemetry_row = ui.row().classes("items-center gap-1 flex-wrap")
+            self.refresh_telemetry()
             self._grid = ui.aggrid(
                 grid_options,
                 html_columns=[0],
                 theme="quartz",
             ).classes("w-full flex-1 h-full min-h-[220px]")
             self._grid.on("cellClicked", self._handle_cell_clicked)
+
+    def refresh_telemetry(self) -> None:
+        """Обновляет информационную плашку активных параметров над таблицей."""
+        if self._telemetry_row is None:
+            return
+        tc = resolve_tool_config(self.runtime.state)
+        self._telemetry_row.clear()
+        with self._telemetry_row:
+            for label, tip in build_grid_telemetry_badges(tc):
+                ui.badge(label, color="slate").props("dense outline").classes(
+                    "text-[10px] font-mono text-slate-300"
+                ).tooltip(tip)
 
     def _handle_cell_clicked(self, e: Any) -> None:
         args = getattr(e, "args", None)

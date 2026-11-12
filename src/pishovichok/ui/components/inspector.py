@@ -14,8 +14,36 @@ from pishovichok.agents.workflow import (
 )
 from pishovichok.config import settings
 from pishovichok.core.rendering import generate_3d_conformer_molblock
+from pishovichok.state.graph_state import resolve_tool_config
+from pishovichok.state.schemas import ToolConfig
 from pishovichok.ui.components.chem_widgets import MoleculeViewer3D
 from pishovichok.ui.session import SessionRuntime
+
+
+def build_inspector_telemetry_summary(tool_config: ToolConfig) -> dict[str, str]:
+    """Формирует компактные строки телеметрии активных параметров для секций инспектора."""
+    cats = (
+        ", ".join(tool_config.active_filter_catalogs)
+        if tool_config.active_filter_catalogs
+        else "нет"
+    )
+    return {
+        "conformer_3d": (
+            f"{tool_config.etkdg_variant} + {tool_config.force_field} "
+            f"(n={tool_config.num_conformers}, it={tool_config.conformer_opt_max_iters})"
+        ),
+        "rdkit_filters": (
+            f"Filters: {cats} [{tool_config.alert_penalty_mode}] | "
+            f"BRICS≥{tool_config.brics_min_fragment_size} | "
+            f"ExtraDesc: {len(tool_config.extra_rdkit_descriptors)}"
+        ),
+        "admet": f"Backend: {tool_config.admet_backend}",
+        "sar_fp": (
+            f"FP: {tool_config.fp_type}/r{tool_config.fp_radius}/{tool_config.fp_nbits} | "
+            f"{tool_config.similarity_metric} | "
+            f"Cliff: S≥{tool_config.cliff_similarity_cutoff:.2f}, Δ≥{tool_config.cliff_delta_pic50_cutoff:.1f}"
+        ),
+    }
 
 
 class InspectorPane:
@@ -34,9 +62,11 @@ class InspectorPane:
         self._pin_btn: ui.button | None = None
         self._exclude_btn: ui.button | None = None
         self._pairwise_box: ui.row | None = None
+        self._conformer_title: ui.label | None = None
         self._viewer3d: MoleculeViewer3D | None = None
         self._desirability_box: ui.column | None = None
         self._provenance_box: ui.column | None = None
+        self._telemetry_bar: ui.row | None = None
         self._mol3d_cache: dict[str, str] = {}
         self._build()
 
@@ -61,6 +91,7 @@ class InspectorPane:
             self._smiles_label = ui.label("").classes(
                 "text-[11px] font-mono text-slate-400 break-all bg-slate-900 p-2 rounded border border-slate-800"
             )
+            self._telemetry_bar = ui.row().classes("w-full gap-1 flex-wrap")
 
             # Попарное 2D-сравнение (Parent -> SMIRKS -> Candidate) через ленивые HTTP-URL
             ui.label("Попарный дифф (Parent → Candidate)").classes(
@@ -70,9 +101,9 @@ class InspectorPane:
                 "w-full items-center justify-between gap-2 no-wrap"
             )
 
-            # 3D-конформер ETKDGv3
+            # 3D-конформер (ETKDG + силовое поле из ToolConfig)
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("3D-конформер (ETKDGv3 + UFF)").classes(
+                self._conformer_title = ui.label("3D-конформер").classes(
                     "text-xs uppercase tracking-wider font-semibold text-slate-400"
                 )
                 ui.button(
@@ -148,13 +179,23 @@ class InspectorPane:
         if cand is None or self._viewer3d is None:
             ui.notify("Сначала выберите кандидата", type="warning")
             return
-        molblock = self._mol3d_cache.get(cid or "")
+        tool_config = resolve_tool_config(self.runtime.state)
+        cache_key = (
+            f"{cid or ''}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
+            f"{tool_config.num_conformers}_{tool_config.conformer_opt_max_iters}_"
+            f"{tool_config.conformer_random_seed}"
+        )
+        molblock = self._mol3d_cache.get(cache_key)
         if molblock is None:
             molblock, _ = await run.cpu_bound(
-                generate_3d_conformer_molblock, cand.canonical_smiles
+                generate_3d_conformer_molblock,
+                cand.canonical_smiles,
+                tool_config.num_conformers,
+                tool_config.conformer_random_seed,
+                tool_config,
             )
             if cid and molblock:
-                self._mol3d_cache[cid] = molblock
+                self._mol3d_cache[cache_key] = molblock
         if not molblock:
             ui.notify("Не удалось сгенерировать 3D-конформер", type="warning")
             return
@@ -192,8 +233,28 @@ class InspectorPane:
             filename=f"{self.runtime.session_id}_report.md",
         )
 
+    def invalidate_3d_cache(self) -> None:
+        """Сбрасывает кэш 3D-конформеров при изменении параметров ETKDG/силового поля."""
+        self._mol3d_cache.clear()
+
     def refresh(self) -> None:
         """Обновляет содержимое инспектора под текущего выбранного кандидата."""
+        tool_config = resolve_tool_config(self.runtime.state)
+        telem = build_inspector_telemetry_summary(tool_config)
+        if self._conformer_title is not None:
+            self._conformer_title.set_text(f"3D-конформер ({telem['conformer_3d']})")
+        if self._telemetry_bar is not None:
+            self._telemetry_bar.clear()
+            with self._telemetry_bar:
+                for chip_text in (
+                    telem["sar_fp"],
+                    telem["rdkit_filters"],
+                    telem["admet"],
+                ):
+                    ui.badge(chip_text, color="slate").props("dense outline").classes(
+                        "text-[10px] font-mono text-slate-300"
+                    )
+
         cid, cand, row = self._get_selected()
         if cid is None or cand is None or row is None:
             if self._header_title is not None:
@@ -240,7 +301,12 @@ class InspectorPane:
                     )
 
         if self._viewer3d is not None:
-            cached_3d = self._mol3d_cache.get(cid)
+            cache_key = (
+                f"{cid}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
+                f"{tool_config.num_conformers}_{tool_config.conformer_opt_max_iters}_"
+                f"{tool_config.conformer_random_seed}"
+            )
+            cached_3d = self._mol3d_cache.get(cache_key) or self._mol3d_cache.get(cid)
             if cached_3d:
                 self._viewer3d.load_molblock(cached_3d, list(cand.highlighted_atom_indices))
             else:
@@ -274,23 +340,34 @@ class InspectorPane:
                     f"Parent: {cand.parent_chembl_id} | Exp pIC50: {cand.parent_exp_pic50:.2f} | "
                     f"Assay: {cand.parent_assay_type} ({cand.parent_bao_format}) | Source: {cand.parent_source_dataset}",
                 )
+                extra_desc_text = ""
+                if cand.calc_rdkit.extra_descriptors:
+                    pairs = [
+                        f"{k}={v:.2f}"
+                        for k, v in cand.calc_rdkit.extra_descriptors.items()
+                    ]
+                    extra_desc_text = f"\nExtra: {', '.join(pairs)}"
                 self._prov_card(
                     "2. Расчёт RDKit",
                     f"MW: {cand.calc_rdkit.mw:.1f} | cLogP: {cand.calc_rdkit.clogp:.2f} | "
                     f"TPSA: {cand.calc_rdkit.tpsa:.1f} | SA: {cand.calc_rdkit.sa_score:.2f} | "
-                    f"QED: {cand.calc_rdkit.qed:.2f} | PAINS: {cand.calc_rdkit.pains_alerts_count} | Brenk: {cand.calc_rdkit.brenk_alerts_count}",
+                    f"QED: {cand.calc_rdkit.qed:.2f} | PAINS: {cand.calc_rdkit.pains_alerts_count} | "
+                    f"Brenk: {cand.calc_rdkit.brenk_alerts_count} | ExtraAlerts: {cand.calc_rdkit.extra_alerts_count}\n"
+                    f"Параметры: {telem['rdkit_filters']}"
+                    f"{extra_desc_text}",
                 )
                 self._prov_card(
                     "3. Прогноз ADMET",
                     f"Pred pIC50: {cand.pred_admet.predicted_pic50:.2f} | "
                     f"hERG: {cand.pred_admet.herg_liability_prob:.2f} ({cand.pred_admet.herg_risk_level}) | "
-                    f"Source: {cand.pred_admet.model_source}",
+                    f"Source: {cand.pred_admet.model_source} ({telem['admet']})",
                 )
                 self._prov_card(
                     "4. Гипотеза SAR / Critic",
                     f"Origin: {cand.hypothesis_rationale.generation_origin} | "
                     f"Rule: {cand.hypothesis_rationale.rule_id} | "
                     f"SMIRKS: {cand.hypothesis_rationale.applied_smirks}\n"
+                    f"Параметры SAR: {telem['sar_fp']}\n"
                     f"Нарушения: {', '.join(row.violations) if row.violations else 'нет'}",
                 )
 
