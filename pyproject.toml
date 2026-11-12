@@ -1,0 +1,42 @@
+[project]
+name = "pishovichok"
+version = "0.1.0"
+description = "Multi-agent system for SAR analysis and directed small molecule design"
+readme = "README.md"
+authors = [
+    { name = "arutamonofu", email = "arutamonofu@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "rdkit>=2024.3.5",
+    "duckdb>=1.1.0",
+    "pyarrow>=17.0.0",
+    "pandas>=2.2.0",
+    "numpy>=2.0.0",
+    "catboost>=1.2.7",
+    "scikit-learn>=1.5.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "langgraph>=0.2.35",
+    "langchain-core>=0.3.10",
+    "langchain-openai>=0.2.2",
+    "httpx>=0.27.0",
+    "streamlit>=1.39.0",
+    "plotly>=5.24.0",
+    "pillow>=10.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+pishovichok = "pishovichok:main"
+pishovichok-ui = "pishovichok.ui.app:run_app"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
