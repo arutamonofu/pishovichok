@@ -210,9 +210,6 @@ async def chemical_ide_page(
                 ui.label("Пишовичок готов к работе").classes(
                     "text-base font-semibold text-[#5C2D3B]"
                 )
-                ui.label(
-                    "Опишите задачу молекулярного дизайна ниже или выберите один из готовых сценариев"
-                ).classes("text-xs text-[#64748B] text-center max-w-md")
 
             mpo_slot = ui.element("div").classes(
                 "w-full shrink-0 h-[46%] min-h-[290px] max-h-[420px]"

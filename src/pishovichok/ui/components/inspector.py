@@ -314,38 +314,66 @@ class InspectorPane:
         dlg.open()
 
     async def _open_3d_fullscreen_modal(self) -> None:
-        """Открывает 3D-конформер выбранного кандидата в полноэкранном модальном окне."""
+        """Открывает 3D-конформер или докинг-комплекс выбранного кандидата в полноэкранном модальном окне."""
         cid, cand, _ = self._get_selected()
         if cid is None or cand is None:
             ui.notify("Сначала выберите кандидата", type="info")
             return
         tool_config = resolve_tool_config(self.runtime.state)
-        cache_key = (
-            f"{cid}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
-            f"{tool_config.num_conformers}_{tool_config.conformer_opt_max_iters}_"
-            f"{tool_config.conformer_random_seed}"
+
+        has_docking = (
+            cand.docking is not None
+            and cand.docking.status == "SUCCESS"
+            and bool(cand.docking.pose_sdf_block)
         )
-        molblock = self._mol3d_cache.get(cache_key)
-        if molblock is None:
-            molblock, _ = await run.cpu_bound(
-                generate_3d_conformer_molblock,
-                cand.canonical_smiles,
-                num_conformers=tool_config.num_conformers,
-                random_seed=tool_config.conformer_random_seed,
-                tool_config=tool_config,
+
+        modal_title = (
+            f"3D-комплекс связывания (Докинг): {cid}"
+            if has_docking
+            else f"3D-конформер: {cid}"
+        )
+        modal_subtitle = (
+            f"(PDB: {cand.docking.resolved_pdb_id or '—'} · ΔG = {cand.docking.binding_affinity_kcal:.2f} ккал/моль)"
+            if has_docking and cand.docking.binding_affinity_kcal is not None
+            else f"({tool_config.etkdg_variant} + {tool_config.force_field})"
+        )
+
+        molblock: str | None = None
+        receptor_pdb = ""
+        if has_docking:
+            if cand.docking.receptor_pdb_path:
+                rec_path = Path(cand.docking.receptor_pdb_path)
+                if rec_path.is_file():
+                    receptor_pdb = await run.io_bound(
+                        rec_path.read_text, encoding="utf-8"
+                    )
+        else:
+            cache_key = (
+                f"{cid}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
+                f"{tool_config.num_conformers}_{tool_config.conformer_opt_max_iters}_"
+                f"{tool_config.conformer_random_seed}"
             )
-            if molblock:
-                self._mol3d_cache[cache_key] = molblock
+            molblock = self._mol3d_cache.get(cache_key)
+            if molblock is None:
+                molblock, _ = await run.cpu_bound(
+                    generate_3d_conformer_molblock,
+                    cand.canonical_smiles,
+                    num_conformers=tool_config.num_conformers,
+                    random_seed=tool_config.conformer_random_seed,
+                    tool_config=tool_config,
+                )
+                if molblock:
+                    self._mol3d_cache[cache_key] = molblock
 
         with ui.dialog().classes("w-full h-full p-2 md:p-6") as dlg, ui.card().classes(
             "w-[94vw] h-[88vh] max-w-6xl bg-white border border-[#CBD5E1] rounded-2xl p-4 gap-2.5 shadow-2xl flex flex-col overflow-hidden"
         ):
             with ui.row().classes("w-full items-center justify-between gap-2 shrink-0 pb-1 border-b border-[#E2D9DD]"):
                 with ui.row().classes("items-center gap-2 min-w-0"):
-                    ui.label(f"3D-конформер: {cid}").classes(
+                    ui.label(modal_title).classes(
                         "text-sm md:text-base font-semibold text-[#5C2D3B] truncate"
                     )
-                    ui.label(f"({tool_config.etkdg_variant} + {tool_config.force_field})").classes(
+                    ui.label(modal_subtitle).classes(
                         "text-xs text-[#594D52]"
                     )
                 with ui.row().classes("items-center gap-2"):
@@ -363,7 +391,13 @@ class InspectorPane:
 
             with ui.column().classes("w-full flex-1 min-h-0 relative"):
                 fs_viewer = MoleculeViewer3D(height="100%")
-                if molblock:
+                if has_docking:
+                    fs_viewer.load_docking_complex(
+                        cand.docking.pose_sdf_block,
+                        receptor_pdb,
+                        list(cand.docking.key_residues),
+                    )
+                elif molblock:
                     fs_viewer.load_molblock(molblock, list(cand.highlighted_atom_indices))
 
         dlg.open()
