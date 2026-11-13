@@ -207,7 +207,7 @@ async def chemical_ide_page(
                     'style="height:150px;width:auto;object-fit:contain;display:block;" />',
                     sanitize=False,
                 )
-                ui.label("ПИШОВИЧОК готов к SAR-дизайну").classes(
+                ui.label("Пишовичок готов к работе").classes(
                     "text-base font-semibold text-[#5C2D3B]"
                 )
                 ui.label(
@@ -327,7 +327,7 @@ def run_ui(
     ui.run(
         host=host or settings.ui_host,
         port=port or settings.ui_port,
-        title="ПИШОВИЧОК",
+        title="Пишовичок",
         dark=False,
         reload=reload,
         native=native,

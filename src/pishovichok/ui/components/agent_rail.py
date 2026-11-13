@@ -398,7 +398,7 @@ class TopStatusBar:
                     "</div>",
                     sanitize=False,
                 )
-                ui.label("ПИШОВИЧОК").classes(
+                ui.label("Пишовичок").classes(
                     "text-sm font-semibold tracking-tight text-[#5C2D3B] whitespace-nowrap"
                 )
 
