@@ -184,6 +184,8 @@ def render_rule_transformation_svg(
     height: int = 120,
 ) -> str:
     """Рендерит компактный 2D SVG превью трансформации правила SAR (`R_from -> R_to`) для ховера."""
+    import re
+
     half_w = max(110, (width - 36) // 2)
     svg_l = render_molecule_svg(
         smiles=from_fragment,
@@ -197,15 +199,20 @@ def render_rule_transformation_svg(
         height=height,
         clear_background=True,
     )
+    # Убираем XML-заголовки вложенных SVG, иначе браузер отклоняет документ в <img>
+    xml_decl_re = re.compile(r"<\?xml[^>]*\?>|<!DOCTYPE[^>]*>", re.IGNORECASE)
+    svg_l_clean = xml_decl_re.sub("", svg_l).strip()
+    svg_r_clean = xml_decl_re.sub("", svg_r).strip()
+
     arrow_color = "#059669" if delta_pic50 >= 0 else "#E11D48"
     return (
-        f"<svg width='{width}' height='{height}' xmlns='http://www.w3.org/2000/svg' "
-        f"style='background:#FFFFFF;'>"
+        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+        f"xmlns='http://www.w3.org/2000/svg' style='background:#FFFFFF;'>"
         f"<rect width='100%' height='100%' fill='#FFFFFF'/>"
-        f"<g transform='translate(0,0)'>{svg_l}</g>"
+        f"<g transform='translate(0,0)'>{svg_l_clean}</g>"
         f"<text x='{half_w + 18}' y='{height // 2 + 5}' text-anchor='middle' "
         f"fill='{arrow_color}' font-family='sans-serif' font-size='20' font-weight='bold'>→</text>"
-        f"<g transform='translate({half_w + 36},0)'>{svg_r}</g>"
+        f"<g transform='translate({half_w + 36},0)'>{svg_r_clean}</g>"
         f"</svg>"
     )
 

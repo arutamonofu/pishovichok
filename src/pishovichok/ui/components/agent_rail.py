@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -142,6 +143,66 @@ def format_node_telemetry_chips(
             stat_chips.append((str(k), _compact_telemetry_val(v)))
 
     return param_chips, stat_chips
+
+
+def _localize_trace_summary(raw_text: str) -> str:
+    """Переводит шаблонные англоязычные сводки узлов графа на русский язык для UI."""
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+
+    # Курация
+    m_cur = re.match(
+        r"^Curated\s+(\d+)\s+molecules\s+\(dropped\s+(\d+)\s+invalid,\s+(\d+)\s+censored,\s+(\d+)\s+duplicates\)\.\s*Dominant BAO:\s*(\S+)\s*\(homogeneous=(True|False)\)\.?$",
+        text,
+    )
+    if m_cur:
+        n_mol, n_inv, n_cens, n_dup, bao, homog = m_cur.groups()
+        homog_ru = "да" if homog == "True" else "нет"
+        return (
+            f"Отобрано {n_mol} молекул (отсеяно: {n_inv} невал., {n_cens} цензур., {n_dup} дубл.). "
+            f"Протокол BAO: {bao} (однородный: {homog_ru})."
+        )
+
+    # Анализ SAR
+    m_sar = re.match(
+        r"^Extracted\s+(\d+)\s+SAR rules and\s+(\d+)\s+Activity Cliffs\.\s*Homogeneous rules:\s*(\d+/\d+)\s*\(background_enriched=(True|False)\)\.?$",
+        text,
+    )
+    if m_sar:
+        n_rules, n_cliffs, homog_ratio, enriched = m_sar.groups()
+        enr_ru = "да" if enriched == "True" else "нет"
+        return (
+            f"Извлечено правил SAR: {n_rules}, перепадов активности: {n_cliffs}. "
+            f"Однородных правил: {homog_ratio} (обогащение фоном: {enr_ru})."
+        )
+
+    # Генерация
+    m_gen = re.match(
+        r"^Generated\s+(\d+)\s+candidate structures from\s+(\d+)\s+parent seeds\s*\(iteration=(\d+),\s*preferred_types=(.+)\)\.?$",
+        text,
+    )
+    if m_gen:
+        n_cand, n_seeds, it_num, pref = m_gen.groups()
+        pref_ru = pref.replace("['any']", "любые").replace('["any"]', "любые")
+        return (
+            f"Сгенерировано {n_cand} структур-кандидатов из {n_seeds} прототипов "
+            f"(итерация {it_num}, типы трансформаций: {pref_ru})."
+        )
+
+    # Оценка ADMET
+    m_eval = re.match(
+        r"^Evaluated\s+(\d+)\s+candidates;\s*top-(\d+)\s+selected\s*\(max Harrington D=([\d.]+)\)\.\s*Constraints fully satisfied:\s*(\d+/\d+)\.?$",
+        text,
+    )
+    if m_eval:
+        n_ev, n_top, max_d, sat = m_eval.groups()
+        return (
+            f"Оценено кандидатов: {n_ev}; выбрано топ-{n_top} (макс. D Харрингтона = {max_d}). "
+            f"Ограничения соблюдены: {sat}."
+        )
+
+    return text.replace("Critic Agent:", "Верификация:")
 
 
 class TopStatusBar:
@@ -678,7 +739,9 @@ class AgentRail:
                                 ui.label(f"{ev.duration_ms:.0f} мс").classes(
                                     "text-[10px] font-mono text-[#475569]"
                                 )
-                            ui.label(ev.output_summary or ev.action_taken).classes(text_cls)
+                            ui.label(
+                                _localize_trace_summary(ev.output_summary or ev.action_taken)
+                            ).classes(text_cls)
 
                             if is_expert:
                                 stage_key = _AGENT_TO_STAGE.get(
