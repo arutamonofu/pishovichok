@@ -206,6 +206,22 @@ def read_candidates_parquet(
     return [CandidateMolecule.from_flat_parquet_record(row) for row in rows]
 
 
+def save_candidate_pose_sdf(
+    workspace_dir: str | Path,
+    mol_id: str,
+    sdf_content: str,
+) -> str:
+    """Сохраняет 3D-позу докинга кандидата в файл .sdf внутри рабочей директории сессии."""
+    poses_dir = Path(workspace_dir).resolve() / "poses"
+    poses_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = "".join(
+        ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in str(mol_id)
+    ).strip("_") or "candidate"
+    out_path = poses_dir / f"{safe_id}_docked.sdf"
+    out_path.write_text(sdf_content, encoding="utf-8")
+    return out_path.as_posix()
+
+
 def export_trace_log(
     trace_log: list[TraceEvent],
     session_dir: str | Path,

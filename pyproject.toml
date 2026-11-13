@@ -24,6 +24,10 @@ dependencies = [
     "nicegui>=4.0.0",
     "chembl_webresource_client>=0.3.3",
     "crem>=0.3.2",
+    "meeko>=0.5.0",
+    "vina>=1.2.5",
+    "prolif>=2.0.0",
+    "MDAnalysis>=2.7.0",
 ]
 
 [dependency-groups]

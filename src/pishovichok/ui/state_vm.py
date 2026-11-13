@@ -119,6 +119,11 @@ _EVALUATION_STAGE_KEYS: frozenset[str] = frozenset(
         "logs_moderate_cutoff",
         "logs_poor_cutoff",
         "top_k_output",
+        "docking_mode",
+        "docking_exhaustiveness",
+        "docking_top_k",
+        "custom_pdb_id",
+        "custom_box_center",
     }
 )
 
@@ -231,6 +236,16 @@ class CandidateRowVM(BaseModel):
     desirability_d5_herg: float = 0.0
     desirability_d6_tpsa: float = 0.0
     desirability_d7_logs: float = 0.0
+    docking_status: str | None = None
+    docking_dg_kcal: float | None = None
+    docking_pdb_id: str | None = None
+    docking_source: str | None = None
+    docking_backend: str | None = None
+    docking_interactions: dict[str, list[str]] = Field(default_factory=dict)
+    docking_receptor_pdb_path: str | None = None
+    docking_pose_sdf_block: str | None = None
+    docking_key_residues: list[str] = Field(default_factory=list)
+    docking_message: str | None = None
     pinned: bool = False
     excluded: bool = False
     pca_x: float = 0.0
@@ -260,6 +275,27 @@ class CandidateRowVM(BaseModel):
         if self.alert_penalty_mode == "veto":
             return f"Вето ({' '.join(parts)})"
         return " ".join(parts)
+
+    @property
+    def docking_dg_display(self) -> str:
+        if self.docking_status == "SUCCESS" and self.docking_dg_kcal is not None:
+            return f"{self.docking_dg_kcal:.2f} ккал/моль"
+        if self.docking_status == "SKIPPED":
+            return "Пропущен"
+        if self.docking_status == "FAILED":
+            return "Ошибка"
+        return "Не выполнен"
+
+    @property
+    def docking_interactions_summary(self) -> str:
+        if not self.docking_interactions:
+            return "-"
+        parts = [
+            f"{k}: {', '.join(v[:3])}"
+            for k, v in self.docking_interactions.items()
+            if v
+        ]
+        return "; ".join(parts[:3]) if parts else "-"
 
     @property
     def method_rule_label(self) -> str:
@@ -330,6 +366,14 @@ class CandidateRowVM(BaseModel):
             "excluded": self.excluded,
             "rule_id": self.rule_id,
             "method_rule_display": self.method_rule_label,
+            "docking_status": self.docking_status or "PENDING",
+            "docking_dg_kcal": round(self.docking_dg_kcal, 2)
+            if self.docking_dg_kcal is not None
+            else None,
+            "docking_dg_display": self.docking_dg_display,
+            "docking_pdb_id": self.docking_pdb_id or "-",
+            "docking_backend": self.docking_backend or "-",
+            "docking_interactions_summary": self.docking_interactions_summary,
         }
 
 
@@ -457,6 +501,16 @@ class StateViewModel:
                 mpo_score=cand.mpo_harrington_score,
                 passes_all=cand.passes_all_constraints,
                 violations=list(cand.constraint_violations),
+                docking_status=cand.docking.status if cand.docking else None,
+                docking_dg_kcal=cand.docking.docking_score_kcal if cand.docking else None,
+                docking_pdb_id=cand.docking.pdb_id if cand.docking else None,
+                docking_source=cand.docking.source if cand.docking else None,
+                docking_backend=cand.docking.backend if cand.docking else None,
+                docking_interactions=dict(cand.docking.interactions) if cand.docking else {},
+                docking_receptor_pdb_path=cand.docking.receptor_pdb_path if cand.docking else None,
+                docking_pose_sdf_block=cand.docking.pose_sdf_block if cand.docking else None,
+                docking_key_residues=list(cand.docking.key_residues) if cand.docking else [],
+                docking_message=cand.docking.message if cand.docking else None,
                 pinned=cand.candidate_id in self.pinned_ids,
                 excluded=cand.candidate_id in self.excluded_ids,
                 pca_x=existing_row.pca_x if existing_row else 0.0,
@@ -521,6 +575,11 @@ class StateViewModel:
                 max_sa_score=self.weights.max_sa_score,
                 max_herg_prob=self.weights.max_herg_prob,
                 min_tpsa=self.min_tpsa,
+                docking_score_kcal=(
+                    row.docking_dg_kcal
+                    if row.docking_status == "SUCCESS"
+                    else None
+                ),
                 tool_config=effective_tc,
             )
 

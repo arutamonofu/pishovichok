@@ -33,6 +33,20 @@ class MoleculeViewer3D(
         """Передаёт 3D MolBlock и индексы подсвечиваемых атомов в активный WebGL-вьюер."""
         self.run_method("loadMolBlock", molblock, list(highlight_indices or []))
 
+    def load_docking_complex(
+        self,
+        ligand_sdf: str,
+        receptor_pdb: str = "",
+        key_residues: list[str] | None = None,
+    ) -> None:
+        """Отображает 3D-позу докированного лиганда в активном центре рецептора."""
+        self.run_method(
+            "loadDockingComplex",
+            ligand_sdf,
+            receptor_pdb,
+            list(key_residues or []),
+        )
+
     def clear_viewer(self) -> None:
         """Очищает текущую 3D-модель без пересоздания WebGL-контекста."""
         self.run_method("clearViewer")

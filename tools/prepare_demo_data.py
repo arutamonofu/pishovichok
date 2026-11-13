@@ -640,8 +640,9 @@ def prepare_all_demo_datasets(base_data_dir: Path | None = None) -> dict[str, An
     samples_dir = data_dir / "samples"
     crem_dir = data_dir / "crem"
     models_dir = data_dir / "models"
+    receptors_dir = data_dir / "receptors"
 
-    for d in (chembl_dir, samples_dir, crem_dir, models_dir):
+    for d in (chembl_dir, samples_dir, crem_dir, models_dir, receptors_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     target_datasets = {
@@ -733,6 +734,35 @@ def prepare_all_demo_datasets(base_data_dir: Path | None = None) -> dict[str, An
     # Генерируем компактную SQLite базу CReM
     crem_count = build_crem_sqlite_db(crem_dir / "replacements_sa2.db")
     summary["crem_replacements_count"] = crem_count
+
+    # Подготавливаем 3 предкэшированных демо-рецептора для физического 3D-докинга
+    from pishovichok.config import DEMO_RECEPTOR_PRESETS
+    from pishovichok.core.receptor_resolver import (
+        generate_minimal_demo_receptor,
+        resolve_receptor,
+    )
+
+    receptors_summary: dict[str, Any] = {}
+    for target_id in DEMO_RECEPTOR_PRESETS:
+        try:
+            rec_meta = resolve_receptor(target_id, receptors_dir=receptors_dir)
+            if rec_meta.get("status") != "READY":
+                rec_meta = generate_minimal_demo_receptor(
+                    target_id, receptors_dir=receptors_dir
+                )
+        except Exception:
+            rec_meta = generate_minimal_demo_receptor(
+                target_id, receptors_dir=receptors_dir
+            )
+        receptors_summary[target_id] = {
+            "status": rec_meta.get("status"),
+            "pdb_id": rec_meta.get("pdb_id"),
+            "source": rec_meta.get("source"),
+            "pdb_path": rec_meta.get("pdb_path"),
+            "pdbqt_path": rec_meta.get("pdbqt_path"),
+            "box_center": rec_meta.get("box_center"),
+        }
+    summary["receptors"] = receptors_summary
 
     return summary
 

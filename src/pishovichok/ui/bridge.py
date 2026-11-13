@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,6 +26,7 @@ from pishovichok.agents.workflow import (
     export_candidates_to_csv,
     export_candidates_to_sdf,
 )
+from pishovichok.core.evaluation import evaluate_docking_batch
 from pishovichok.core.rendering import compute_chemical_space_projection
 from pishovichok.state.graph_state import (
     SARGraphState,
@@ -37,12 +39,14 @@ from pishovichok.state.schemas import (
     QueryConstraints,
     SARRule,
     ToolConfig,
+    TraceEvent,
 )
 from pishovichok.state.storage import (
     compute_file_sha256,
     create_session_workspace,
     export_trace_log,
     read_candidates_parquet,
+    write_candidates_parquet,
 )
 from pishovichok.ui.session import (
     HITLDecision,
@@ -55,7 +59,12 @@ from pishovichok.ui.state_vm import ReferencePointVM
 
 RestartStage = Literal["research", "sar", "design", "evaluation"]
 _NULLABLE_TOOL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"protected_smarts", "modifiable_atom_indices"}
+    {
+        "protected_smarts",
+        "modifiable_atom_indices",
+        "custom_pdb_id",
+        "custom_box_center",
+    }
 )
 _ALL_GRAPH_NODES = ["research", "sar", "design", "evaluation", "critic"]
 
@@ -64,6 +73,7 @@ _ALLOWED_CHECKPOINT_MODULES: list[tuple[str, str]] = [
     ("pishovichok.state.schemas", "CalcRDKitMetrics"),
     ("pishovichok.state.schemas", "PredADMETMetrics"),
     ("pishovichok.state.schemas", "SARHypothesisRationale"),
+    ("pishovichok.state.schemas", "DockingResult"),
     ("pishovichok.state.schemas", "CandidateMolecule"),
     ("pishovichok.state.schemas", "ParquetPointer"),
     ("pishovichok.state.schemas", "QueryConstraints"),
@@ -208,6 +218,15 @@ def _apply_modifications_to_state(
             changed_keys,
             "ui_manual",
         )
+        for dock_key in (
+            "docking_mode",
+            "docking_exhaustiveness",
+            "docking_top_k",
+            "custom_pdb_id",
+            "custom_box_center",
+        ):
+            if dock_key in changed_keys:
+                patch[dock_key] = getattr(updated_tc, dock_key)
 
     return patch
 
@@ -857,6 +876,156 @@ class AgentUIBridge:
                 "verdict": runtime.state.get("critic_verdict"),
             },
         )
+
+    async def run_standalone_docking(
+        self,
+        session_id: str,
+        candidate_ids: list[str] | None = None,
+        *,
+        custom_pdb_id: str | None = None,
+        custom_box_center: list[float] | None = None,
+        exhaustiveness: int | None = None,
+        top_k: int | None = None,
+    ) -> dict[str, Any]:
+        """Запускает физический 3D-докинг вручную без перезапуска ChEMBL/SAR/CReM."""
+        runtime = self.registry.get(session_id)
+        if runtime is None:
+            runtime = await self.registry.restore_from_workspace(session_id)
+        if runtime is None:
+            raise KeyError(f"Сессия {session_id!r} не найдена.")
+
+        state = runtime.state
+        constraints = state.get("query_constraints") or runtime.view_model.query_constraints
+        tool_config = resolve_tool_config(state)
+        target_id = constraints.target_chembl_id if constraints is not None else None
+
+        cand_ptr = state.get("candidates_table_uri")
+        if cand_ptr is not None:
+            pool = await asyncio.to_thread(read_candidates_parquet, cand_ptr)
+        else:
+            pool = list(state.get("top_candidates", []))
+
+        if not pool:
+            return {
+                "status": "SKIPPED",
+                "docked_count": 0,
+                "success_count": 0,
+                "message": "В текущей сессии нет сгенерированных кандидатов для 3D-докинга.",
+            }
+
+        eff_pdb = (
+            custom_pdb_id
+            if custom_pdb_id is not None
+            else (state.get("custom_pdb_id") or tool_config.custom_pdb_id)
+        )
+        eff_box = (
+            custom_box_center
+            if custom_box_center is not None
+            else (state.get("custom_box_center") or tool_config.custom_box_center)
+        )
+        eff_exhaust = int(
+            exhaustiveness
+            if exhaustiveness is not None
+            else (state.get("docking_exhaustiveness") or tool_config.docking_exhaustiveness)
+        )
+        eff_top_k = int(
+            top_k
+            if top_k is not None
+            else (state.get("docking_top_k") or tool_config.docking_top_k)
+        )
+
+        workspace_dir = runtime.workspace_dir or state.get("workspace_dir")
+        if workspace_dir is None:
+            _, session_dir = create_session_workspace(
+                base_workspace_dir=self.registry.base_workspace_dir,
+                session_id=session_id,
+            )
+            workspace_dir = session_dir
+            runtime.workspace_dir = session_dir
+
+        start_t = asyncio.get_running_loop().time()
+        updated_pool, dock_summary = await asyncio.to_thread(
+            evaluate_docking_batch,
+            pool,
+            target_id,
+            eff_top_k,
+            eff_exhaust,
+            eff_pdb,
+            eff_box,
+            workspace_dir,
+            candidate_ids,
+            constraints,
+            tool_config,
+        )
+        duration_ms = round((asyncio.get_running_loop().time() - start_t) * 1000.0, 2)
+
+        updated_pool.sort(
+            key=lambda c: (
+                bool(c.passes_all_constraints),
+                float(c.mpo_harrington_score),
+                float(c.pred_admet.predicted_pic50),
+                -float(c.calc_rdkit.clogp),
+            ),
+            reverse=True,
+        )
+
+        new_pointer = await asyncio.to_thread(
+            write_candidates_parquet,
+            updated_pool,
+            workspace_dir,
+            "evaluated_candidates.parquet",
+        )
+        state["candidates_table_uri"] = new_pointer
+        top_limit = max(1, int(tool_config.top_k_output))
+        state["top_candidates"] = updated_pool[:top_limit]
+
+        existing_trace = list(state.get("trace_log", []))
+        best_dg = dock_summary.get("best_score_kcal")
+        dg_text = f"{best_dg:.2f} kcal/mol" if best_dg is not None else "N/A"
+        dock_event = TraceEvent(
+            step_index=len(existing_trace),
+            timestamp_iso=datetime.now(tz=UTC).isoformat(),
+            agent_name="EvaluationAgent",
+            phase="docking_3d_manual",
+            input_summary=(
+                f"manual_run | target={target_id or 'N/A'} | custom_pdb={eff_pdb or 'auto'} | "
+                f"selected={candidate_ids or f'top_{eff_top_k}'}"
+            ),
+            action_taken="Executed standalone physical 3D docking and updated Harrington MPO scores.",
+            output_summary=(
+                f"status={dock_summary.get('status')} | pdb={dock_summary.get('pdb_id') or 'N/A'} "
+                f"({dock_summary.get('source') or 'N/A'}) | "
+                f"docked={dock_summary.get('success_count', 0)}/{dock_summary.get('docked_count', 0)} | "
+                f"best ΔG={dg_text}."
+            ),
+            verdict_or_routing="docking_completed",
+            fallback_triggered=None,
+            duration_ms=duration_ms,
+        )
+        state["trace_log"] = [*existing_trace, dock_event]
+        if workspace_dir is not None:
+            await asyncio.to_thread(export_trace_log, state["trace_log"], workspace_dir)
+
+        lead_ref = state.get("lead_reference_metrics")
+        new_ids = runtime.view_model.upsert_candidates(updated_pool, lead_reference=lead_ref)
+
+        await self.registry.broadcast(
+            session_id,
+            {
+                "type": "candidates_updated",
+                "session_id": session_id,
+                "new_ids": new_ids,
+            },
+        )
+        await self.registry.broadcast(
+            session_id,
+            {
+                "type": "docking_completed",
+                "session_id": session_id,
+                "summary": dock_summary,
+            },
+        )
+        return dock_summary
 
 
 agent_bridge = AgentUIBridge()

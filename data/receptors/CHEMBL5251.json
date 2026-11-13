@@ -1,0 +1,35 @@
+{
+  "status": "READY",
+  "target_id": "CHEMBL5251",
+  "pdb_id": "5P9J",
+  "source": "DEMO_CACHE",
+  "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL5251.pdb",
+  "pdbqt_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL5251.pdbqt",
+  "box_center": [
+    19.812,
+    7.156,
+    3.617
+  ],
+  "box_size": [
+    20.0,
+    20.0,
+    20.0
+  ],
+  "key_residues": [
+    "MET477",
+    "GLU475",
+    "THR474",
+    "ALA428",
+    "LYS430",
+    "LEU528",
+    "CYS481",
+    "ASP539",
+    "GLY480",
+    "SER538",
+    "MET449",
+    "ASN484"
+  ],
+  "ligand_resname": "8E8",
+  "is_apo": false,
+  "minimal_offline_reference": false
+}

@@ -1,0 +1,29 @@
+{
+  "status": "READY",
+  "target_id": "CHEMBL262",
+  "pdb_id": "1Q5K",
+  "source": "DEMO_CACHE",
+  "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL262.pdb",
+  "pdbqt_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL262.pdbqt",
+  "box_center": [
+    23.2,
+    21.6,
+    8.9
+  ],
+  "box_size": [
+    20.0,
+    20.0,
+    20.0
+  ],
+  "key_residues": [
+    "VAL135",
+    "ASP133",
+    "TYR134",
+    "PRO136",
+    "ALA83",
+    "LEU188"
+  ],
+  "ligand_resname": "TMU",
+  "is_apo": false,
+  "minimal_offline_reference": false
+}

@@ -440,3 +440,152 @@ def calculate_rdkit_metrics(
         delta_clogp_vs_parent=delta_clogp,
         delta_tpsa_vs_parent=delta_tpsa,
     )
+
+
+def evaluate_docking_batch(
+    candidates: list[Any],
+    target_id: str | None,
+    top_k: int = 3,
+    exhaustiveness: int = 4,
+    custom_pdb_id: str | None = None,
+    custom_box_center: list[float] | None = None,
+    workspace_dir: str | Path | None = None,
+    selected_mol_ids: list[str] | None = None,
+    constraints: Any | None = None,
+    tool_config: Any | None = None,
+    receptors_dir: Path | str | None = None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Выполняет пакетный 3D-докинг топ-K кандидатов (или выбранных candidate_id) и пересчитывает MPO."""
+    from pishovichok.core.docking import run_docking
+    from pishovichok.core.scoring import calculate_harrington_mpo_score
+    from pishovichok.state.schemas import DockingResult
+    from pishovichok.state.storage import save_candidate_pose_sdf
+
+    if not candidates:
+        return list(candidates), {
+            "status": "SKIPPED",
+            "docked_count": 0,
+            "success_count": 0,
+            "pdb_id": custom_pdb_id,
+            "source": None,
+            "best_score_kcal": None,
+            "message": "Список кандидатов пуст — докинг не выполнялся.",
+        }
+
+    if selected_mol_ids:
+        selected_set = {str(cid) for cid in selected_mol_ids}
+        target_indices = [
+            idx
+            for idx, cand in enumerate(candidates)
+            if str(getattr(cand, "candidate_id", "")) in selected_set
+        ]
+    else:
+        limit = max(1, int(top_k))
+        target_indices = list(range(min(limit, len(candidates))))
+
+    updated_list = list(candidates)
+    success_count = 0
+    best_score: float | None = None
+    last_pdb_id: str | None = custom_pdb_id
+    last_source: str | None = None
+    last_message: str | None = None
+    overall_status = "SKIPPED"
+
+    for pos, idx in enumerate(target_indices):
+        cand = updated_list[idx]
+        dock_res = run_docking(
+            ligand_smiles=cand.canonical_smiles,
+            target_id=target_id,
+            exhaustiveness=exhaustiveness,
+            custom_pdb_id=custom_pdb_id,
+            custom_box_center=custom_box_center,
+            receptors_dir=receptors_dir,
+        )
+
+        pose_path = dock_res.get("pose_sdf_path")
+        pose_block = dock_res.get("pose_sdf_block")
+        if workspace_dir is not None and pose_block:
+            pose_path = save_candidate_pose_sdf(
+                workspace_dir=workspace_dir,
+                mol_id=cand.candidate_id,
+                sdf_content=pose_block,
+            )
+
+        res_status = str(dock_res.get("status", "FAILED"))
+        if res_status not in {"PENDING", "SUCCESS", "SKIPPED", "FAILED"}:
+            res_status = "FAILED"
+
+        docking_model = DockingResult(
+            status=res_status,  # type: ignore[arg-type]
+            pdb_id=dock_res.get("pdb_id"),
+            source=dock_res.get("source"),
+            docking_score_kcal=dock_res.get("docking_score_kcal"),
+            backend=dock_res.get("backend"),
+            interactions=dock_res.get("interactions") or {},
+            pose_sdf_path=pose_path,
+            pose_sdf_block=pose_block,
+            receptor_pdb_path=dock_res.get("receptor_pdb_path"),
+            box_center=dock_res.get("box_center"),
+            box_size=dock_res.get("box_size"),
+            key_residues=list(dock_res.get("key_residues") or []),
+            message=dock_res.get("message"),
+        )
+
+        new_mpo = cand.mpo_harrington_score
+        if (
+            res_status == "SUCCESS"
+            and docking_model.docking_score_kcal is not None
+            and constraints is not None
+        ):
+            has_alerts = (
+                cand.calc_rdkit.pains_alerts_count > 0
+                or cand.calc_rdkit.brenk_alerts_count > 0
+                or cand.calc_rdkit.extra_alerts_count > 0
+            )
+            if cand.alert_penalty_mode == "veto" and has_alerts:
+                new_mpo = 0.0
+            else:
+                new_mpo = calculate_harrington_mpo_score(
+                    calc_rdkit=cand.calc_rdkit,
+                    pred_admet=cand.pred_admet,
+                    parent_exp_pic50=cand.parent_exp_pic50,
+                    constraints=constraints,
+                    docking_score_kcal=docking_model.docking_score_kcal,
+                    tool_config=tool_config,
+                )
+
+        updated_list[idx] = cand.model_copy(
+            update={"docking": docking_model, "mpo_harrington_score": new_mpo}
+        )
+
+        last_pdb_id = docking_model.pdb_id or last_pdb_id
+        last_source = docking_model.source or last_source
+        last_message = docking_model.message or last_message
+
+        if res_status == "SUCCESS":
+            success_count += 1
+            overall_status = "SUCCESS"
+            dg = docking_model.docking_score_kcal
+            if dg is not None and (best_score is None or dg < best_score):
+                best_score = dg
+        elif res_status == "SKIPPED" and pos == 0:
+            # Если структура рецептора отсутствует вообще, пропускаем остальные без повторных сетевых запросов
+            for rem_idx in target_indices[1:]:
+                rem_cand = updated_list[rem_idx]
+                updated_list[rem_idx] = rem_cand.model_copy(
+                    update={"docking": docking_model}
+                )
+            overall_status = "SKIPPED"
+            break
+        elif overall_status != "SUCCESS":
+            overall_status = res_status
+
+    return updated_list, {
+        "status": overall_status,
+        "docked_count": len(target_indices),
+        "success_count": success_count,
+        "pdb_id": last_pdb_id,
+        "source": last_source,
+        "best_score_kcal": best_score,
+        "message": last_message,
+    }

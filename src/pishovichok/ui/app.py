@@ -270,7 +270,7 @@ async def chemical_ide_page(
                     mpo_canvas.refresh(mark_pca_dirty=True)
                 if inspector is not None:
                     inspector.refresh()
-            elif event_type in ("mpo_recalculated", "tool_config_reset"):
+            elif event_type in ("mpo_recalculated", "tool_config_reset", "docking_completed"):
                 if candidate_grid is not None:
                     candidate_grid.push_updated_rows()
                 if mpo_canvas is not None:

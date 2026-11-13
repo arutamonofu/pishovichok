@@ -1,0 +1,29 @@
+{
+  "status": "READY",
+  "target_id": "CHEMBL203",
+  "pdb_id": "1M17",
+  "source": "DEMO_CACHE",
+  "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL203.pdb",
+  "pdbqt_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL203.pdbqt",
+  "box_center": [
+    22.01,
+    0.25,
+    52.79
+  ],
+  "box_size": [
+    20.0,
+    20.0,
+    20.0
+  ],
+  "key_residues": [
+    "MET769",
+    "LEU694",
+    "VAL702",
+    "ALA719",
+    "LYS721",
+    "LEU820"
+  ],
+  "ligand_resname": "AQ4",
+  "is_apo": false,
+  "minimal_offline_reference": false
+}

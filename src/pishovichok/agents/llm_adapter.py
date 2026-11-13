@@ -138,6 +138,11 @@ class ToolConfigOverrides(BaseModel):
     lipinski_hbd_cutoff: int | None = None
     lipinski_hba_cutoff: int | None = None
     conformer_opt_max_iters: int | None = None
+    docking_mode: Literal["auto_top_k", "manual_only", "skip"] | None = None
+    docking_exhaustiveness: int | None = None
+    docking_top_k: int | None = None
+    custom_pdb_id: str | None = None
+    custom_box_center: list[float] | None = None
 
     # 5. Оркестрация
     max_iterations: int | None = None
@@ -1053,6 +1058,27 @@ class LLMAdapter:
         ):
             overrides["strict_property_thresholds"] = False
 
+        # --- 6. Физический 3D-докинг ---
+        if (
+            "без докинга" in text_lower
+            or "отключи докинг" in text_lower
+            or "пропусти докинг" in text_lower
+            or "docking_mode=skip" in text_lower
+        ):
+            overrides["docking_mode"] = "skip"
+        elif (
+            "докинг вручную" in text_lower
+            or "ручной докинг" in text_lower
+            or "docking_mode=manual_only" in text_lower
+        ):
+            overrides["docking_mode"] = "manual_only"
+        elif "docking_mode=auto_top_k" in text_lower:
+            overrides["docking_mode"] = "auto_top_k"
+
+        m_pdb = re.search(r"\bpdb\s*(?:id)?\s*[:=]?\s*([1-9][a-z0-9]{3})\b", text, re.IGNORECASE)
+        if m_pdb:
+            overrides["custom_pdb_id"] = m_pdb.group(1).upper()
+
         return overrides
 
     # ========================================================================
@@ -1177,6 +1203,24 @@ class LLMAdapter:
                     method="json_schema",
                     strict=True,
                 )
+                def _docking_fact_line(cand: CandidateMolecule) -> str:
+                    if cand.docking is None or cand.docking.status != "SUCCESS":
+                        return "- 3D-моделирование / Докинг: не выполнялся"
+                    contacts = "; ".join(
+                        f"{k}: {', '.join(v)}"
+                        for k, v in cand.docking.interactions.items()
+                        if v
+                    ) or "контакты не обнаружены"
+                    dg_str = (
+                        f"{cand.docking.docking_score_kcal:.2f} ккал/моль"
+                        if cand.docking.docking_score_kcal is not None
+                        else "N/A"
+                    )
+                    return (
+                        f"- 3D-моделирование / Докинг ({cand.docking.pdb_id or 'PDB'}, {cand.docking.backend or '3D'}): "
+                        f"ΔG={dg_str}, контакты=[{contacts}]"
+                    )
+
                 facts_text = "\n".join(
                     f"Кандидат {c.candidate_id}:\n"
                     f"- Родитель: {c.parent_chembl_id} (pIC50={c.parent_exp_pic50:.2f}, BAO={c.parent_bao_format})\n"
@@ -1184,6 +1228,7 @@ class LLMAdapter:
                     f"- Статистика MMP: support={c.hypothesis_rationale.support_pairs_count}, ΔpIC50={c.hypothesis_rationale.historical_mean_delta_pic50:+.2f}, однороден={c.hypothesis_rationale.assay_homogeneous}\n"
                     f"- Детерминированный сдвиг: ΔcLogP={c.calc_rdkit.delta_clogp_vs_parent:+.2f}, ΔTPSA={c.calc_rdkit.delta_tpsa_vs_parent:+.1f}, SAscore={c.calc_rdkit.sa_score:.2f}\n"
                     f"- ADMET: прогноз pIC50={c.pred_admet.predicted_pic50:.2f}, hERG prob={c.pred_admet.herg_liability_prob:.2f} ({c.pred_admet.herg_risk_level}), растворимость={c.pred_admet.solubility_class}\n"
+                    f"{_docking_fact_line(c)}\n"
                     f"- BRICS прекурсоры: {', '.join(c.calc_rdkit.brics_fragments[:3])}"
                     for c in candidates
                 )
@@ -1202,10 +1247,32 @@ class LLMAdapter:
             except Exception:  # noqa: BLE001, S110
                 pass
 
-        # Детерминированный фолбэк: возвращаем существующие детерминированные гипотезы из ядра
-        return {
-            c.candidate_id: c.hypothesis_rationale.text_summary for c in candidates
-        }, "deterministic_rule_based_engine"
+        # Детерминированный фолбэк: дополняем базовую гипотезу результатами 3D-докинга при наличии
+        enriched_summaries: dict[str, str] = {}
+        for c in candidates:
+            base_summary = c.hypothesis_rationale.text_summary
+            if (
+                c.docking is not None
+                and c.docking.status == "SUCCESS"
+                and c.docking.docking_score_kcal is not None
+                and "3D-моделирование / Докинг" not in base_summary
+            ):
+                contacts_parts = [
+                    f"{k}: {', '.join(v[:3])}"
+                    for k, v in c.docking.interactions.items()
+                    if v
+                ]
+                contacts_str = (
+                    "; ".join(contacts_parts[:3])
+                    if contacts_parts
+                    else "стерическая комплементарность карману"
+                )
+                base_summary = (
+                    f"{base_summary} [3D-моделирование / Докинг ({c.docking.pdb_id or 'PDB'}): "
+                    f"ΔG={c.docking.docking_score_kcal:.2f} ккал/моль; контакты: {contacts_str}.]"
+                )
+            enriched_summaries[c.candidate_id] = base_summary
+        return enriched_summaries, "deterministic_rule_based_engine"
 
     # ========================================================================
     # 4. СИНТЕЗ ИТОГОВОГО АКАДЕМИЧЕСКОГО Markdown-ОТЧЕТА
@@ -1307,10 +1374,22 @@ class LLMAdapter:
             or "| - | Нет правил | - | - | - |"
         )
 
+        def _dock_cell(cand: CandidateMolecule) -> str:
+            if cand.docking is None:
+                return "Не запускался"
+            if cand.docking.status == "SUCCESS" and cand.docking.docking_score_kcal is not None:
+                top_res = [
+                    r for vals in cand.docking.interactions.values() for r in vals
+                ][:3]
+                res_txt = f" ({', '.join(top_res)})" if top_res else ""
+                return f"ΔG={cand.docking.docking_score_kcal:.2f} ккал/моль [{cand.docking.pdb_id or 'PDB'}]{res_txt}"
+            return f"{cand.docking.status}"
+
         cands_md = "\n".join(
             f"| `{c.candidate_id}` | `{c.canonical_smiles}` | `{c.parent_chembl_id}` (`{c.parent_exp_pic50:.2f}`) | "
             f"MW={c.calc_rdkit.mw:.1f}, LogP={c.calc_rdkit.clogp:.2f}, SA={c.calc_rdkit.sa_score:.2f} | "
             f"pIC50={c.pred_admet.predicted_pic50:.2f}, hERG={c.pred_admet.herg_liability_prob:.2f} ({c.pred_admet.herg_risk_level}) | "
+            f"{_dock_cell(c)} | "
             f"`D = {c.mpo_harrington_score:.3f}` |"
             for c in top_candidates
         )
@@ -1349,8 +1428,8 @@ class LLMAdapter:
             f"- **Директива контроля качества:** {critic_feedback or 'Все целевые параметры выполнены.'}\n\n"
             f"{compromise_notice}"
             f"## 4. Сводная таблица отобранных кандидатов\n\n"
-            f"| ID | SMILES кандидата | Экспериментальный факт | Детерминированный расчет RDKit | Модельный прогноз ADMET | Индекс Харрингтона |\n"
-            f"| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+            f"| ID | SMILES кандидата | Экспериментальный факт | Детерминированный расчет RDKit | Модельный прогноз ADMET | 3D-моделирование / Докинг | Индекс Харрингтона |\n"
+            f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
             f"{cands_md}\n\n"
             f"## 5. Ретросинтетическая декомпозиция на доступные строительные блоки (BRICS)\n"
             f"{brics_md}\n\n"

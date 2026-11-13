@@ -61,6 +61,12 @@ class TaskCommandIsland:
         self._hitl_card: ui.card | None = None
         self._hitl_prompt_label: ui.label | None = None
         self._structure_chip: ui.label | None = None
+        self._show_docking: bool = False
+        self._syncing_docking: bool = False
+        self._docking_box: ui.column | None = None
+        self._docking_mode_select: ui.select | None = None
+        self._docking_pdb_input: ui.input | None = None
+        self._docking_box_input: ui.input | None = None
         self._build()
 
     def _is_csv_scenario_active(self) -> bool:
@@ -168,6 +174,13 @@ class TaskCommandIsland:
                             ui.html(svg_icon("edit", 12), sanitize=False)
                             ui.label("Редактор структур").classes("text-[11px]")
 
+                        with ui.button(on_click=self._toggle_docking_panel).props(
+                            "dense flat no-caps size=xs color=grey-8"
+                        ).classes("text-[11px] px-2 py-0.5 rounded bg-[#EFF6FF] border border-[#BFDBFE] text-[#1D4ED8] gap-1").tooltip(
+                            "Настройки 3D-докинга перед запуском"
+                        ):
+                            ui.label("3D-докинг").classes("text-[11px]")
+
                         min_btn = (
                             ui.button(on_click=self._minimize)
                             .props("dense flat size=xs color=grey-7")
@@ -274,6 +287,57 @@ class TaskCommandIsland:
                     ).props("dense flat no-caps size=xs color=primary").classes("text-[11px]")
                 self._sketcher_box.set_visibility(False)
 
+                # Компактные настройки 3D-докинга (управляемый опциональный этап)
+                tc_dock = resolve_tool_config(self.runtime.state)
+                self._docking_box = ui.column().classes(
+                    "w-full gap-1.5 p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg"
+                )
+                with self._docking_box:
+                    ui.label("Настройки 3D-докинга").classes(
+                        "text-[11px] font-semibold text-[#1E3A8A]"
+                    )
+                    with ui.grid(columns=3).classes("w-full gap-2"):
+                        self._docking_mode_select = (
+                            ui.select(
+                                options={
+                                    "auto_top_k": "Авто (топ-K)",
+                                    "manual_only": "Только вручную",
+                                    "skip": "Отключён",
+                                },
+                                value=tc_dock.docking_mode,
+                                label="Режим докинга",
+                                on_change=self._handle_quick_docking_change,
+                            )
+                            .props("dense outlined options-dense")
+                            .classes("w-full text-xs bg-white")
+                        )
+                        self._docking_pdb_input = (
+                            ui.input(
+                                label="PDB ID (опц.)",
+                                value=str(tc_dock.custom_pdb_id or ""),
+                                placeholder="Авто или 1M17",
+                                on_change=self._handle_quick_docking_change,
+                            )
+                            .props("dense outlined clearable")
+                            .classes("w-full text-xs font-mono bg-white")
+                        )
+                        box_str = (
+                            f"{tc_dock.custom_box_center[0]:.2f}, {tc_dock.custom_box_center[1]:.2f}, {tc_dock.custom_box_center[2]:.2f}"
+                            if tc_dock.custom_box_center and len(tc_dock.custom_box_center) == 3
+                            else ""
+                        )
+                        self._docking_box_input = (
+                            ui.input(
+                                label="Центр X, Y, Z (опц.)",
+                                value=box_str,
+                                placeholder="Авто по ко-лиганду",
+                                on_change=self._handle_quick_docking_change,
+                            )
+                            .props("dense outlined clearable")
+                            .classes("w-full text-xs font-mono bg-white")
+                        )
+                self._docking_box.set_visibility(False)
+
                 # Основная строка ввода как в чате + кнопка запуска
                 initial_query = str(self.runtime.state.get("user_query") or "")
                 with ui.row().classes("w-full items-end gap-2 no-wrap"):
@@ -326,6 +390,43 @@ class TaskCommandIsland:
         self._show_csv = not self._show_csv
         if self._csv_box is not None:
             self._csv_box.set_visibility(self._show_csv)
+
+    def _toggle_docking_panel(self) -> None:
+        self._show_docking = not self._show_docking
+        if self._docking_box is not None:
+            self._docking_box.set_visibility(self._show_docking)
+
+    @staticmethod
+    def _parse_box_coords(raw: str) -> list[float] | None:
+        parts = [p.strip() for p in str(raw or "").replace(";", ",").split(",") if p.strip()]
+        if len(parts) != 3:
+            return None
+        try:
+            return [float(p) for p in parts]
+        except ValueError:
+            return None
+
+    def _handle_quick_docking_change(self, _e: Any = None) -> None:
+        if self._syncing_docking:
+            return
+        overrides: dict[str, Any] = {}
+        if self._docking_mode_select is not None and self._docking_mode_select.value:
+            overrides["docking_mode"] = str(self._docking_mode_select.value)
+        if self._docking_pdb_input is not None:
+            pdb_val = str(self._docking_pdb_input.value or "").strip().upper()
+            overrides["custom_pdb_id"] = pdb_val or None
+        if self._docking_box_input is not None:
+            box_raw = str(self._docking_box_input.value or "").strip()
+            if not box_raw:
+                overrides["custom_box_center"] = None
+            else:
+                parsed = self._parse_box_coords(box_raw)
+                if parsed is not None:
+                    overrides["custom_box_center"] = parsed
+        if overrides:
+            changed = agent_bridge.apply_ui_tool_overrides(self.runtime, overrides)
+            if changed and self._on_tool_config_changed is not None:
+                self._on_tool_config_changed()
 
     def apply_scenario_context(self, scenario_key: str) -> None:
         """Обновляет блок загрузки CSV и текст запроса при выборе сценария."""
@@ -471,11 +572,32 @@ class TaskCommandIsland:
         smarts_val = (
             str(self._smarts_input.value or "").strip() if self._smarts_input else ""
         )
-        tool_cfg: ToolConfig | None = None
-        param_srcs: dict[str, Any] | None = None
+        base_tc = resolve_tool_config(self.runtime.state)
+        overrides: dict[str, Any] = {}
         if smarts_val and ">>" not in smarts_val:
-            tool_cfg = ToolConfig(protected_smarts=smarts_val)
-            param_srcs = {"protected_smarts": "ui_manual"}
+            overrides["protected_smarts"] = smarts_val
+        if self._docking_mode_select is not None and self._docking_mode_select.value:
+            overrides["docking_mode"] = str(self._docking_mode_select.value)
+        if self._docking_pdb_input is not None:
+            pdb_val = str(self._docking_pdb_input.value or "").strip().upper()
+            overrides["custom_pdb_id"] = pdb_val or None
+        if self._docking_box_input is not None:
+            box_raw = str(self._docking_box_input.value or "").strip()
+            if not box_raw:
+                overrides["custom_box_center"] = None
+            else:
+                parsed = self._parse_box_coords(box_raw)
+                if parsed is not None:
+                    overrides["custom_box_center"] = parsed
+
+        tool_cfg, changed_keys = base_tc.apply_overrides(
+            overrides,
+            allow_none_keys={"protected_smarts", "custom_pdb_id", "custom_box_center"},
+        )
+        existing_sources = dict(self.runtime.state.get("param_sources") or {})
+        for k in changed_keys:
+            existing_sources[k] = "ui_manual"
+        param_srcs: dict[str, Any] | None = existing_sources or None
 
         await agent_bridge.start_pipeline(
             self.runtime.session_id,
@@ -545,6 +667,8 @@ class TaskCommandIsland:
             self._csv_box.set_visibility(self._show_csv and self._expanded)
         if self._sketcher_box is not None:
             self._sketcher_box.set_visibility(self._show_sketcher and self._expanded)
+        if self._docking_box is not None:
+            self._docking_box.set_visibility(self._show_docking and self._expanded)
 
         if self._hitl_card is not None:
             self._hitl_card.set_visibility(is_paused)
@@ -557,6 +681,27 @@ class TaskCommandIsland:
             self._cancel_btn.set_visibility(is_running)
 
         tc = resolve_tool_config(self.runtime.state)
+        self._syncing_docking = True
+        try:
+            if (
+                self._docking_mode_select is not None
+                and self._docking_mode_select.value != tc.docking_mode
+            ):
+                self._docking_mode_select.set_value(tc.docking_mode)
+            if self._docking_pdb_input is not None:
+                target_pdb = str(tc.custom_pdb_id or "")
+                if str(self._docking_pdb_input.value or "").strip().upper() != target_pdb:
+                    self._docking_pdb_input.set_value(target_pdb)
+            if self._docking_box_input is not None:
+                target_box = (
+                    f"{tc.custom_box_center[0]:.2f}, {tc.custom_box_center[1]:.2f}, {tc.custom_box_center[2]:.2f}"
+                    if tc.custom_box_center and len(tc.custom_box_center) == 3
+                    else ""
+                )
+                if str(self._docking_box_input.value or "").strip() != target_box:
+                    self._docking_box_input.set_value(target_box)
+        finally:
+            self._syncing_docking = False
         if self._smarts_input is not None:
             cur_input_val = str(self._smarts_input.value or "").strip()
             if ">>" not in cur_input_val:

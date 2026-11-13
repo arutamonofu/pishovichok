@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from nicegui import run
+from pydantic import BaseModel, ConfigDict
 
 from pishovichok.core.rendering import (
     COLOR_ACTIVITY_GAIN,
@@ -12,6 +13,7 @@ from pishovichok.core.rendering import (
     render_parent_leaving_svg,
     render_rule_transformation_svg,
 )
+from pishovichok.ui.bridge import agent_bridge
 from pishovichok.ui.session import session_registry
 
 router = APIRouter(prefix="/api", tags=["molecules"])
@@ -194,3 +196,36 @@ async def get_sar_rule_svg(
         media_type="image/svg+xml",
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+class StandaloneDockingRequest(BaseModel):
+    """Запрос на ручной запуск физического 3D-докинга для сессии."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_ids: list[str] | None = None
+    custom_pdb_id: str | None = None
+    custom_box_center: list[float] | None = None
+    exhaustiveness: int | None = None
+    top_k: int | None = None
+
+
+@router.post("/sessions/{session_id}/docking")
+async def trigger_standalone_docking(
+    session_id: str,
+    payload: StandaloneDockingRequest | None = None,
+) -> dict[str, object]:
+    """Запускает физический 3D-докинг вручную без перезапуска ChEMBL/SAR/CReM."""
+    req = payload or StandaloneDockingRequest()
+    try:
+        summary = await agent_bridge.run_standalone_docking(
+            session_id=session_id,
+            candidate_ids=req.candidate_ids,
+            custom_pdb_id=req.custom_pdb_id,
+            custom_box_center=req.custom_box_center,
+            exhaustiveness=req.exhaustiveness,
+            top_k=req.top_k,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return summary

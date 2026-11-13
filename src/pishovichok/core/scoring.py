@@ -76,6 +76,7 @@ def compute_harrington_mpo_breakdown(
     max_sa_score: float,
     max_herg_prob: float,
     min_tpsa: float | None = None,
+    docking_score_kcal: float | None = None,
     tool_config: ToolConfig | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Единый детерминированный расчёт индекса Харрингтона D и частных желательностей d1..d7."""
@@ -162,11 +163,19 @@ def compute_harrington_mpo_breakdown(
         "logs": d_logs,
         "herg": d_herg,
     }
+    if docking_score_kcal is not None:
+        desirabilities["docking"] = harrington_one_sided_desirability(
+            value=float(docking_score_kcal),
+            bad_limit=-5.5,
+            good_target=-8.5,
+        )
 
     if cfg.alert_penalty_mode == "veto" and has_alerts:
         return 0.0, desirabilities
 
-    weights = cfg.mpo_weights or {}
+    weights = dict(cfg.mpo_weights or {})
+    if docking_score_kcal is not None and "docking" not in weights:
+        weights["docking"] = 1.0
     weighted_sum = 0.0
     total_weight = 0.0
     for key, d_val in desirabilities.items():
@@ -178,7 +187,11 @@ def compute_harrington_mpo_breakdown(
     if total_weight > 0.0:
         geom_mean = math.exp(weighted_sum / total_weight)
     else:
-        geom_mean = (d_pic50 * d_logp * d_sa * d_qed * d_herg) ** (1.0 / 5.0)
+        core_prod = d_pic50 * d_logp * d_sa * d_qed * d_herg
+        if "docking" in desirabilities:
+            geom_mean = (core_prod * desirabilities["docking"]) ** (1.0 / 6.0)
+        else:
+            geom_mean = core_prod ** (1.0 / 5.0)
 
     if cfg.alert_penalty_mode == "soft_penalty" and has_alerts:
         geom_mean *= float(cfg.alert_soft_multiplier)
@@ -192,6 +205,7 @@ def calculate_harrington_mpo_score(
     parent_exp_pic50: float,
     constraints: QueryConstraints,
     *,
+    docking_score_kcal: float | None = None,
     tool_config: ToolConfig | None = None,
 ) -> float:
     """Вычисляет обобщенный многопараметрический индекс желательности Харрингтона $D \\in [0, 1]$.
@@ -219,6 +233,7 @@ def calculate_harrington_mpo_score(
         max_sa_score=constraints.max_sa_score,
         max_herg_prob=constraints.max_herg_prob,
         min_tpsa=constraints.min_tpsa,
+        docking_score_kcal=docking_score_kcal,
         tool_config=tool_config,
     )
     return score

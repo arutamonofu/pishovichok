@@ -97,6 +97,13 @@ class SARGraphState(TypedDict):
     trace_log: Annotated[list[TraceEvent], operator.add]
     final_report_markdown: str | None
 
+    # Управление физическим 3D-докингом
+    docking_mode: Literal["auto_top_k", "manual_only", "skip"]
+    docking_exhaustiveness: int
+    docking_top_k: int
+    custom_pdb_id: str | None
+    custom_box_center: list[float] | None
+
 
 def resolve_tool_config(state: dict[str, Any] | SARGraphState) -> ToolConfig:
     """Безопасно извлекает ToolConfig из состояния графа (с fallback к дефолтному)."""
@@ -180,6 +187,11 @@ def create_initial_graph_state(
         critic_feedback=None,
         trace_log=[],
         final_report_markdown=None,
+        docking_mode=resolved_config.docking_mode,
+        docking_exhaustiveness=resolved_config.docking_exhaustiveness,
+        docking_top_k=resolved_config.docking_top_k,
+        custom_pdb_id=resolved_config.custom_pdb_id,
+        custom_box_center=resolved_config.custom_box_center,
     )
 
 

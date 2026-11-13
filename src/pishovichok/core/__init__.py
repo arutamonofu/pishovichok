@@ -22,6 +22,7 @@ from pishovichok.core.curation import (
     standardize_molecule_detailed,
     standardize_smiles,
 )
+from pishovichok.core.docking import run_docking
 from pishovichok.core.evaluation import (
     calculate_rdkit_metrics,
     calculate_sa_score,
@@ -30,6 +31,11 @@ from pishovichok.core.evaluation import (
     compute_extra_rdkit_descriptors,
     count_lipinski_violations,
     decompose_brics_precursors,
+    evaluate_docking_batch,
+)
+from pishovichok.core.receptor_resolver import (
+    generate_minimal_demo_receptor,
+    resolve_receptor,
 )
 from pishovichok.core.fingerprints import (
     compute_fp_similarity,
@@ -108,6 +114,7 @@ __all__ = [
     "decompose_brics_precursors",
     "determine_prediction_confidence",
     "evaluate_and_rank_candidates",
+    "evaluate_docking_batch",
     "evaluate_lead_reference",
     "extract_mmp_and_cliffs",
     "extract_mmp_with_background_fallback",
@@ -117,6 +124,7 @@ __all__ = [
     "generate_candidate_structures",
     "generate_candidates_pipeline",
     "generate_graph_ga_candidates",
+    "generate_minimal_demo_receptor",
     "harrington_one_sided_desirability",
     "molecule_svg_to_data_uri",
     "parse_activity_cell",
@@ -125,6 +133,8 @@ __all__ = [
     "render_mmp_pair_svg",
     "render_mmp_pair_svgs",
     "render_molecule_svg",
+    "resolve_receptor",
+    "run_docking",
     "select_bioisostere_rules",
     "select_parent_seeds_from_curated",
     "standardize_molecule_detailed",

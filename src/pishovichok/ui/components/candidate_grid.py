@@ -53,9 +53,12 @@ def build_grid_telemetry_badges(tool_config: ToolConfig) -> list[tuple[str, str]
     ]
 
 
-def build_candidate_column_defs() -> list[dict[str, Any]]:
-    """Формирует двухуровневые заголовки `columnDefs` с 4 цветовыми категориями знаний."""
-    return [
+def build_candidate_column_defs(
+    *,
+    include_docking: bool = False,
+) -> list[dict[str, Any]]:
+    """Формирует двухуровневые заголовки `columnDefs` с цветовыми категориями знаний."""
+    groups: list[dict[str, Any]] = [
         {
             "headerName": "1. Эксперимент",
             "headerClass": "ag-cat-experiment",
@@ -186,6 +189,34 @@ def build_candidate_column_defs() -> list[dict[str, Any]]:
             ],
         },
     ]
+    if include_docking:
+        groups.append(
+            {
+                "headerName": "3D-моделирование / Докинг",
+                "headerClass": "ag-cat-hypothesis",
+                "children": [
+                    {
+                        "headerName": "ΔG (ккал/моль)",
+                        "field": "docking_dg_display",
+                        "width": 134,
+                        "minWidth": 120,
+                        "filter": "agTextColumnFilter",
+                        "headerTooltip": "Расчётная свободная энергия связывания (AutoDock Vina / RDKit-MMFF94-3D)",
+                        "headerClass": "ag-cat-hypothesis-col",
+                    },
+                    {
+                        "headerName": "PDB мишени",
+                        "field": "docking_pdb_id",
+                        "width": 98,
+                        "minWidth": 90,
+                        "filter": "agTextColumnFilter",
+                        "headerTooltip": "Идентификатор 3D-структуры рецептора в RCSB PDB",
+                        "headerClass": "ag-cat-hypothesis-col",
+                    },
+                ],
+            }
+        )
+    return groups
 
 
 class CandidateGrid:
@@ -202,6 +233,7 @@ class CandidateGrid:
         self._grid: ui.aggrid | None = None
         self._title_label: ui.label | None = None
         self._telemetry_row: ui.row | None = None
+        self._dock_btn: ui.button | None = None
         self._empty_overlay: ui.column | None = None
         self._build()
 
@@ -211,7 +243,7 @@ class CandidateGrid:
         for r in initial_rows:
             vm.emitted_to_grid_ids.add(str(r["candidate_id"]))
 
-        column_defs = build_candidate_column_defs()
+        column_defs = build_candidate_column_defs(include_docking=True)
 
         grid_options: dict[str, Any] = {
             "columnDefs": column_defs,
@@ -243,6 +275,16 @@ class CandidateGrid:
                     self._telemetry_row = ui.row().classes("items-center gap-1 flex-wrap")
 
                 with ui.row().classes("items-center gap-1.5"):
+                    self._dock_btn = (
+                        ui.button(on_click=self._run_manual_docking)
+                        .props("dense unelevated no-caps size=sm color=primary")
+                        .classes("text-[11px] px-2.5 gap-1")
+                        .tooltip("Запустить физический 3D-докинг для топ-кандидатов без перезапуска пайплайна")
+                    )
+                    with self._dock_btn:
+                        ui.html(svg_icon("play", 12), sanitize=False)
+                        ui.label("Запустить 3D-докинг").classes("text-[11px] font-medium")
+
                     with ui.button(on_click=self._export_csv).props(
                         "dense outline no-caps size=sm color=grey-8"
                     ).classes("text-[11px] bg-white border-[#D5C8CD] px-2 gap-1").tooltip(
@@ -288,6 +330,31 @@ class CandidateGrid:
                     ).classes("text-xs text-[#64748B] text-center max-w-sm")
                 self._empty_overlay.set_visibility(len(vm.rows_by_id) == 0)
 
+    async def _run_manual_docking(self) -> None:
+        from pishovichok.ui.bridge import agent_bridge
+
+        cands = list(self.runtime.view_model.candidates_by_id.values())
+        if not cands:
+            ui.notify("Сначала сгенерируйте кандидатов", type="warning")
+            return
+        if self._dock_btn is not None:
+            self._dock_btn.disable()
+        ui.notify("Запущен расчёт 3D-докинга...", type="info")
+        try:
+            summary = await agent_bridge.run_standalone_docking(self.runtime.session_id)
+            status = summary.get("status")
+            if status == "SUCCESS":
+                dg = summary.get("best_score_kcal")
+                dg_txt = f" (лучший ΔG = {dg:.2f} ккал/моль)" if dg is not None else ""
+                ui.notify(f"3D-докинг завершён{dg_txt}", type="positive")
+            else:
+                ui.notify(str(summary.get("message") or f"Статус докинга: {status}"), type="warning")
+        except Exception as exc:
+            ui.notify(f"Ошибка 3D-докинга: {exc}", type="negative")
+        finally:
+            if self._dock_btn is not None:
+                self._dock_btn.enable()
+
     async def _export_csv(self) -> None:
         cands = list(self.runtime.view_model.candidates_by_id.values())
         if not cands:
@@ -313,6 +380,8 @@ class CandidateGrid:
             self._title_label.set_text(f"Кандидаты и расчётные свойства ({count})")
         if self._empty_overlay is not None:
             self._empty_overlay.set_visibility(count == 0)
+        if self._dock_btn is not None:
+            self._dock_btn.set_visibility(count > 0)
         if self._telemetry_row is None:
             return
         self._telemetry_row.clear()

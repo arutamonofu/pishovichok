@@ -181,15 +181,36 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
         )
         target_k = min(effective_top_k, len(top_candidates)) if top_candidates else 1
 
-        # Петля №2: если кандидаты не удовлетворяют ограничениям и лимит итераций не исчерпан
+        docked_top = [
+            c
+            for c in top_candidates
+            if c.docking is not None
+            and c.docking.status == "SUCCESS"
+            and c.docking.docking_score_kcal is not None
+        ]
+        poor_docking_affinity = bool(docked_top) and all(
+            float(c.docking.docking_score_kcal) > -6.5  # type: ignore[union-attr]
+            for c in docked_top
+        )
+
+        # Петля №2: если кандидаты не удовлетворяют ограничениям (или все докированные кандидаты слабо связываются > -6.5) и лимит итераций не исчерпан
         needs_loop2_redesign = (
-            tool_config.strict_property_thresholds
-            and (valid_count < target_k or len(top_candidates) == 0)
+            (
+                (
+                    tool_config.strict_property_thresholds
+                    and (valid_count < target_k or len(top_candidates) == 0)
+                )
+                or poor_docking_affinity
+            )
             and (design_it < tool_config.max_iterations)
         )
 
         if needs_loop2_redesign:
             reasons = [viol for c in top_candidates for viol in c.constraint_violations]
+            if poor_docking_affinity:
+                reasons.append(
+                    "Все докированные топ-кандидаты имеют слабую расчетную энергию связывания (ΔG > -6.5 ккал/моль)"
+                )
             if not reasons:
                 reasons = [
                     "Недостаточное число кандидатов, удовлетворяющих целевым ограничениям"

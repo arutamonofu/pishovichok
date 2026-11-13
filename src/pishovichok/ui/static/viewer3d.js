@@ -110,6 +110,63 @@ export default {
       this._viewer.zoomTo();
       this._viewer.render();
     },
+    async loadDockingComplex(ligandSdf, receptorPdb = '', keyResidues = []) {
+      await ensure3DmolLoaded();
+      if (!this._viewer && this.$refs.container && window.$3Dmol) {
+        this._viewer = window.$3Dmol.createViewer(this.$refs.container, {
+          backgroundColor: this.backgroundColor,
+        });
+      }
+      if (!this._viewer) return;
+
+      this._viewer.clear();
+      if (!ligandSdf && !receptorPdb) {
+        this.empty = true;
+        this._viewer.render();
+        return;
+      }
+
+      this.empty = false;
+      if (receptorPdb) {
+        this._viewer.addModel(receptorPdb, 'pdb');
+        this._viewer.setStyle(
+          { model: 0 },
+          {
+            cartoon: { color: '#CBD5E1', opacity: 0.72 },
+          },
+        );
+        if (Array.isArray(keyResidues) && keyResidues.length > 0) {
+          const resNums = keyResidues
+            .map((lbl) => parseInt(String(lbl).replace(/^\D+/, ''), 10))
+            .filter((n) => !Number.isNaN(n));
+          if (resNums.length > 0) {
+            this._viewer.setStyle(
+              { model: 0, resi: resNums },
+              {
+                cartoon: { color: '#CBD5E1', opacity: 0.65 },
+                stick: { radius: 0.12, color: '#64748B' },
+              },
+            );
+          }
+        }
+      }
+
+      if (ligandSdf) {
+        const ligModelIdx = receptorPdb ? 1 : 0;
+        this._viewer.addModel(ligandSdf, 'sdf');
+        this._viewer.setStyle(
+          { model: ligModelIdx },
+          {
+            stick: { radius: 0.20, colorscheme: 'Jmol' },
+            sphere: { scale: 0.24, colorscheme: 'Jmol' },
+          },
+        );
+        this._viewer.zoomTo({ model: ligModelIdx });
+      } else {
+        this._viewer.zoomTo();
+      }
+      this._viewer.render();
+    },
     clear() {
       this.clearViewer();
     },

@@ -18,6 +18,37 @@ def _default_project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+DATA_DIR: Path = _default_project_root() / "data"
+RECEPTORS_DIR: Path = DATA_DIR / "receptors"
+
+# Параметры физического 3D-докинга по умолчанию (Слой 5)
+DOCKING_ENABLED_DEFAULT: bool = True
+DOCKING_EXHAUSTIVENESS_DEFAULT: int = 4
+DOCKING_TOP_K_DEFAULT: int = 3
+DOCKING_MAX_BOX_VOLUME: float = 27000.0
+
+DEMO_RECEPTOR_PRESETS: dict[str, dict[str, object]] = {
+    "CHEMBL203": {
+        "pdb_id": "1M17",
+        "box_center": [22.01, 0.25, 52.79],
+        "box_size": [20.0, 20.0, 20.0],
+        "key_residues": ["MET769", "LEU694", "VAL702", "ALA719", "LYS721", "LEU820"],
+    },
+    "CHEMBL5251": {
+        "pdb_id": "5P9J",
+        "box_center": [-18.30, -6.20, 18.50],
+        "box_size": [20.0, 20.0, 20.0],
+        "key_residues": ["MET477", "GLU475", "THR474", "ALA428", "LYS430", "LEU528"],
+    },
+    "CHEMBL262": {
+        "pdb_id": "1Q5K",
+        "box_center": [23.20, 21.60, 8.90],
+        "box_size": [20.0, 20.0, 20.0],
+        "key_residues": ["VAL135", "ASP133", "TYR134", "PRO136", "ALA83", "LEU188"],
+    },
+}
+
+
 class AppSettings(BaseSettings):
     """Глобальные настройки приложения pishovichok."""
 
@@ -148,6 +179,10 @@ class AppSettings(BaseSettings):
     @property
     def samples_dir(self) -> Path:
         return self.resolved_data_dir / "samples"
+
+    @property
+    def receptors_dir(self) -> Path:
+        return self.resolved_data_dir / "receptors"
 
 
 settings = AppSettings()

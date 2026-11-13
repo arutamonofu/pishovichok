@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from pishovichok.agents.llm_adapter import LLMAdapter
+from pishovichok.core.evaluation import evaluate_docking_batch
 from pishovichok.core.generation import select_parent_seeds_from_curated
 from pishovichok.core.scoring import (
     evaluate_and_rank_candidates,
@@ -80,6 +81,101 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
     )
     top_k = evaluated_pool[:top_k_limit]
 
+    # 3.5. Управляемый этап физического 3D-докинга
+    docking_mode = state.get("docking_mode") or tool_config.docking_mode
+    docking_exhaustiveness = int(
+        state.get("docking_exhaustiveness") or tool_config.docking_exhaustiveness
+    )
+    docking_top_k = int(state.get("docking_top_k") or tool_config.docking_top_k)
+    custom_pdb_id = state.get("custom_pdb_id") or tool_config.custom_pdb_id
+    custom_box_center = state.get("custom_box_center") or tool_config.custom_box_center
+    target_id = constraints.target_chembl_id
+
+    docking_events: list[TraceEvent] = []
+    docking_summary: dict[str, Any]
+    step_idx_base = len(state.get("trace_log", []))
+
+    if docking_mode == "auto_top_k":
+        dock_start = time.perf_counter()
+        docked_top, docking_summary = evaluate_docking_batch(
+            candidates=top_k,
+            target_id=target_id,
+            top_k=docking_top_k,
+            exhaustiveness=docking_exhaustiveness,
+            custom_pdb_id=custom_pdb_id,
+            custom_box_center=custom_box_center,
+            workspace_dir=session_dir,
+            constraints=constraints,
+            tool_config=tool_config,
+        )
+        top_k = sorted(
+            docked_top,
+            key=lambda c: (
+                bool(c.passes_all_constraints),
+                float(c.mpo_harrington_score),
+                float(c.pred_admet.predicted_pic50),
+                -float(c.calc_rdkit.clogp),
+            ),
+            reverse=True,
+        )
+        dock_duration = round((time.perf_counter() - dock_start) * 1000.0, 2)
+        dock_status = docking_summary.get("status", "SKIPPED")
+        best_dg = docking_summary.get("best_score_kcal")
+        dg_text = f"{best_dg:.2f} kcal/mol" if best_dg is not None else "N/A"
+        docking_events.append(
+            TraceEvent(
+                step_index=step_idx_base,
+                timestamp_iso=datetime.now(tz=UTC).isoformat(),
+                agent_name="EvaluationAgent",
+                phase=f"docking_3d_it{iteration}",
+                input_summary=(
+                    f"mode=auto_top_k | target={target_id or 'N/A'} | "
+                    f"custom_pdb={custom_pdb_id or 'auto'} | top_k={docking_top_k} | exhaustiveness={docking_exhaustiveness}"
+                ),
+                action_taken=(
+                    "Resolved receptor pocket (cache/RCSB PDB) and executed 3D docking + interaction profiling."
+                ),
+                output_summary=(
+                    f"status={dock_status} | pdb={docking_summary.get('pdb_id') or 'N/A'} "
+                    f"({docking_summary.get('source') or 'N/A'}) | "
+                    f"docked={docking_summary.get('success_count', 0)}/{docking_summary.get('docked_count', 0)} | "
+                    f"best ΔG={dg_text}."
+                ),
+                verdict_or_routing="docking_completed" if dock_status == "SUCCESS" else "docking_skipped",
+                fallback_triggered=None,
+                duration_ms=dock_duration,
+            )
+        )
+    else:
+        skip_reason = (
+            "3D-докинг отложен пользователем (режим 'manual_only'): доступен ручной запуск из таблицы или инспектора."
+            if docking_mode == "manual_only"
+            else "3D-докинг отключён перед запуском (режим 'skip')."
+        )
+        docking_summary = {
+            "status": "SKIPPED",
+            "docked_count": 0,
+            "success_count": 0,
+            "pdb_id": custom_pdb_id,
+            "source": None,
+            "best_score_kcal": None,
+            "message": skip_reason,
+        }
+        docking_events.append(
+            TraceEvent(
+                step_index=step_idx_base,
+                timestamp_iso=datetime.now(tz=UTC).isoformat(),
+                agent_name="EvaluationAgent",
+                phase=f"docking_3d_it{iteration}",
+                input_summary=f"mode={docking_mode} | target={target_id or 'N/A'}",
+                action_taken="Skipped automatic 3D docking according to docking_mode.",
+                output_summary=skip_reason,
+                verdict_or_routing="docking_skipped",
+                fallback_triggered=None,
+                duration_ms=0.0,
+            )
+        )
+
     # 4. Формирование детализированных текстовых обоснований гипотез через LLM-адаптер
     id_to_text, fallback_hypotheses = llm_adapter.generate_hypothesis_rationales(top_k)
     enriched_top: list[CandidateMolecule] = []
@@ -131,7 +227,7 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         f"(max Harrington D={top_score:.3f}). Constraints fully satisfied: {valid_count}/{len(enriched_top)}."
     )
 
-    step_idx = len(state.get("trace_log", []))
+    step_idx = len(state.get("trace_log", [])) + len(docking_events)
     trace_event = TraceEvent(
         step_index=step_idx,
         timestamp_iso=datetime.now(tz=UTC).isoformat(),
@@ -165,6 +261,9 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
             "mpo_weights": dict(tool_config.mpo_weights),
             "extra_rdkit_descriptors": list(tool_config.extra_rdkit_descriptors),
             "top_k_output": top_k_limit,
+            "docking_mode": docking_mode,
+            "docking_exhaustiveness": docking_exhaustiveness,
+            "docking_top_k": docking_top_k,
         },
         "stats": {
             "iteration": iteration,
@@ -173,6 +272,9 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
             "top_k_count": len(enriched_top),
             "valid_top_k_count": valid_count,
             "max_harrington_d": round(top_score, 4),
+            "docking_status": docking_summary.get("status"),
+            "docking_pdb_id": docking_summary.get("pdb_id"),
+            "docking_best_dg_kcal": docking_summary.get("best_score_kcal"),
             "duration_ms": round(duration_ms, 2),
         },
     }
@@ -182,7 +284,7 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         "top_candidates": enriched_top,
         "node_telemetry": node_telemetry,
         "last_executed_stage": "evaluation",
-        "trace_log": [trace_event],
+        "trace_log": [*docking_events, trace_event],
     }
     if lead_reference is not None:
         result_dict["lead_reference_metrics"] = lead_reference

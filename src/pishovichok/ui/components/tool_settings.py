@@ -766,6 +766,97 @@ class ToolSettingsDrawer:
                 self._add_number("harrington_qed_target", "Харрингтон QED цель", min_val=0.0, max_val=1.0, step=0.05)
                 self._add_number("harrington_sa_min", "Харрингтон SAscore мин.", min_val=1.0, max_val=10.0, step=0.1)
 
+            self._section_header("Физический 3D-докинг (AutoDock Vina / ProLIF)")
+            with ui.grid(columns=2).classes("w-full gap-2"):
+                self._add_select(
+                    "docking_mode",
+                    "Режим 3D-докинга",
+                    {
+                        "auto_top_k": "Авто (топ-K в пайплайне)",
+                        "manual_only": "Только вручную после генерации",
+                        "skip": "Отключён перед запуском",
+                    },
+                )
+                self._add_number(
+                    "docking_exhaustiveness",
+                    "Глубина поиска (exhaustiveness)",
+                    min_val=1,
+                    max_val=16,
+                    step=1,
+                    is_int=True,
+                )
+                self._add_number(
+                    "docking_top_k",
+                    "Топ-K кандидатов для автодокинга",
+                    min_val=1,
+                    max_val=10,
+                    step=1,
+                    is_int=True,
+                )
+
+            with ui.grid(columns=2).classes("w-full gap-2"):
+                pdb_card = ui.column().classes("w-full gap-1 bg-white p-2 rounded border border-[#E2E8F0]")
+                self._cards["custom_pdb_id"] = pdb_card
+                with pdb_card:
+                    self._render_param_header("custom_pdb_id", "Пользовательский PDB ID (опц.)")
+
+                    def _on_pdb_change(e: Any) -> None:
+                        raw = str(e.value or "").strip().upper()
+                        self._on_field_changed("custom_pdb_id", raw or None)
+
+                    pdb_inp = (
+                        ui.input(
+                            value=str(tc.custom_pdb_id or ""),
+                            placeholder="Напр., 1M17 или авто",
+                            on_change=_on_pdb_change,
+                        )
+                        .props("dense outlined clearable")
+                        .classes("w-full text-xs font-mono bg-white")
+                    )
+
+                    def _upd_pdb(cfg: ToolConfig) -> None:
+                        pdb_inp.set_value(str(cfg.custom_pdb_id or ""))
+
+                    self._control_updaters.append(_upd_pdb)
+
+                box_card = ui.column().classes("w-full gap-1 bg-white p-2 rounded border border-[#E2E8F0]")
+                self._cards["custom_box_center"] = box_card
+                with box_card:
+                    self._render_param_header("custom_box_center", "Центр кармана X, Y, Z (опц.)")
+
+                    def _fmt_box(vals: list[float] | None) -> str:
+                        if not vals or len(vals) != 3:
+                            return ""
+                        return f"{vals[0]:.2f}, {vals[1]:.2f}, {vals[2]:.2f}"
+
+                    def _on_box_change(e: Any) -> None:
+                        raw = str(e.value or "").strip()
+                        if not raw:
+                            self._on_field_changed("custom_box_center", None)
+                            return
+                        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+                        if len(parts) == 3:
+                            try:
+                                coords = [float(p) for p in parts]
+                                self._on_field_changed("custom_box_center", coords)
+                            except ValueError:
+                                pass
+
+                    box_inp = (
+                        ui.input(
+                            value=_fmt_box(tc.custom_box_center),
+                            placeholder="Напр., 22.0, 0.3, 52.8",
+                            on_change=_on_box_change,
+                        )
+                        .props("dense outlined clearable")
+                        .classes("w-full text-xs font-mono bg-white")
+                    )
+
+                    def _upd_box(cfg: ToolConfig) -> None:
+                        box_inp.set_value(_fmt_box(cfg.custom_box_center))
+
+                    self._control_updaters.append(_upd_box)
+
             self._section_header("Генерация 3D-конформеров и PCA")
             with ui.grid(columns=2).classes("w-full gap-2"):
                 self._add_select("etkdg_variant", "3D генератор ETKDG", ["ETKDGv3", "ETKDGv2"])

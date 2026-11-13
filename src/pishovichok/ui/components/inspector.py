@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from nicegui import run, ui
@@ -99,6 +100,7 @@ class InspectorPane:
         self._conformer_title: ui.label | None = None
         self._viewer3d: MoleculeViewer3D | None = None
         self._desirability_box: ui.column | None = None
+        self._docking_box: ui.column | None = None
         self._provenance_box: ui.column | None = None
         self._telemetry_bar: ui.row | None = None
         self._mol3d_cache: dict[str, str] = {}
@@ -200,6 +202,16 @@ class InspectorPane:
                 )
                 with ui.card().classes("w-full shrink-0 bg-white border border-[#E2E8F0] rounded-lg p-2.5 shadow-none"):
                     self._desirability_box = ui.column().classes("w-full gap-1.5")
+
+                with ui.row().classes("w-full items-center justify-between shrink-0"):
+                    ui.label("Профиль связывания в активном центре").classes(
+                        "text-xs font-semibold text-[#334155]"
+                    )
+                    ui.label("3D-моделирование / Докинг").classes(
+                        "text-[10px] font-medium px-1.5 py-0.5 rounded bg-[#EFF6FF] text-[#1D4ED8] border border-[#BFDBFE]"
+                    )
+                with ui.card().classes("w-full shrink-0 bg-white border border-[#E2E8F0] rounded-lg p-2.5 shadow-none"):
+                    self._docking_box = ui.column().classes("w-full gap-1.5")
 
                 ui.label("Источники данных и верификация").classes(
                     "text-xs font-semibold text-[#334155] shrink-0"
@@ -319,6 +331,30 @@ class InspectorPane:
         if self._on_row_updated is not None:
             self._on_row_updated(cid)
 
+    async def _dock_selected_candidate(self) -> None:
+        from pishovichok.ui.bridge import agent_bridge
+
+        cid, _, _ = self._get_selected()
+        if not cid:
+            return
+        ui.notify(f"Запуск 3D-докинга для {cid}...", type="info")
+        try:
+            summary = await agent_bridge.run_standalone_docking(
+                self.runtime.session_id,
+                candidate_ids=[cid],
+            )
+            if summary.get("status") == "SUCCESS":
+                dg = summary.get("best_score_kcal")
+                dg_txt = f" (ΔG = {dg:.2f} ккал/моль)" if dg is not None else ""
+                ui.notify(f"3D-докинг для {cid} завершён{dg_txt}", type="positive")
+            else:
+                ui.notify(
+                    str(summary.get("message") or f"Статус: {summary.get('status')}"),
+                    type="warning",
+                )
+        except Exception as exc:
+            ui.notify(f"Ошибка докинга: {exc}", type="negative")
+
     async def _load_3d_conformer(self) -> None:
         cid, cand, _ = self._get_selected()
         if cand is None:
@@ -326,6 +362,26 @@ class InspectorPane:
         self._ensure_3d_viewer()
         if self._viewer3d is None:
             return
+
+        if (
+            cand.docking is not None
+            and cand.docking.status == "SUCCESS"
+            and cand.docking.pose_sdf_block
+        ):
+            receptor_pdb = ""
+            if cand.docking.receptor_pdb_path:
+                rec_path = Path(cand.docking.receptor_pdb_path)
+                if rec_path.is_file():
+                    receptor_pdb = await run.io_bound(
+                        rec_path.read_text, encoding="utf-8"
+                    )
+            self._viewer3d.load_docking_complex(
+                cand.docking.pose_sdf_block,
+                receptor_pdb,
+                list(cand.docking.key_residues),
+            )
+            return
+
         tool_config = resolve_tool_config(self.runtime.state)
         cache_key = (
             f"{cid or ''}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
@@ -389,6 +445,8 @@ class InspectorPane:
                 self._viewer3d.clear_viewer()
             if self._desirability_box is not None:
                 self._desirability_box.clear()
+            if self._docking_box is not None:
+                self._docking_box.clear()
             if self._provenance_box is not None:
                 self._provenance_box.clear()
             return
@@ -515,6 +573,107 @@ class InspectorPane:
                         ui.label(f"{val:.2f}").classes(
                             "text-[11px] font-mono font-semibold text-[#0F172A] w-9 text-right"
                         )
+
+        # Профиль связывания в активном центре (3D-моделирование / Докинг)
+        if self._docking_box is not None:
+            self._docking_box.clear()
+            with self._docking_box:
+                dock = cand.docking
+                if dock is None or dock.status != "SUCCESS":
+                    status_msg = (
+                        dock.message
+                        if dock is not None and dock.message
+                        else "3D-докинг ещё не выполнялся для данного кандидата."
+                    )
+                    ui.label(status_msg).classes("text-[11px] text-[#475569]")
+                    with ui.button(on_click=self._dock_selected_candidate).props(
+                        "dense unelevated no-caps size=sm color=primary"
+                    ).classes("text-[11px] px-2.5 gap-1 self-start"):
+                        ui.html(svg_icon("play", 12), sanitize=False)
+                        ui.label("Запустить 3D-докинг").classes("text-[11px] font-medium")
+                else:
+                    src_ru = (
+                        "Кэш демо-мишени"
+                        if dock.source == "DEMO_CACHE"
+                        else (
+                            "RCSB PDB автозагрузка"
+                            if dock.source in ("RCSB_LIVE", "RCSB_CACHE")
+                            else (dock.source or "Локальный кэш")
+                        )
+                    )
+                    dg_val = (
+                        f"{dock.docking_score_kcal:.2f} ккал/моль"
+                        if dock.docking_score_kcal is not None
+                        else "-"
+                    )
+                    with ui.grid(columns=2).classes("w-full gap-1.5"):
+                        for k_lbl, v_txt in (
+                            ("PDB мишени", f"{dock.pdb_id or '-'} ({src_ru})"),
+                            ("Энергия ΔG", dg_val),
+                            ("Движок 3D", dock.backend or "-"),
+                            ("Статус", "Успешно"),
+                        ):
+                            with ui.column().classes(
+                                "bg-[#F8FAFC] border border-[#E2E8F0] rounded px-1.5 py-1 gap-0 min-w-0"
+                            ):
+                                ui.label(k_lbl).classes("text-[10px] text-[#64748B]")
+                                ui.label(v_txt).classes(
+                                    "text-[11px] font-semibold text-[#0F172A] truncate"
+                                ).tooltip(v_txt)
+
+                    interaction_groups: list[tuple[str, list[str], str]] = [
+                        (
+                            "Водородные связи",
+                            sorted(
+                                set(dock.interactions.get("HBDonor", []))
+                                | set(dock.interactions.get("HBAcceptor", []))
+                            ),
+                            "bg-[#ECFDF5] text-[#065F46] border-[#A7F3D0]",
+                        ),
+                        (
+                            "Гидрофобные контакты",
+                            list(dock.interactions.get("Hydrophobic", [])),
+                            "bg-[#FFFBEB] text-[#92400E] border-[#FDE68A]",
+                        ),
+                        (
+                            "π-стекинг",
+                            list(dock.interactions.get("PiStacking", [])),
+                            "bg-[#F3E8FF] text-[#6B21A8] border-[#DDD6FE]",
+                        ),
+                        (
+                            "Ионные контакты",
+                            sorted(
+                                set(dock.interactions.get("Anionic", []))
+                                | set(dock.interactions.get("Cationic", []))
+                                | set(dock.interactions.get("CationPi", []))
+                            ),
+                            "bg-[#EFF6FF] text-[#1E40AF] border-[#BFDBFE]",
+                        ),
+                    ]
+                    has_any_badges = any(res_list for _, res_list, _ in interaction_groups)
+                    if has_any_badges:
+                        with ui.column().classes("w-full gap-1 pt-0.5"):
+                            for grp_name, res_list, badge_cls in interaction_groups:
+                                if not res_list:
+                                    continue
+                                with ui.row().classes("w-full items-center gap-1 flex-wrap"):
+                                    ui.label(f"{grp_name}:").classes(
+                                        "text-[10px] font-medium text-[#475569]"
+                                    )
+                                    for rname in res_list[:6]:
+                                        ui.label(rname).classes(
+                                            f"text-[10px] font-mono px-1.5 py-0.5 rounded border {badge_cls}"
+                                        )
+                    else:
+                        ui.label("Ключевые остатки кармана: " + (", ".join(dock.key_residues[:5]) or "-")).classes(
+                            "text-[10px] text-[#64748B]"
+                        )
+
+                    with ui.button(on_click=self._dock_selected_candidate).props(
+                        "dense flat no-caps size=xs color=primary"
+                    ).classes("text-[11px] px-1.5 gap-1 self-start"):
+                        ui.html(svg_icon("refresh", 12), sanitize=False)
+                        ui.label("Пересчитать 3D-докинг").classes("text-[11px]")
 
         # Источники данных и верификация (4 категории в 2 колонки без технических дампов)
         if self._provenance_box is not None:

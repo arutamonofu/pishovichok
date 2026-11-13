@@ -333,6 +333,26 @@ class SARHypothesisRationale(BaseModel):
 # ============================================================================
 # ЕДИНЫЙ КОНТРАКТ КАНДИДАТА (CandidateMolecule)
 # ============================================================================
+class DockingResult(BaseModel):
+    """Результат физического 3D-докинга и анализа белок-лигандных взаимодействий."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["PENDING", "SUCCESS", "SKIPPED", "FAILED"] = "PENDING"
+    pdb_id: str | None = None
+    source: str | None = None
+    docking_score_kcal: float | None = None
+    backend: str | None = None
+    interactions: dict[str, list[str]] = Field(default_factory=dict)
+    pose_sdf_path: str | None = None
+    pose_sdf_block: str | None = None
+    receptor_pdb_path: str | None = None
+    box_center: list[float] | None = None
+    box_size: list[float] | None = None
+    key_residues: list[str] = Field(default_factory=list)
+    message: str | None = None
+
+
 class CandidateMolecule(BaseModel):
     """Контракт молекулы-кандидата с принудительным разделением 4 категорий знаний."""
 
@@ -421,6 +441,10 @@ class CandidateMolecule(BaseModel):
         default="veto",
         description="Режим штрафа за структурные алерты при расчете индекса Харрингтона",
     )
+    docking: DockingResult | None = Field(
+        default=None,
+        description="Результаты физического 3D-докинга и анализа белок-лигандных контактов",
+    )
 
     @model_validator(mode="after")
     def _enforce_veto_invariant(self) -> CandidateMolecule:
@@ -502,6 +526,9 @@ class CandidateMolecule(BaseModel):
                 self.constraint_violations, ensure_ascii=False
             ),
             "highlighted_atom_indices_json": json.dumps(self.highlighted_atom_indices),
+            "docking_json": self.docking.model_dump_json()
+            if self.docking is not None
+            else None,
         }
 
     @classmethod
@@ -533,6 +560,9 @@ class CandidateMolecule(BaseModel):
             highlighted_atom_indices=json.loads(
                 row.get("highlighted_atom_indices_json") or "[]"
             ),
+            docking=DockingResult.model_validate_json(row["docking_json"])
+            if row.get("docking_json")
+            else None,
         )
 
 
@@ -917,6 +947,13 @@ class ToolConfig(BaseModel):
     conformer_opt_max_iters: int = Field(default=200, ge=0, le=5000)
     conformer_random_seed: int = 42
     pca_random_seed: int = 42
+
+    # 4.1. Физический 3D-докинг (docking.py, receptor_resolver.py)
+    docking_mode: Literal["auto_top_k", "manual_only", "skip"] = "auto_top_k"
+    docking_exhaustiveness: int = Field(default=4, ge=1, le=16)
+    docking_top_k: int = Field(default=3, ge=1, le=10)
+    custom_pdb_id: str | None = None
+    custom_box_center: list[float] | None = None
 
     # 5. Оркестрация (critic_node.py, workflow.py)
     max_iterations: int = Field(default=2, ge=0, le=10)
