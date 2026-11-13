@@ -121,7 +121,21 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
         dock_duration = round((time.perf_counter() - dock_start) * 1000.0, 2)
         dock_status = docking_summary.get("status", "SKIPPED")
         best_dg = docking_summary.get("best_score_kcal")
-        dg_text = f"{best_dg:.2f} kcal/mol" if best_dg is not None else "N/A"
+        dg_text = f"{best_dg:.2f} ккал/моль" if best_dg is not None else "Н/Д"
+        _st_ru = {
+            "SUCCESS": "Успешно",
+            "SKIPPED": "Пропущено",
+            "FAILED": "Ошибка",
+            "NO_RECEPTOR": "Рецептор не найден",
+        }.get(str(dock_status), str(dock_status))
+        _src_raw = docking_summary.get("source")
+        _src_ru = {
+            "DEMO_CACHE": "демо-кэш",
+            "RCSB_LIVE": "RCSB PDB",
+            "RCSB_CACHE": "RCSB кэш",
+            "LOCAL_PDB": "локальный PDB",
+        }.get(str(_src_raw or ""), str(_src_raw or "Н/Д"))
+        _pdb_val = docking_summary.get("pdb_id") or "Н/Д"
         docking_events.append(
             TraceEvent(
                 step_index=step_idx_base,
@@ -133,13 +147,12 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
                     f"custom_pdb={custom_pdb_id or 'auto'} | top_k={docking_top_k} | exhaustiveness={docking_exhaustiveness}"
                 ),
                 action_taken=(
-                    "Resolved receptor pocket (cache/RCSB PDB) and executed 3D docking + interaction profiling."
+                    "Подготовлен карман рецептора (кэш/RCSB PDB), выполнен 3D-докинг и профилирование взаимодействий."
                 ),
                 output_summary=(
-                    f"status={dock_status} | pdb={docking_summary.get('pdb_id') or 'N/A'} "
-                    f"({docking_summary.get('source') or 'N/A'}) | "
-                    f"docked={docking_summary.get('success_count', 0)}/{docking_summary.get('docked_count', 0)} | "
-                    f"best ΔG={dg_text}."
+                    f"Статус: {_st_ru} | PDB: {_pdb_val} ({_src_ru}) | "
+                    f"состыковано: {docking_summary.get('success_count', 0)}/{docking_summary.get('docked_count', 0)} | "
+                    f"лучшая ΔG = {dg_text}."
                 ),
                 verdict_or_routing="docking_completed" if dock_status == "SUCCESS" else "docking_skipped",
                 fallback_triggered=None,
@@ -223,8 +236,8 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
     top_score = enriched_top[0].mpo_harrington_score if enriched_top else 0.0
 
     output_text = (
-        f"Evaluated {len(evaluated_pool)} candidates; top-{len(enriched_top)} selected "
-        f"(max Harrington D={top_score:.3f}). Constraints fully satisfied: {valid_count}/{len(enriched_top)}."
+        f"Оценено кандидатов: {len(evaluated_pool)}; выбрано топ-{len(enriched_top)} "
+        f"(макс. D Харрингтона = {top_score:.3f}). Ограничения соблюдены: {valid_count}/{len(enriched_top)}."
     )
 
     step_idx = len(state.get("trace_log", [])) + len(docking_events)

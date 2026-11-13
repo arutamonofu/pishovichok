@@ -91,10 +91,21 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
     duration_ms = (time.perf_counter() - start_time) * 1000.0
 
     step_idx = len(state.get("trace_log", []))
+    _pref_map = {
+        "any": "любые",
+        "polar": "полярные",
+        "less_lipophilic": "менее липофильные",
+        "exclude_halogens": "без галогенов",
+        "bioisostere": "биоизостеры",
+        "hbd_reduction": "снижение доноров H-связей",
+        "mw_reduction": "снижение мол. массы",
+        "aromatic_reduction": "снижение ароматичности",
+    }
+    pref_ru = ", ".join(_pref_map.get(t, t) for t in constraints.preferred_substituent_types) or "любые"
     output_text = (
-        f"Generated {len(raw_candidates)} candidate structures from {len(parent_seeds)} parent seeds "
-        f"(iteration={design_iteration}, SMIRKS={smirks_count}, CReM={crem_count}, GraphGA={graph_ga_count}, "
-        f"preferred_types={constraints.preferred_substituent_types})."
+        f"Сгенерировано {len(raw_candidates)} структур-кандидатов из {len(parent_seeds)} прототипов "
+        f"(итерация {design_iteration}, SMIRKS: {smirks_count}, CReM: {crem_count}, GraphGA: {graph_ga_count}, "
+        f"типы: {pref_ru})."
     )
 
     ga_params_used: dict[str, object] = {

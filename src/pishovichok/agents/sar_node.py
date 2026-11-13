@@ -78,9 +78,10 @@ def sar_node(state: SARGraphState) -> dict[str, Any]:
     duration_ms = (time.perf_counter() - start_time) * 1000.0
 
     homo_count = sum(1 for r in sar_rules if r.assay_homogeneous)
+    enr_ru = "да" if enriched else "нет"
     output_text = (
-        f"Extracted {len(sar_rules)} SAR rules and {len(cliffs)} Activity Cliffs. "
-        f"Homogeneous rules: {homo_count}/{len(sar_rules)} (background_enriched={enriched})."
+        f"Извлечено правил SAR: {len(sar_rules)}, перепадов активности: {len(cliffs)}. "
+        f"Однородных правил: {homo_count}/{len(sar_rules)} (обогащение фоном: {enr_ru})."
     )
 
     step_idx = len(state.get("trace_log", []))

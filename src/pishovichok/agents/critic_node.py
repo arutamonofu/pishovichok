@@ -78,8 +78,8 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             )
 
             feedback_msg = (
-                f"Critic Agent: Обнаружена методологическая неоднородность экспериментальных данных "
-                f"(assay_homogeneous=False). Извлеченные правила SAR содержат смешение протоколов испытаний. "
+                f"Верификация: Обнаружена методологическая неоднородность экспериментальных данных "
+                f"(однородность=нет). Извлеченные правила SAR содержат смешение протоколов испытаний. "
                 f"Активирована Петля самокоррекции №1: возврат на этап курации со строгой фильтрацией "
                 f"по доминирующему формату протокола '{dominant_bao}'."
             )
@@ -128,8 +128,8 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
 
         # Все протоколы однородны или исчерпан лимит перефильтрации
         feedback_msg = (
-            "Critic Agent: Экспериментальные протоколы проверены. Правила SAR методологически однородны "
-            "(assay_homogeneous=True). Разрешен переход к направленному молекулярному дизайну."
+            "Верификация: Экспериментальные протоколы проверены. Правила SAR методологически однородны "
+            "(однородность=да). Разрешен переход к направленному молекулярному дизайну."
         )
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         node_telemetry["critic"] = {
@@ -294,7 +294,7 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             }
 
         approval_feedback = (
-            f"Critic Agent: Портфель кандидатов успешно утвержден "
+            f"Верификация: Портфель кандидатов успешно утвержден "
             f"(валидных: {valid_count}/{len(top_candidates)}). "
             f"Сформирован итоговый аналитический отчет."
         )
@@ -363,7 +363,7 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
     # Непредвиденная стадия
     return {
         "critic_verdict": "approve",
-        "critic_feedback": f"Critic Agent: unhandled stage '{last_stage}', terminating safely.",
+        "critic_feedback": f"Верификация: необработанная стадия '{last_stage}', безопасное завершение.",
         "trace_log": [],
     }
 

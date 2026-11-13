@@ -981,7 +981,22 @@ class AgentUIBridge:
 
         existing_trace = list(state.get("trace_log", []))
         best_dg = dock_summary.get("best_score_kcal")
-        dg_text = f"{best_dg:.2f} kcal/mol" if best_dg is not None else "N/A"
+        dg_text = f"{best_dg:.2f} ккал/моль" if best_dg is not None else "Н/Д"
+        _dock_st = dock_summary.get("status")
+        _st_ru = {
+            "SUCCESS": "Успешно",
+            "SKIPPED": "Пропущено",
+            "FAILED": "Ошибка",
+            "NO_RECEPTOR": "Рецептор не найден",
+        }.get(str(_dock_st or ""), str(_dock_st or "Н/Д"))
+        _src_raw = dock_summary.get("source")
+        _src_ru = {
+            "DEMO_CACHE": "демо-кэш",
+            "RCSB_LIVE": "RCSB PDB",
+            "RCSB_CACHE": "RCSB кэш",
+            "LOCAL_PDB": "локальный PDB",
+        }.get(str(_src_raw or ""), str(_src_raw or "Н/Д"))
+        _pdb_val = dock_summary.get("pdb_id") or "Н/Д"
         dock_event = TraceEvent(
             step_index=len(existing_trace),
             timestamp_iso=datetime.now(tz=UTC).isoformat(),
@@ -991,12 +1006,11 @@ class AgentUIBridge:
                 f"manual_run | target={target_id or 'N/A'} | custom_pdb={eff_pdb or 'auto'} | "
                 f"selected={candidate_ids or f'top_{eff_top_k}'}"
             ),
-            action_taken="Executed standalone physical 3D docking and updated Harrington MPO scores.",
+            action_taken="Выполнен автономный 3D-докинг и обновлены оценки Харрингтона.",
             output_summary=(
-                f"status={dock_summary.get('status')} | pdb={dock_summary.get('pdb_id') or 'N/A'} "
-                f"({dock_summary.get('source') or 'N/A'}) | "
-                f"docked={dock_summary.get('success_count', 0)}/{dock_summary.get('docked_count', 0)} | "
-                f"best ΔG={dg_text}."
+                f"Статус: {_st_ru} | PDB: {_pdb_val} ({_src_ru}) | "
+                f"состыковано: {dock_summary.get('success_count', 0)}/{dock_summary.get('docked_count', 0)} | "
+                f"лучшая ΔG = {dg_text}."
             ),
             verdict_or_routing="docking_completed",
             fallback_triggered=None,

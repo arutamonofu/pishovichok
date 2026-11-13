@@ -1020,3 +1020,43 @@ class TestWetLabLightModeRefactoring:
             for term in banned_terms:
                 assert term not in content, f"Found banned term {term!r} in {path}"
 
+    def test_trace_summary_localization(self) -> None:
+        from pishovichok.ui.components.agent_rail import _localize_trace_summary
+
+        docking_ru = _localize_trace_summary(
+            "status=SUCCESS | pdb=5P9J (DEMO_CACHE) | docked=3/3 | best ΔG=-10.02 kcal/mol."
+        )
+        assert docking_ru == (
+            "Статус: Успешно | PDB: 5P9J (демо-кэш) | состыковано: 3/3 | лучшая ΔG = -10.02 ккал/моль."
+        )
+
+        gen_ru = _localize_trace_summary(
+            "Generated 24 candidate structures from 5 parent seeds "
+            "(iteration=1, SMIRKS=18, CReM=6, GraphGA=0, preferred_types=['any'])."
+        )
+        assert gen_ru == (
+            "Сгенерировано 24 структур-кандидатов из 5 прототипов "
+            "(итерация 1, SMIRKS: 18, CReM: 6, GraphGA: 0, типы: любые)."
+        )
+
+        gen_legacy_ru = _localize_trace_summary(
+            "Generated 44 candidate structures from 5 parent seeds "
+            "(iteration=2, preferred_types=['polar', 'less_lipophilic', 'exclude_halogens'])."
+        )
+        assert gen_legacy_ru == (
+            "Сгенерировано 44 структур-кандидатов из 5 прототипов "
+            "(итерация 2, типы: полярные, менее липофильные, без галогенов)."
+        )
+
+        eval_ru = _localize_trace_summary(
+            "Evaluated 5 candidates; top-5 selected (max Harrington D=0.797). Constraints fully satisfied: 5/5."
+        )
+        assert eval_ru == (
+            "Оценено кандидатов: 5; выбрано топ-5 (макс. D Харрингтона = 0.797). Ограничения соблюдены: 5/5."
+        )
+
+        critic_ru = _localize_trace_summary(
+            "Critic Agent: Портфель кандидатов успешно утвержден (валидных: 5/5)."
+        )
+        assert critic_ru == "Верификация: Портфель кандидатов успешно утвержден (валидных: 5/5)."
+

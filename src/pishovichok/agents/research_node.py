@@ -100,11 +100,12 @@ def research_node(state: SARGraphState) -> dict[str, Any]:
         else "Parsed user constraints and performed initial standardization and SMILES curation."
     )
 
+    homog_ru = "да" if summary.is_dataset_assay_homogeneous else "нет"
     output_text = (
-        f"Curated {summary.curated_molecules_count} molecules "
-        f"(dropped {summary.invalid_smiles_dropped} invalid, {summary.censored_values_count} censored, "
-        f"{summary.duplicates_merged_count} duplicates). Dominant BAO: {summary.dominant_bao_format} "
-        f"(homogeneous={summary.is_dataset_assay_homogeneous})."
+        f"Отобрано {summary.curated_molecules_count} молекул "
+        f"(отсеяно: {summary.invalid_smiles_dropped} невал., {summary.censored_values_count} цензур., "
+        f"{summary.duplicates_merged_count} дубл.). Протокол BAO: {summary.dominant_bao_format} "
+        f"(однородный: {homog_ru})."
     )
 
     step_idx = len(state.get("trace_log", []))

@@ -86,6 +86,56 @@ _COMMON_FRAGMENT_NAMES: dict[str, str] = {
     "[H]": "H",
 }
 
+_TRANSFORMATION_TYPE_RU: dict[str, str] = {
+    "any": "любые",
+    "polar": "полярные",
+    "less_lipophilic": "менее липофильные",
+    "exclude_halogens": "без галогенов",
+    "bioisostere": "биоизостеры",
+    "hbd_reduction": "снижение доноров H-связей",
+    "mw_reduction": "снижение мол. массы",
+    "aromatic_reduction": "снижение ароматичности",
+    "rigidify": "повышение жёсткости",
+    "solubility": "повышение растворимости",
+}
+
+_ACTION_TRANSLATIONS: dict[str, str] = {
+    "Parsed user constraints and performed initial standardization and SMILES curation.": (
+        "Сформулированы ограничения поиска, выполнена стандартизация и курация SMILES."
+    ),
+    "Executed dual-engine candidate generation (rdMMPA/SMIRKS transformations and CReM bioisosteric replacements).": (
+        "Выполнена двухдвижковая генерация кандидатов (трансформации rdMMPA/SMIRKS и биоизостерные замены CReM)."
+    ),
+    "Calculated RDKit 2D metrics, PAINS/Brenk alerts, BRICS precursors, ADMET probabilities, and Harrington MPO desirability index.": (
+        "Рассчитаны 2D-дескрипторы RDKit, алерты PAINS/Brenk, прекурсоры BRICS, вероятности ADMET и интегральный индекс Харрингтона."
+    ),
+    "Resolved receptor pocket (cache/RCSB PDB) and executed 3D docking + interaction profiling.": (
+        "Подготовлен карман рецептора (кэш/RCSB PDB), выполнен 3D-докинг и профилирование взаимодействий."
+    ),
+    "Executed standalone physical 3D docking and updated Harrington MPO scores.": (
+        "Выполнен автономный 3D-докинг и обновлены оценки Харрингтона."
+    ),
+    "Skipped automatic 3D docking according to docking_mode.": (
+        "Автоматический 3D-докинг пропущен согласно настройкам режима."
+    ),
+    "Confirmed assay protocol homogeneity. Routed workflow to DesignAgent.": (
+        "Однородность экспериментальных протоколов подтверждена. Переход к этапу генерации."
+    ),
+    "Approved candidates satisfying all user constraints. Synthesized final report.": (
+        "Кандидаты удовлетворяют всем ограничениям. Сформирован итоговый аналитический отчёт."
+    ),
+}
+
+
+def _translate_preferred_types(pref_str: str) -> str:
+    """Преобразует список типов трансформаций из Python-представления в читаемый русский текст."""
+    cleaned = pref_str.strip("[]").replace("'", "").replace('"', "")
+    tokens = [t.strip() for t in cleaned.split(",") if t.strip()]
+    if not tokens:
+        return "любые"
+    ru_tokens = [_TRANSFORMATION_TYPE_RU.get(t, t) for t in tokens]
+    return ", ".join(ru_tokens)
+
 
 def _format_readable_fragment(frag: str) -> str:
     """Преобразует фрагмент SMILES с точкой крепления `[*:1]` в читаемое обозначение заместителя."""
@@ -153,7 +203,7 @@ def _localize_trace_summary(raw_text: str) -> str:
 
     # Курация
     m_cur = re.match(
-        r"^Curated\s+(\d+)\s+molecules\s+\(dropped\s+(\d+)\s+invalid,\s+(\d+)\s+censored,\s+(\d+)\s+duplicates\)\.\s*Dominant BAO:\s*(\S+)\s*\(homogeneous=(True|False)\)\.?$",
+        r"^Curated\s+(\d+)\s+molecules\s+\(dropped\s+(\d+)\s+invalid,\s+(\d+)\s+censored,\s+(\d+)\s+duplicates\)\.\s*Dominant BAO:\s*(.+?)\s*\(homogeneous=(True|False)\)\.?$",
         text,
     )
     if m_cur:
@@ -163,6 +213,9 @@ def _localize_trace_summary(raw_text: str) -> str:
             f"Отобрано {n_mol} молекул (отсеяно: {n_inv} невал., {n_cens} цензур., {n_dup} дубл.). "
             f"Протокол BAO: {bao} (однородный: {homog_ru})."
         )
+    m_cur_short = re.match(r"^Curated\s+(\d+)\s+molecules\.?$", text)
+    if m_cur_short:
+        return f"Отобрано {m_cur_short.group(1)} молекул."
 
     # Анализ SAR
     m_sar = re.match(
@@ -179,15 +232,27 @@ def _localize_trace_summary(raw_text: str) -> str:
 
     # Генерация
     m_gen = re.match(
-        r"^Generated\s+(\d+)\s+candidate structures from\s+(\d+)\s+parent seeds\s*\(iteration=(\d+),\s*preferred_types=(.+)\)\.?$",
+        r"^Generated\s+(\d+)\s+candidate structures from\s+(\d+)\s+parent seeds\s*\((.*?)\)\.?$",
         text,
     )
     if m_gen:
-        n_cand, n_seeds, it_num, pref = m_gen.groups()
-        pref_ru = pref.replace("['any']", "любые").replace('["any"]', "любые")
+        n_cand, n_seeds, meta_str = m_gen.groups()
+        it_m = re.search(r"iteration=(\d+)", meta_str)
+        it_num = it_m.group(1) if it_m else "1"
+
+        methods_parts: list[str] = []
+        for key in ("SMIRKS", "CReM", "GraphGA"):
+            km = re.search(rf"\b{key}=(\d+)", meta_str)
+            if km:
+                methods_parts.append(f"{key}: {km.group(1)}")
+        methods_str = f", {', '.join(methods_parts)}" if methods_parts else ""
+
+        pref_m = re.search(r"preferred_types=(.+)$", meta_str)
+        pref_ru = _translate_preferred_types(pref_m.group(1)) if pref_m else "любые"
+
         return (
             f"Сгенерировано {n_cand} структур-кандидатов из {n_seeds} прототипов "
-            f"(итерация {it_num}, типы трансформаций: {pref_ru})."
+            f"(итерация {it_num}{methods_str}, типы: {pref_ru})."
         )
 
     # Оценка ADMET
@@ -202,7 +267,52 @@ def _localize_trace_summary(raw_text: str) -> str:
             f"Ограничения соблюдены: {sat}."
         )
 
-    return text.replace("Critic Agent:", "Верификация:")
+    # 3D-докинг
+    m_dock = re.match(
+        r"^status=([A-Za-z0-9_]+)\s*\|\s*pdb=([^|]+?)(?:\s*\(([^)]*)\))?\s*\|\s*docked=(\d+/\d+)\s*\|\s*best\s*ΔG=(.+?)\.?$",
+        text,
+    )
+    if m_dock:
+        st, pdb, src, docked, dg = m_dock.groups()
+        st_map = {
+            "SUCCESS": "Успешно",
+            "SKIPPED": "Пропущено",
+            "FAILED": "Ошибка",
+            "NO_RECEPTOR": "Рецептор не найден",
+        }
+        st_ru = st_map.get(st, st)
+
+        src_clean = (src or "").strip()
+        src_map = {
+            "DEMO_CACHE": "демо-кэш",
+            "RCSB_LIVE": "RCSB PDB",
+            "RCSB_CACHE": "RCSB кэш",
+            "LOCAL_PDB": "локальный PDB",
+            "None": "",
+            "N/A": "",
+        }
+        src_ru = src_map.get(src_clean, src_clean)
+
+        pdb_clean = pdb.strip()
+        if pdb_clean in ("None", "N/A", "-"):
+            pdb_str = "нет"
+        elif src_ru:
+            pdb_str = f"{pdb_clean} ({src_ru})"
+        else:
+            pdb_str = pdb_clean
+
+        dg_clean = dg.strip().replace("kcal/mol", "ккал/моль")
+        if dg_clean in ("None", "N/A", "-"):
+            dg_str = "Н/Д"
+        else:
+            dg_str = dg_clean
+
+        return f"Статус: {st_ru} | PDB: {pdb_str} | состыковано: {docked} | лучшая ΔG = {dg_str}."
+
+    if text in _ACTION_TRANSLATIONS:
+        return _ACTION_TRANSLATIONS[text]
+
+    return text.replace("Critic Agent:", "Верификация:").replace("Critic Agent", "Верификатор")
 
 
 class TopStatusBar:
@@ -415,7 +525,8 @@ class TopStatusBar:
                 ev = last_events.get(stage_key)
                 tip_parts = [f"Этап: {stage_label}"]
                 if ev is not None:
-                    tip_parts.append(f"{ev.output_summary} ({ev.duration_ms:.0f} мс)")
+                    loc_summary = _localize_trace_summary(ev.output_summary or ev.action_taken)
+                    tip_parts.append(f"{loc_summary} ({ev.duration_ms:.0f} мс)")
                 elif isinstance(node_telemetry, dict) and stage_key in node_telemetry:
                     tip_parts.append("Выполнен")
                 else:
@@ -438,8 +549,13 @@ class TopStatusBar:
 
                 def _on_node_click(sk: str = stage_key, sl: str = stage_label) -> None:
                     ev_local = last_events.get(sk)
+                    loc_msg = (
+                        _localize_trace_summary(ev_local.output_summary or ev_local.action_taken)
+                        if ev_local is not None
+                        else ""
+                    )
                     msg = (
-                        f"{sl}: {ev_local.output_summary}"
+                        f"{sl}: {loc_msg}"
                         if ev_local is not None
                         else f"{sl}: этап ещё не выполнялся"
                     )
@@ -719,7 +835,8 @@ class AgentRail:
                             card_cls = "w-full bg-[#ECFDF5] border border-[#059669] border-l-[3px] border-l-[#059669] p-2 gap-1 shadow-none"
                             text_cls = "text-xs text-[#065F46]"
                             badge_cls = "bg-[#059669] text-white"
-                            title_txt = "Утверждено (5/5)"
+                            m_val = re.search(r"\(валидных:\s*(\d+/\d+)\)", ev.output_summary or "")
+                            title_txt = f"Утверждено ({m_val.group(1)})" if m_val else "Утверждено"
                         else:
                             card_cls = "w-full bg-white border border-[#E2D9DD] p-2 gap-1 shadow-none"
                             text_cls = "text-xs text-[#1F181B]"
@@ -728,8 +845,11 @@ class AgentRail:
                                 if ev.fallback_triggered
                                 else "bg-[#8B495C] text-white"
                             )
-                            stage_ru = _AGENT_TO_RU.get(ev.agent_name, ev.agent_name)
-                            title_txt = stage_ru
+                            if ev.phase and "docking" in ev.phase:
+                                title_txt = "3D-докинг"
+                            else:
+                                stage_ru = _AGENT_TO_RU.get(ev.agent_name, ev.agent_name)
+                                title_txt = stage_ru
 
                         with ui.card().classes(card_cls):
                             with ui.row().classes("w-full items-center justify-between gap-1"):
@@ -764,9 +884,13 @@ class AgentRail:
                                 if param_chips:
                                     with ui.row().classes("w-full gap-1 flex-wrap"):
                                         for chip in param_chips[:10]:
+                                            src_meta = PARAM_SOURCE_BADGE_META.get(
+                                                chip["source"], (chip["source"], "slate")
+                                            )
+                                            src_title = src_meta[0] or "По умолчанию"
                                             ui.label(chip["label"]).classes(
                                                 "text-[10px] mono-code px-1 py-0"
-                                            ).tooltip(f"Источник: {chip['source']}")
+                                            ).tooltip(f"Источник: {src_title}")
 
     def _render_state_json_spoiler(self) -> None:
         if self._state_spoiler_box is None:
