@@ -9,12 +9,18 @@ from typing import Any
 
 from nicegui import run, ui
 
+from pishovichok.core.evaluation import resolve_generation_method_label
 from pishovichok.core.rendering import generate_3d_conformer_molblock
 from pishovichok.state.graph_state import resolve_tool_config
 from pishovichok.state.schemas import ToolConfig
 from pishovichok.ui.components.chem_widgets import MoleculeViewer3D
 from pishovichok.ui.icons import svg_icon
 from pishovichok.ui.session import SessionRuntime
+from pishovichok.ui.state_vm import (
+    AD_TANIMOTO_THRESHOLD,
+    DOCKING_STRONG_BENCHMARK_KCAL,
+    resolve_receptor_display_name,
+)
 
 
 def build_inspector_telemetry_summary(tool_config: ToolConfig) -> dict[str, str]:
@@ -651,9 +657,36 @@ class InspectorPane:
                         f"/api/sessions/{sid}/mol/{cid}/svg?variant=parent&width=480&height=220"
                     ).classes("w-full h-[150px] object-contain bg-white")
 
-                with ui.row().classes("w-full items-center justify-center gap-1 text-[#64748B] py-0"):
+                with ui.row().classes("w-full items-center justify-center gap-1.5 text-[#64748B] py-0 flex-wrap"):
                     ui.html(svg_icon("arrow_down", 13), sanitize=False)
-                    ui.label(f"{row.method_rule_label}").classes("text-[10px] font-mono")
+                    gen_method = row.resolved_generation_method or resolve_generation_method_label(
+                        cand.hypothesis_rationale.generation_origin
+                    )
+                    gen_badge_cls = {
+                        "MMP SMIRKS": "bg-[#EDE9FE] text-[#5B21B6] border-[#DDD6FE]",
+                        "Изостера CReM": "bg-[#ECFDF5] text-[#065F46] border-[#A7F3D0]",
+                        "Генеративная модель": "bg-[#EFF6FF] text-[#1E40AF] border-[#BFDBFE]",
+                    }.get(gen_method, "bg-[#F1F5F9] text-[#334155] border-[#CBD5E1]")
+                    ui.label(gen_method).classes(
+                        f"text-[10px] font-semibold px-1.5 py-0.5 rounded border {gen_badge_cls}"
+                    )
+                    ui.label(f"{cand.hypothesis_rationale.rule_id}").classes("text-[10px] font-mono")
+                    tc_val = cand.calc_rdkit.tanimoto_to_parent
+                    if tc_val is not None:
+                        in_ad = tc_val >= AD_TANIMOTO_THRESHOLD
+                        ad_cls = (
+                            "bg-[#ECFDF5] text-[#065F46] border-[#A7F3D0]"
+                            if in_ad
+                            else "bg-[#FFFBEB] text-[#92400E] border-[#FDE68A]"
+                        )
+                        ad_txt = (
+                            f"Tc {tc_val:.2f} · В домене (AD)"
+                            if in_ad
+                            else f"Tc {tc_val:.2f} · Экстраполяция"
+                        )
+                        ui.label(ad_txt).classes(
+                            f"text-[10px] font-semibold px-1.5 py-0.5 rounded border {ad_cls}"
+                        )
 
                 delta_cls = (
                     "text-[#065F46] bg-[#ECFDF5]"
@@ -776,10 +809,52 @@ class InspectorPane:
                         if dock.docking_score_kcal is not None
                         else "-"
                     )
+                    receptor_name = resolve_receptor_display_name(
+                        dock.pdb_id, dock.receptor_name
+                    )
+                    receptor_display = (
+                        f"{receptor_name} · PDB {dock.pdb_id}"
+                        if receptor_name and dock.pdb_id
+                        else (dock.pdb_id or "-")
+                    )
+                    is_strong_bind = (
+                        dock.docking_score_kcal is not None
+                        and dock.docking_score_kcal <= DOCKING_STRONG_BENCHMARK_KCAL
+                    )
+                    quality_txt = (
+                        f"Сильное (≤ {DOCKING_STRONG_BENCHMARK_KCAL:.1f} ккал/моль)"
+                        if is_strong_bind
+                        else f"Умеренное/слабое (> {DOCKING_STRONG_BENCHMARK_KCAL:.1f} ккал/моль)"
+                    )
+                    quality_badge_cls = (
+                        "bg-[#ECFDF5] text-[#065F46] border-[#A7F3D0]"
+                        if is_strong_bind
+                        else "bg-[#FFFBEB] text-[#92400E] border-[#FDE68A]"
+                    )
+                    parent_dg = dock.parent_docking_score_kcal
+                    delta_dg = (
+                        round(dock.docking_score_kcal - parent_dg, 2)
+                        if (dock.docking_score_kcal is not None and parent_dg is not None)
+                        else None
+                    )
+                    delta_txt = (
+                        f"{delta_dg:+.2f} ккал/моль (родитель: {parent_dg:.2f})"
+                        if delta_dg is not None and parent_dg is not None
+                        else "Н/Д"
+                    )
+                    with ui.row().classes("w-full items-center gap-1.5 flex-wrap"):
+                        ui.label(f"ΔG = {dg_val}").classes(
+                            "text-[11px] font-semibold text-[#0F172A] px-1.5 py-0.5 rounded bg-[#F8FAFC] border border-[#E2E8F0]"
+                        )
+                        ui.label(quality_txt).classes(
+                            f"text-[10px] font-semibold px-1.5 py-0.5 rounded border {quality_badge_cls}"
+                        )
                     with ui.grid(columns=2).classes("w-full gap-1.5"):
                         for k_lbl, v_txt in (
-                            ("PDB мишени", f"{dock.pdb_id or '-'} ({src_ru})"),
-                            ("Энергия ΔG", dg_val),
+                            ("Рецептор / PDB", receptor_display),
+                            ("Ориентир качества", quality_txt),
+                            ("Δ к родителю", delta_txt),
+                            ("Источник PDB", f"{dock.pdb_id or '-'} ({src_ru})"),
                             ("Движок 3D", dock.backend or "-"),
                             ("Статус", "Успешно"),
                         ):
@@ -869,6 +944,7 @@ class InspectorPane:
                     ("TPSA", f"{cand.calc_rdkit.tpsa:.1f}"),
                     ("SAscore", f"{cand.calc_rdkit.sa_score:.2f}"),
                     ("QED", f"{cand.calc_rdkit.qed:.2f}"),
+                    ("Танимото (AD)", row.ad_status_label),
                     (
                         "Фильтры",
                         f"PAINS: {cand.calc_rdkit.pains_alerts_count}, Brenk: {cand.calc_rdkit.brenk_alerts_count}",
@@ -909,7 +985,8 @@ class InspectorPane:
                     ", ".join(row.violations) if row.violations else "Соответствует"
                 )
                 sar_items: list[tuple[str, str]] = [
-                    ("Метод", origin_ru),
+                    ("Источник генерации", row.resolved_generation_method or origin_ru),
+                    ("Метод / детали", origin_ru),
                     ("Правило", cand.hypothesis_rationale.rule_id),
                     ("Ограничения", violations_txt),
                     ("Индекс MPO", f"{row.mpo_score:.3f}"),

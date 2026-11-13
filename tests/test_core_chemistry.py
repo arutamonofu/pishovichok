@@ -1027,3 +1027,34 @@ def test_generate_graph_ga_candidates_respects_constraints() -> None:
     assert rule_ids.intersection({"GEN-GA", "CREM-GROW"})
 
 
+def test_applicability_domain_tanimoto_and_generation_method_calculation() -> None:
+    """Проверяет расчёт tanimoto_to_parent (Morgan) и метки generation_method в CalcRDKitMetrics."""
+    parent = "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1"
+    analog = "COc1cc2ncnc(Nc3ccc(F)cc3)c2cc1OCCCN1CCOCC1"
+    unrelated = "CC(=O)Oc1ccccc1C(=O)O"
+
+    same_metrics = calculate_rdkit_metrics(
+        parent, parent, generation_origin="mmp_smirks_rule"
+    )
+    assert same_metrics.tanimoto_to_parent == pytest.approx(1.0)
+    assert same_metrics.generation_method == "MMP SMIRKS"
+
+    analog_metrics = calculate_rdkit_metrics(
+        analog, parent, generation_origin="crem_fragment_replacement"
+    )
+    assert analog_metrics.tanimoto_to_parent is not None
+    assert 0.5 <= analog_metrics.tanimoto_to_parent < 1.0
+    assert analog_metrics.generation_method == "Изостера CReM"
+
+    ref_metrics = calculate_rdkit_metrics(
+        analog,
+        None,
+        reference_mols_or_smiles=[unrelated, parent],
+        generation_origin="graph_ga",
+    )
+    assert ref_metrics.tanimoto_to_parent == pytest.approx(
+        analog_metrics.tanimoto_to_parent
+    )
+    assert ref_metrics.generation_method == "Генеративная модель"
+
+

@@ -64,11 +64,26 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
     raw_candidates = [GeneratedRawCandidate.model_validate(c) for c in raw_data]
 
     # 2. Детерминированный расчет, ADMET и многопараметрический скоринг Харрингтона
+    active_ref_smiles: list[str] | None = None
+    curated_ptr_for_ad = state.get("dataset_uri")
+    if curated_ptr_for_ad is not None and Path(curated_ptr_for_ad.uri).is_file():
+        try:
+            active_seeds = select_parent_seeds_from_curated(
+                curated_ptr_for_ad,
+                constraints,
+                max_parents=30,
+                tool_config=tool_config,
+            )
+            active_ref_smiles = [s.canonical_smiles for s in active_seeds if s.canonical_smiles]
+        except Exception:
+            active_ref_smiles = None
+
     _cand_pointer, evaluated_pool = evaluate_and_rank_candidates(
         raw_candidates=raw_candidates,
         constraints=constraints,
         session_dir=session_dir,
         filename=f"evaluated_candidates_it{iteration}.parquet",
+        active_reference_smiles=active_ref_smiles,
         tool_config=tool_config,
     )
 
@@ -136,6 +151,8 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
             "LOCAL_PDB": "локальный PDB",
         }.get(str(_src_raw or ""), str(_src_raw or "Н/Д"))
         _pdb_val = docking_summary.get("pdb_id") or "Н/Д"
+        _rec_name = docking_summary.get("receptor_name")
+        _rec_label = f"{_rec_name} / PDB {_pdb_val}" if _rec_name else f"PDB {_pdb_val}"
         docking_events.append(
             TraceEvent(
                 step_index=step_idx_base,
@@ -150,7 +167,7 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
                     "Подготовлен карман рецептора (кэш/RCSB PDB), выполнен 3D-докинг и профилирование взаимодействий."
                 ),
                 output_summary=(
-                    f"Статус: {_st_ru} | PDB: {_pdb_val} ({_src_ru}) | "
+                    f"Статус: {_st_ru} | Рецептор: {_rec_label} ({_src_ru}) | "
                     f"состыковано: {docking_summary.get('success_count', 0)}/{docking_summary.get('docked_count', 0)} | "
                     f"лучшая ΔG = {dg_text}."
                 ),
@@ -170,6 +187,7 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
             "docked_count": 0,
             "success_count": 0,
             "pdb_id": custom_pdb_id,
+            "receptor_name": None,
             "source": None,
             "best_score_kcal": None,
             "message": skip_reason,
@@ -234,6 +252,18 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
 
     valid_count = sum(1 for c in enriched_top if c.passes_all_constraints)
     top_score = enriched_top[0].mpo_harrington_score if enriched_top else 0.0
+    in_ad_count = sum(
+        1
+        for c in evaluated_pool
+        if c.calc_rdkit.tanimoto_to_parent is not None
+        and c.calc_rdkit.tanimoto_to_parent >= 0.5
+    )
+    extrapolation_count = sum(
+        1
+        for c in evaluated_pool
+        if c.calc_rdkit.tanimoto_to_parent is not None
+        and c.calc_rdkit.tanimoto_to_parent < 0.5
+    )
 
     output_text = (
         f"Оценено кандидатов: {len(evaluated_pool)}; выбрано топ-{len(enriched_top)} "
@@ -284,9 +314,15 @@ def evaluation_node(state: SARGraphState) -> dict[str, Any]:
             "evaluated_pool_count": len(evaluated_pool),
             "top_k_count": len(enriched_top),
             "valid_top_k_count": valid_count,
+            "in_ad_count": in_ad_count,
+            "extrapolation_count": extrapolation_count,
             "max_harrington_d": round(top_score, 4),
+            "docking_mode": docking_mode,
             "docking_status": docking_summary.get("status"),
+            "docking_docked_count": docking_summary.get("docked_count", 0),
+            "docking_success_count": docking_summary.get("success_count", 0),
             "docking_pdb_id": docking_summary.get("pdb_id"),
+            "docking_receptor_name": docking_summary.get("receptor_name"),
             "docking_best_dg_kcal": docking_summary.get("best_score_kcal"),
             "duration_ms": round(duration_ms, 2),
         },

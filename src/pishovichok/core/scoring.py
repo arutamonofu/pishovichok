@@ -386,7 +386,10 @@ def evaluate_lead_reference(
         raise ValueError(f"Invalid lead SMILES: {lead_seed.canonical_smiles}")
 
     calc_metrics = calculate_rdkit_metrics(
-        lead_mol, parent_mol_or_smiles=lead_mol, tool_config=cfg
+        lead_mol,
+        parent_mol_or_smiles=lead_mol,
+        generation_origin="mmp_smirks_rule",
+        tool_config=cfg,
     )
     admet_metrics = predict_admet_metrics(
         mol_or_smiles=lead_mol,
@@ -457,6 +460,7 @@ def evaluate_and_rank_candidates(
     *,
     filename: str = "evaluated_candidates.parquet",
     preferred_admet_backend: ADMETBackendLiteral | None = None,
+    active_reference_smiles: list[str] | None = None,
     tool_config: ToolConfig | None = None,
 ) -> tuple[ParquetPointer, list[CandidateMolecule]]:
     """Оценивает пул сгенерированных кандидатов, сохраняет `evaluated_candidates.parquet` и ранжирует их.
@@ -482,6 +486,8 @@ def evaluate_and_rank_candidates(
         calc_metrics = calculate_rdkit_metrics(
             mol_or_smiles=cand_mol,
             parent_mol_or_smiles=parent_mol,
+            reference_mols_or_smiles=active_reference_smiles,
+            generation_origin=raw_cand.generation_origin,
             tool_config=cfg,
         )
         admet_metrics = predict_admet_metrics(

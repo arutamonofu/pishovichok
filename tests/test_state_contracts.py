@@ -706,4 +706,24 @@ def test_from_flat_parquet_record_handles_nan_and_empty_optional_fields() -> Non
     assert restored.highlighted_atom_indices == []
 
 
+def test_tanimoto_and_generation_method_roundtrip_and_disjointness() -> None:
+    """Проверяет сохранение tanimoto_to_parent и generation_method в calc_rdkit и Parquet-roundtrip."""
+    base = _sample_candidate()
+    calc_with_ad = base.calc_rdkit.model_copy(
+        update={"tanimoto_to_parent": 0.6421, "generation_method": "MMP SMIRKS"}
+    )
+    cand = base.model_copy(update={"calc_rdkit": calc_with_ad})
+    cats = cand.to_four_category_dict()
+    assert cats["category_2_calculation"]["tanimoto_to_parent"] == pytest.approx(0.6421)
+    assert cats["category_2_calculation"]["generation_method"] == "MMP SMIRKS"
+    assert set(cats["category_2_calculation"]).isdisjoint(
+        set(cats["category_4_hypothesis"])
+    )
+
+    flat = cand.to_flat_parquet_record()
+    restored = CandidateMolecule.from_flat_parquet_record(flat)
+    assert restored.calc_rdkit.tanimoto_to_parent == pytest.approx(0.6421)
+    assert restored.calc_rdkit.generation_method == "MMP SMIRKS"
+
+
 

@@ -398,3 +398,61 @@ def test_parquet_roundtrip_and_standalone_docking_route(
     body = resp.json()
     assert body["status"] == "SUCCESS"
     assert rt.view_model.rows_by_id["C_MANUAL_01"].docking_status == "SUCCESS"
+    assert docked_cand.docking.receptor_name == "EGFR (Epidermal Growth Factor Receptor)"
+    assert docked_cand.docking.parent_docking_score_kcal is not None
+
+
+def test_critic_node_records_poor_docking_affinity_in_feedback_and_trace() -> None:
+    """Если докинг включён и ΔG > -6.0 ккал/моль, critic_node фиксирует это в feedback и TraceEvent."""
+    from pishovichok.agents.critic_node import critic_node
+    from pishovichok.state import create_initial_graph_state
+
+    weak_dock = DockingResult(
+        status="SUCCESS",
+        pdb_id="1M17",
+        receptor_name="EGFR (Epidermal Growth Factor Receptor)",
+        source="DEMO_CACHE",
+        docking_score_kcal=-5.2,
+        parent_docking_score_kcal=-7.8,
+        backend="RDKit-MMFF94-3D",
+    )
+    cand = _sample_candidate("C_WEAK_DOCK").model_copy(update={"docking": weak_dock})
+
+    # 1. Итерация < max_iterations -> redesign_molecules с фиксацией докинга
+    state_redesign = create_initial_graph_state(
+        user_query="Оптимизируй ингибитор EGFR CHEMBL203",
+        session_id="critic_dock_redesign",
+        workspace_dir="/tmp",
+    )
+    state_redesign["last_executed_stage"] = "evaluation"
+    state_redesign["design_iteration"] = 1
+    state_redesign["top_candidates"] = [cand]
+    state_redesign["tool_config"] = ToolConfig(docking_mode="auto_top_k", max_iterations=2)
+
+    out_redesign = critic_node(state_redesign)
+    assert out_redesign["critic_verdict"] == "redesign_molecules"
+    assert "-6.0" in out_redesign["critic_feedback"]
+    assert "3D-докинг" in out_redesign["critic_feedback"]
+    assert out_redesign["node_telemetry"]["critic"]["stats"]["poor_docking_affinity"] is True
+    ev_redesign = out_redesign["trace_log"][0]
+    assert "Weak docking affinity" in ev_redesign.action_taken
+    assert "-6.0" in ev_redesign.output_summary
+
+    # 2. Исчерпан лимит итераций -> approve, но с предупреждением о докинге в feedback и трассе
+    state_approve = create_initial_graph_state(
+        user_query="Оптимизируй ингибитор EGFR CHEMBL203",
+        session_id="critic_dock_approve",
+        workspace_dir="/tmp",
+    )
+    state_approve["last_executed_stage"] = "evaluation"
+    state_approve["design_iteration"] = 2
+    state_approve["top_candidates"] = [cand]
+    state_approve["tool_config"] = ToolConfig(docking_mode="auto_top_k", max_iterations=2)
+
+    out_approve = critic_node(state_approve)
+    assert out_approve["critic_verdict"] == "approve"
+    assert "-6.0" in out_approve["critic_feedback"]
+    assert "3D-докинг" in out_approve["critic_feedback"]
+    ev_approve = out_approve["trace_log"][0]
+    assert "Weak 3D docking binding energy" in ev_approve.action_taken or "weak 3D docking binding energy" in ev_approve.action_taken
+    assert "-6.0" in ev_approve.output_summary

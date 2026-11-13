@@ -228,6 +228,16 @@ class CalcRDKitMetrics(BaseModel):
         ...,
         description="Точный сдвиг полярной поверхности относительно родителя (TPSA_cand - TPSA_parent)",
     )
+    tanimoto_to_parent: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Структурное сходство Танимото (Morgan/ECFP) к родительской молекуле или максимуму по активным соединениям мишени",
+    )
+    generation_method: str = Field(
+        default="",
+        description="Явная метка метода генерации (MMP SMIRKS / Изостера CReM / Генеративная модель)",
+    )
 
 
 # ============================================================================
@@ -341,8 +351,10 @@ class DockingResult(BaseModel):
 
     status: Literal["PENDING", "SUCCESS", "SKIPPED", "FAILED"] = "PENDING"
     pdb_id: str | None = None
+    receptor_name: str | None = None
     source: str | None = None
     docking_score_kcal: float | None = None
+    parent_docking_score_kcal: float | None = None
     backend: str | None = None
     interactions: dict[str, list[str]] = Field(default_factory=dict)
     pose_sdf_path: str | None = None

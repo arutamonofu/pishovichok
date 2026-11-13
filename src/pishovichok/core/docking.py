@@ -21,7 +21,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen, Lipinski, rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
-from pishovichok.config import DOCKING_MAX_BOX_VOLUME
+from pishovichok.config import DEMO_RECEPTOR_PRESETS, DOCKING_MAX_BOX_VOLUME
 from pishovichok.core.receptor_resolver import resolve_receptor
 
 PROLIF_INTERACTION_TYPES: tuple[str, ...] = (
@@ -467,10 +467,21 @@ def run_docking(
         custom_box_center=custom_box_center,
         receptors_dir=receptors_dir,
     )
+    receptor_name = (
+        str(receptor_meta.get("target_name") or receptor_meta.get("receptor_name"))
+        if (receptor_meta.get("target_name") or receptor_meta.get("receptor_name"))
+        else (
+            str(DEMO_RECEPTOR_PRESETS[target_str.upper()]["target_name"])
+            if target_str.upper() in DEMO_RECEPTOR_PRESETS
+            and DEMO_RECEPTOR_PRESETS[target_str.upper()].get("target_name")
+            else None
+        )
+    )
     if receptor_meta.get("status") != "READY":
         return {
             "status": "SKIPPED",
             "pdb_id": receptor_meta.get("pdb_id"),
+            "receptor_name": receptor_name,
             "message": receptor_meta.get(
                 "reason",
                 "Экспериментальная 3D-структура мишени не найдена — докинг пропущен.",
@@ -499,6 +510,7 @@ def run_docking(
         return {
             "status": "FAILED",
             "pdb_id": receptor_meta.get("pdb_id"),
+            "receptor_name": receptor_name,
             "source": receptor_meta.get("source"),
             "box_center": eff_box_center,
             "box_size": eff_box_size,
@@ -528,6 +540,7 @@ def run_docking(
         return {
             "status": "FAILED",
             "pdb_id": receptor_meta.get("pdb_id"),
+            "receptor_name": receptor_name,
             "source": receptor_meta.get("source"),
             "box_center": eff_box_center,
             "box_size": eff_box_size,
@@ -539,6 +552,7 @@ def run_docking(
         return {
             "status": "FAILED",
             "pdb_id": receptor_meta.get("pdb_id"),
+            "receptor_name": receptor_name,
             "source": receptor_meta.get("source"),
             "box_center": eff_box_center,
             "box_size": eff_box_size,
@@ -558,6 +572,7 @@ def run_docking(
     return {
         "status": worker_res.get("status", "FAILED"),
         "pdb_id": receptor_meta.get("pdb_id"),
+        "receptor_name": receptor_name,
         "source": receptor_meta.get("source"),
         "docking_score_kcal": worker_res.get("docking_score_kcal"),
         "backend": worker_res.get("backend"),

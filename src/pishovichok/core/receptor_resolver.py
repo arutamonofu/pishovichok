@@ -478,6 +478,8 @@ def generate_minimal_demo_receptor(
         meta["status"] = "READY"
         meta["pdb_path"] = pdb_path.as_posix()
         meta["pdbqt_path"] = pdbqt_path.as_posix()
+        if not meta.get("target_name") and preset.get("target_name"):
+            meta["target_name"] = str(preset["target_name"])
         return meta
 
     cx, cy, cz = [float(v) for v in preset["box_center"]]
@@ -553,6 +555,7 @@ def generate_minimal_demo_receptor(
     meta: dict[str, Any] = {
         "status": "READY",
         "target_id": target_clean,
+        "target_name": str(preset.get("target_name") or target_clean),
         "pdb_id": pdb_id,
         "source": "DEMO_CACHE",
         "pdb_path": pdb_path.as_posix(),
@@ -619,6 +622,11 @@ def resolve_receptor(
             cached_meta["status"] = "READY"
             cached_meta["pdb_path"] = pdb_path.as_posix()
             cached_meta["pdbqt_path"] = pdbqt_path.as_posix()
+            if not cached_meta.get("target_name"):
+                if preset and preset.get("target_name"):
+                    cached_meta["target_name"] = str(preset["target_name"])
+                elif target_clean:
+                    cached_meta["target_name"] = target_clean
             if custom_box_center is not None and len(custom_box_center) == 3:
                 cached_meta["box_center"] = [float(v) for v in custom_box_center]
                 cached_meta["box_size"] = [20.0, 20.0, 20.0]
@@ -691,9 +699,15 @@ def resolve_receptor(
     pdbqt_path.write_text("".join(pdbqt_lines), encoding="utf-8")
 
     source_label = "DEMO_CACHE" if (preset is not None and pdb_override is None) else "RCSB_LIVE"
+    resolved_target_name = (
+        str(preset["target_name"])
+        if preset is not None and preset.get("target_name")
+        else (target_clean or resolved_pdb_id)
+    )
     meta = {
         "status": "READY",
         "target_id": target_clean or None,
+        "target_name": resolved_target_name,
         "pdb_id": resolved_pdb_id,
         "source": source_label,
         "pdb_path": pdb_path.as_posix(),

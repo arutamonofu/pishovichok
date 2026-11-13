@@ -30,6 +30,8 @@ from pishovichok.state.graph_state import (
 )
 from pishovichok.state.schemas import TraceEvent
 
+DOCKING_POOR_AFFINITY_THRESHOLD_KCAL: float = -6.0
+
 
 def critic_node(state: SARGraphState) -> dict[str, Any]:
     """Узел Critic Agent: аудит однородности протоколов и валидация физико-химического профиля."""
@@ -181,6 +183,8 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
         )
         target_k = min(effective_top_k, len(top_candidates)) if top_candidates else 1
 
+        docking_mode = str(state.get("docking_mode") or tool_config.docking_mode or "skip")
+        docking_enabled = docking_mode != "skip"
         docked_top = [
             c
             for c in top_candidates
@@ -188,12 +192,19 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             and c.docking.status == "SUCCESS"
             and c.docking.docking_score_kcal is not None
         ]
-        poor_docking_affinity = bool(docked_top) and all(
-            float(c.docking.docking_score_kcal) > -6.5  # type: ignore[union-attr]
-            for c in docked_top
+        best_docking_kcal: float | None = (
+            min(float(c.docking.docking_score_kcal) for c in docked_top)  # type: ignore[arg-type]
+            if docked_top
+            else None
+        )
+        poor_docking_affinity = bool(
+            docking_enabled
+            and docked_top
+            and best_docking_kcal is not None
+            and best_docking_kcal > DOCKING_POOR_AFFINITY_THRESHOLD_KCAL
         )
 
-        # Петля №2: если кандидаты не удовлетворяют ограничениям (или все докированные кандидаты слабо связываются > -6.5) и лимит итераций не исчерпан
+        # Петля №2: если кандидаты не удовлетворяют ограничениям (или докированные топ-кандидаты слабо связываются > -6.0 ккал/моль) и лимит итераций не исчерпан
         needs_loop2_redesign = (
             (
                 (
@@ -205,12 +216,17 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             and (design_it < tool_config.max_iterations)
         )
 
+        docking_warning_note = ""
+        if poor_docking_affinity and best_docking_kcal is not None:
+            docking_warning_note = (
+                f"3D-докинг: у лучших кандидатов расчетная энергия связывания хуже порога "
+                f"(лучшая ΔG = {best_docking_kcal:.2f} > {DOCKING_POOR_AFFINITY_THRESHOLD_KCAL:.1f} ккал/моль)."
+            )
+
         if needs_loop2_redesign:
             reasons = [viol for c in top_candidates for viol in c.constraint_violations]
-            if poor_docking_affinity:
-                reasons.append(
-                    "Все докированные топ-кандидаты имеют слабую расчетную энергию связывания (ΔG > -6.5 ккал/моль)"
-                )
+            if poor_docking_affinity and docking_warning_note:
+                reasons.append(docking_warning_note)
             if not reasons:
                 reasons = [
                     "Недостаточное число кандидатов, удовлетворяющих целевым ограничениям"
@@ -223,6 +239,8 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
                     tool_config=tool_config,
                 )
             )
+            if poor_docking_affinity and docking_warning_note and "докинг" not in feedback_text.lower():
+                feedback_text = f"{feedback_text} {docking_warning_note}"
             critic_overrides: dict[str, Any] = {
                 "max_candidates_pool": min(tool_config.max_candidates_pool + 15, 200),
                 "crem_max_replacements": min(tool_config.crem_max_replacements + 15, 200),
@@ -261,10 +279,19 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
                     "verdict": "redesign_molecules",
                     "valid_count": valid_count,
                     "target_k": target_k,
+                    "docking_enabled": docking_enabled,
+                    "docked_top_count": len(docked_top),
+                    "best_docking_kcal": round(best_docking_kcal, 2) if best_docking_kcal is not None else None,
+                    "poor_docking_affinity": poor_docking_affinity,
                     "critic_overrides": changed_keys,
                     "duration_ms": round(duration_ms, 2),
                 },
             }
+            dock_action_suffix = (
+                f" | Weak docking affinity detected (best={best_docking_kcal:.2f} > {DOCKING_POOR_AFFINITY_THRESHOLD_KCAL:.1f} kcal/mol)."
+                if poor_docking_affinity and best_docking_kcal is not None
+                else ""
+            )
             trace_event = TraceEvent(
                 step_index=step_idx,
                 timestamp_iso=datetime.now(tz=UTC).isoformat(),
@@ -273,10 +300,16 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
                 input_summary=(
                     f"Top {len(top_candidates)} candidates | valid: {valid_count}/{target_k} | "
                     f"design_iteration={design_it}"
+                    + (
+                        f" | best_dG={best_docking_kcal:.2f} kcal/mol"
+                        if best_docking_kcal is not None
+                        else ""
+                    )
                 ),
                 action_taken=(
                     f"Detected target metric violations. Triggered Loop 2 (redesign_molecules) "
                     f"with updated constraints: {updated_constraints.preferred_substituent_types}"
+                    f"{dock_action_suffix}"
                 ),
                 output_summary=feedback_text,
                 verdict_or_routing="redesign_molecules",
@@ -298,6 +331,13 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             f"(валидных: {valid_count}/{len(top_candidates)}). "
             f"Сформирован итоговый аналитический отчет."
         )
+        if poor_docking_affinity and docking_warning_note:
+            approval_feedback = f"{approval_feedback} {docking_warning_note}"
+        elif docking_enabled and docked_top and best_docking_kcal is not None:
+            approval_feedback = (
+                f"{approval_feedback} 3D-докинг: лучшая ΔG = {best_docking_kcal:.2f} ккал/моль "
+                f"(состыковано {len(docked_top)})."
+            )
 
         # Все ограничения выполнены либо исчерпан лимит итераций (выдача компромиссного топа)
         report_md, fallback_report = llm_adapter.generate_final_report(
@@ -312,13 +352,18 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             design_iteration=design_it,
         )
 
-        is_compromise = valid_count < target_k
+        is_compromise = valid_count < target_k or poor_docking_affinity
         action_desc = (
             "Approved candidates satisfying all user constraints. Synthesized final report."
             if not is_compromise
             else f"Design iteration limit reached ({design_it}). Approved best compromise candidates "
             f"ranked by Harrington desirability with explicit violation tags."
         )
+        if poor_docking_affinity and best_docking_kcal is not None:
+            action_desc += (
+                f" Flagged weak 3D docking binding energy "
+                f"(best={best_docking_kcal:.2f} > {DOCKING_POOR_AFFINITY_THRESHOLD_KCAL:.1f} kcal/mol)."
+            )
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         node_telemetry["critic"] = {
@@ -334,6 +379,10 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
                 "valid_count": valid_count,
                 "target_k": target_k,
                 "is_compromise": is_compromise,
+                "docking_enabled": docking_enabled,
+                "docked_top_count": len(docked_top),
+                "best_docking_kcal": round(best_docking_kcal, 2) if best_docking_kcal is not None else None,
+                "poor_docking_affinity": poor_docking_affinity,
                 "duration_ms": round(duration_ms, 2),
             },
         }
@@ -345,6 +394,11 @@ def critic_node(state: SARGraphState) -> dict[str, Any]:
             input_summary=(
                 f"Final portfolio: {len(top_candidates)} candidates | "
                 f"top Harrington D={top_candidates[0].mpo_harrington_score if top_candidates else 0.0:.3f}"
+                + (
+                    f" | best_dG={best_docking_kcal:.2f} kcal/mol"
+                    if best_docking_kcal is not None
+                    else ""
+                )
             ),
             action_taken=action_desc,
             output_summary=approval_feedback,

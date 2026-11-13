@@ -249,6 +249,95 @@ def format_node_telemetry_chips(
     return param_chips, stat_chips
 
 
+def build_node_execution_highlights(
+    stage_key: str,
+    telemetry: dict[str, Any] | None,
+) -> list[tuple[str, str]]:
+    """Формирует наглядные бейджи статистики методов генерации (Design) и статуса 3D-докинга (Evaluation)."""
+    if not isinstance(telemetry, dict):
+        return []
+    stats = telemetry.get("stats") or {}
+    params = telemetry.get("active_params") or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    if not isinstance(params, dict):
+        params = {}
+
+    badges: list[tuple[str, str]] = []
+    if stage_key == "design":
+        smirks_cnt = int(stats.get("smirks_candidates", 0) or 0)
+        crem_cnt = int(stats.get("crem_candidates", 0) or 0) + int(
+            stats.get("bioisostere_candidates", 0) or 0
+        )
+        ga_cnt = int(stats.get("graph_ga_candidates", 0) or 0)
+        badges.append(
+            (
+                f"MMP SMIRKS: {smirks_cnt}",
+                "bg-[#EDE9FE] text-[#5B21B6] border border-[#DDD6FE]",
+            )
+        )
+        badges.append(
+            (
+                f"Изостера CReM: {crem_cnt}",
+                "bg-[#ECFDF5] text-[#065F46] border border-[#A7F3D0]",
+            )
+        )
+        badges.append(
+            (
+                f"Генеративная модель: {ga_cnt}",
+                "bg-[#EFF6FF] text-[#1E40AF] border border-[#BFDBFE]",
+            )
+        )
+    elif stage_key == "evaluation":
+        dock_mode = str(stats.get("docking_mode") or params.get("docking_mode") or "auto_top_k")
+        dock_status = str(stats.get("docking_status") or "SKIPPED").upper()
+        dock_pdb = stats.get("docking_pdb_id")
+        dock_rec = stats.get("docking_receptor_name")
+        dock_best = stats.get("docking_best_dg_kcal")
+        dock_ok = stats.get("docking_success_count")
+        dock_tot = stats.get("docking_docked_count")
+
+        if dock_mode == "skip":
+            dock_label = "3D-докинг: Выключен"
+            dock_cls = "bg-[#F1F5F9] text-[#475569] border border-[#CBD5E1]"
+        elif dock_mode == "manual_only" and dock_status == "SKIPPED":
+            dock_label = "3D-докинг: Ручной режим"
+            dock_cls = "bg-[#EFF6FF] text-[#1E40AF] border border-[#BFDBFE]"
+        elif dock_status == "SUCCESS":
+            rec_part = f" · {dock_rec}" if dock_rec else ""
+            pdb_part = f" ({dock_pdb})" if dock_pdb else ""
+            cnt_part = (
+                f" {dock_ok}/{dock_tot}"
+                if dock_ok is not None and dock_tot is not None
+                else ""
+            )
+            dg_part = (
+                f" · лучшая ΔG {float(dock_best):.2f} ккал/моль"
+                if dock_best is not None
+                else ""
+            )
+            dock_label = f"3D-докинг: Успешно{cnt_part}{rec_part}{pdb_part}{dg_part}"
+            dock_cls = "bg-[#ECFDF5] text-[#065F46] border border-[#A7F3D0]"
+        elif dock_status == "FAILED":
+            dock_label = "3D-докинг: Ошибка расчёта"
+            dock_cls = "bg-[#FFF1F2] text-[#9F1239] border border-[#FECDD3]"
+        else:
+            dock_label = "3D-докинг: Пропущен"
+            dock_cls = "bg-[#FFFBEB] text-[#92400E] border border-[#FDE68A]"
+        badges.append((dock_label, dock_cls))
+
+        in_ad = stats.get("in_ad_count")
+        out_ad = stats.get("extrapolation_count")
+        if in_ad is not None or out_ad is not None:
+            badges.append(
+                (
+                    f"AD (Tc≥0.5): {int(in_ad or 0)} | Экстрап.: {int(out_ad or 0)}",
+                    "bg-[#F8FAFC] text-[#334155] border border-[#CBD5E1]",
+                )
+            )
+    return badges
+
+
 def _localize_trace_summary(raw_text: str) -> str:
     """Переводит шаблонные англоязычные сводки узлов графа на русский язык для UI."""
     text = (raw_text or "").strip()
@@ -817,21 +906,32 @@ def render_verification_journal(
                                     )
                                 ).classes(text_cls)
 
+                                stage_key = _AGENT_TO_STAGE.get(
+                                    ev.agent_name, ev.agent_name.lower()
+                                )
+                                telemetry = (
+                                    node_telemetry.get(stage_key)
+                                    if isinstance(node_telemetry, dict)
+                                    else None
+                                )
+                                if ev.agent_name in ("DesignAgent", "EvaluationAgent"):
+                                    highlights = build_node_execution_highlights(
+                                        stage_key, telemetry
+                                    )
+                                    if highlights:
+                                        with ui.row().classes("w-full gap-1 flex-wrap pt-0.5"):
+                                            for h_txt, h_cls in highlights:
+                                                ui.label(h_txt).classes(
+                                                    f"text-[10px] font-medium px-1.5 py-0.5 rounded {h_cls}"
+                                                )
+
                                 if is_expert:
-                                    stage_key = _AGENT_TO_STAGE.get(
-                                        ev.agent_name, ev.agent_name.lower()
-                                    )
-                                    telemetry = (
-                                        node_telemetry.get(stage_key)
-                                        if isinstance(node_telemetry, dict)
-                                        else None
-                                    )
                                     param_chips, stat_chips = format_node_telemetry_chips(
                                         telemetry, param_sources
                                     )
                                     if stat_chips:
                                         with ui.row().classes("w-full gap-1 flex-wrap"):
-                                            for sk, sv in stat_chips[:6]:
+                                            for sk, sv in stat_chips[:12]:
                                                 ui.label(f"{sk}={sv}").classes(
                                                     "text-[10px] mono-code px-1 py-0"
                                                 )

@@ -18,6 +18,7 @@ import contextlib
 import math
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from rdkit.Chem import (
 )
 from rdkit.ML.Descriptors import MoleculeDescriptors
 
+from pishovichok.core.fingerprints import compute_fp_similarity, compute_mol_fingerprint
 from pishovichok.state.schemas import CalcRDKitMetrics, ToolConfig
 
 _SASCORER_MODULE: Any = None
@@ -352,10 +354,34 @@ def compute_extra_rdkit_descriptors(
     return out
 
 
+GENERATION_METHOD_LABELS: dict[str, str] = {
+    "mmp_smirks_rule": "MMP SMIRKS",
+    "crem_fragment_replacement": "Изостера CReM",
+    "bioisostere_catalog": "Изостера CReM",
+    "graph_ga": "Генеративная модель",
+}
+
+
+def resolve_generation_method_label(
+    generation_origin: str | None = None,
+    explicit_method: str | None = None,
+) -> str:
+    """Возвращает человекочитаемую метку источника генерации для `calc_rdkit` и UI."""
+    if explicit_method and explicit_method.strip():
+        return explicit_method.strip()
+    if generation_origin and generation_origin.strip():
+        origin = generation_origin.strip()
+        return GENERATION_METHOD_LABELS.get(origin, origin)
+    return ""
+
+
 def calculate_rdkit_metrics(
     mol_or_smiles: Chem.Mol | str,
     parent_mol_or_smiles: Chem.Mol | str | None = None,
     *,
+    reference_mols_or_smiles: Sequence[Chem.Mol | str] | None = None,
+    generation_origin: str | None = None,
+    generation_method: str | None = None,
     tool_config: ToolConfig | None = None,
 ) -> CalcRDKitMetrics:
     """Вычисляет полный детерминированный профиль `CalcRDKitMetrics` (Категория 2 данных кандидата)."""
@@ -416,6 +442,39 @@ def calculate_rdkit_metrics(
         delta_clogp = 0.0
         delta_tpsa = 0.0
 
+    mol_fp = compute_mol_fingerprint(mol, fp_type="ecfp", fp_radius=2, fp_nbits=2048)
+    tanimoto_to_parent: float | None = None
+    if parent_mol is not None:
+        parent_fp = compute_mol_fingerprint(
+            parent_mol, fp_type="ecfp", fp_radius=2, fp_nbits=2048
+        )
+        tanimoto_to_parent = round(
+            compute_fp_similarity(mol_fp, parent_fp, metric="tanimoto"), 4
+        )
+    elif reference_mols_or_smiles:
+        best_sim: float | None = None
+        for ref_item in reference_mols_or_smiles:
+            ref_mol = (
+                Chem.MolFromSmiles(ref_item)
+                if isinstance(ref_item, str)
+                else ref_item
+            )
+            if ref_mol is None or ref_mol.GetNumAtoms() == 0:
+                continue
+            ref_fp = compute_mol_fingerprint(
+                ref_mol, fp_type="ecfp", fp_radius=2, fp_nbits=2048
+            )
+            sim = compute_fp_similarity(mol_fp, ref_fp, metric="tanimoto")
+            if best_sim is None or sim > best_sim:
+                best_sim = sim
+        if best_sim is not None:
+            tanimoto_to_parent = round(best_sim, 4)
+
+    resolved_method = resolve_generation_method_label(
+        generation_origin=generation_origin,
+        explicit_method=generation_method,
+    )
+
     return CalcRDKitMetrics(
         mw=mw,
         clogp=clogp,
@@ -439,6 +498,8 @@ def calculate_rdkit_metrics(
         brics_bonds_broken=brics_bonds_broken,
         delta_clogp_vs_parent=delta_clogp,
         delta_tpsa_vs_parent=delta_tpsa,
+        tanimoto_to_parent=tanimoto_to_parent,
+        generation_method=resolved_method,
     )
 
 
@@ -467,6 +528,7 @@ def evaluate_docking_batch(
             "docked_count": 0,
             "success_count": 0,
             "pdb_id": custom_pdb_id,
+            "receptor_name": None,
             "source": None,
             "best_score_kcal": None,
             "message": "Список кандидатов пуст — докинг не выполнялся.",
@@ -487,9 +549,11 @@ def evaluate_docking_batch(
     success_count = 0
     best_score: float | None = None
     last_pdb_id: str | None = custom_pdb_id
+    last_receptor_name: str | None = None
     last_source: str | None = None
     last_message: str | None = None
     overall_status = "SKIPPED"
+    parent_score_cache: dict[str, float | None] = {}
 
     for pos, idx in enumerate(target_indices):
         cand = updated_list[idx]
@@ -515,11 +579,41 @@ def evaluate_docking_batch(
         if res_status not in {"PENDING", "SUCCESS", "SKIPPED", "FAILED"}:
             res_status = "FAILED"
 
+        parent_dock_score: float | None = None
+        parent_smi = getattr(cand, "parent_smiles", None) or ""
+        if res_status == "SUCCESS" and parent_smi:
+            if (
+                parent_smi == cand.canonical_smiles
+                and dock_res.get("docking_score_kcal") is not None
+            ):
+                parent_score_cache[parent_smi] = float(dock_res["docking_score_kcal"])
+            elif parent_smi not in parent_score_cache:
+                parent_res = run_docking(
+                    ligand_smiles=parent_smi,
+                    target_id=target_id,
+                    exhaustiveness=exhaustiveness,
+                    custom_pdb_id=custom_pdb_id,
+                    custom_box_center=custom_box_center,
+                    receptors_dir=receptors_dir,
+                )
+                if (
+                    parent_res.get("status") == "SUCCESS"
+                    and parent_res.get("docking_score_kcal") is not None
+                ):
+                    parent_score_cache[parent_smi] = float(
+                        parent_res["docking_score_kcal"]
+                    )
+                else:
+                    parent_score_cache[parent_smi] = None
+            parent_dock_score = parent_score_cache.get(parent_smi)
+
         docking_model = DockingResult(
             status=res_status,  # type: ignore[arg-type]
             pdb_id=dock_res.get("pdb_id"),
+            receptor_name=dock_res.get("receptor_name"),
             source=dock_res.get("source"),
             docking_score_kcal=dock_res.get("docking_score_kcal"),
+            parent_docking_score_kcal=parent_dock_score,
             backend=dock_res.get("backend"),
             interactions=dock_res.get("interactions") or {},
             pose_sdf_path=pose_path,
@@ -559,6 +653,7 @@ def evaluate_docking_batch(
         )
 
         last_pdb_id = docking_model.pdb_id or last_pdb_id
+        last_receptor_name = docking_model.receptor_name or last_receptor_name
         last_source = docking_model.source or last_source
         last_message = docking_model.message or last_message
 
@@ -585,6 +680,7 @@ def evaluate_docking_batch(
         "docked_count": len(target_indices),
         "success_count": success_count,
         "pdb_id": last_pdb_id,
+        "receptor_name": last_receptor_name,
         "source": last_source,
         "best_score_kcal": best_score,
         "message": last_message,

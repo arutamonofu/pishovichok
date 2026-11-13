@@ -1,6 +1,7 @@
 {
   "status": "READY",
   "target_id": "CHEMBL262",
+  "target_name": "GSK-3β (Glycogen Synthase Kinase-3 beta)",
   "pdb_id": "1Q5K",
   "source": "DEMO_CACHE",
   "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL262.pdb",

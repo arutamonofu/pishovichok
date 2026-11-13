@@ -1251,4 +1251,102 @@ class TestRedesignActorMetaAndStatus:
         assert island._query_input.value == "Текущий активный запрос"
 
 
+def test_ad_badges_docking_benchmarks_and_rail_highlights() -> None:
+    """Проверяет бейджи AD/генерации, ориентир докинга (-7.0, дельта, рецептор) и детали Design/Evaluation."""
+    from pishovichok.state.schemas import DockingResult
+    from pishovichok.ui.components.agent_rail import build_node_execution_highlights
+    from pishovichok.ui.state_vm import StateViewModel
+
+    cand_in_ad = _make_dummy_candidate("C_AD_OK", pic50=8.2, clogp=3.5)
+    cand_in_ad = cand_in_ad.model_copy(
+        update={
+            "calc_rdkit": cand_in_ad.calc_rdkit.model_copy(
+                update={"tanimoto_to_parent": 0.78, "generation_method": "MMP SMIRKS"}
+            ),
+            "docking": DockingResult(
+                status="SUCCESS",
+                pdb_id="1M17",
+                receptor_name="EGFR (Epidermal Growth Factor Receptor)",
+                source="DEMO_CACHE",
+                docking_score_kcal=-8.4,
+                parent_docking_score_kcal=-7.6,
+                backend="RDKit-MMFF94-3D",
+            ),
+        }
+    )
+    cand_extrap = _make_dummy_candidate("C_AD_EXTRAP", pic50=7.8, clogp=3.2)
+    cand_extrap = cand_extrap.model_copy(
+        update={
+            "calc_rdkit": cand_extrap.calc_rdkit.model_copy(
+                update={"tanimoto_to_parent": 0.35, "generation_method": "Генеративная модель"}
+            ),
+            "docking": DockingResult(
+                status="SUCCESS",
+                pdb_id="1M17",
+                source="DEMO_CACHE",
+                docking_score_kcal=-6.2,
+                backend="RDKit-MMFF94-3D",
+            ),
+        }
+    )
+
+    vm = StateViewModel("s_ad_dock")
+    vm.upsert_candidates([cand_in_ad, cand_extrap])
+
+    row_ok = vm.rows_by_id["C_AD_OK"].to_aggrid_row("s_ad_dock")
+    assert row_ok["generation_method"] == "MMP SMIRKS"
+    assert row_ok["tanimoto_to_parent"] == pytest.approx(0.78)
+    assert "В домене" in row_ok["method_rule_html"]
+    assert "MMP SMIRKS" in row_ok["method_rule_html"]
+    assert row_ok["docking_delta_kcal"] == pytest.approx(-0.8)
+    assert "≤ -7.0" in row_ok["docking_dg_html"]
+    assert "Δ к родителю: -0.80" in row_ok["docking_dg_html"]
+    assert "EGFR" in row_ok["docking_receptor_html"]
+    assert "1M17" in row_ok["docking_receptor_html"]
+
+    row_extrap = vm.rows_by_id["C_AD_EXTRAP"].to_aggrid_row("s_ad_dock")
+    assert "Экстраполяция" in row_extrap["method_rule_html"]
+    assert "Генеративная модель" in row_extrap["method_rule_html"]
+    assert "> -7.0" in row_extrap["docking_dg_html"]
+
+    design_badges = build_node_execution_highlights(
+        "design",
+        {
+            "stats": {
+                "smirks_candidates": 12,
+                "crem_candidates": 5,
+                "bioisostere_candidates": 3,
+                "graph_ga_candidates": 4,
+            }
+        },
+    )
+    design_texts = [lbl for lbl, _ in design_badges]
+    assert "MMP SMIRKS: 12" in design_texts
+    assert "Изостера CReM: 8" in design_texts
+    assert "Генеративная модель: 4" in design_texts
+
+    eval_badges = build_node_execution_highlights(
+        "evaluation",
+        {
+            "active_params": {"docking_mode": "auto_top_k"},
+            "stats": {
+                "docking_mode": "auto_top_k",
+                "docking_status": "SUCCESS",
+                "docking_pdb_id": "1M17",
+                "docking_receptor_name": "EGFR",
+                "docking_success_count": 3,
+                "docking_docked_count": 3,
+                "docking_best_dg_kcal": -8.4,
+                "in_ad_count": 10,
+                "extrapolation_count": 2,
+            },
+        },
+    )
+    eval_joined = " | ".join(lbl for lbl, _ in eval_badges)
+    assert "3D-докинг: Успешно 3/3" in eval_joined
+    assert "EGFR (1M17)" in eval_joined
+    assert "-8.40 ккал/моль" in eval_joined
+    assert "AD (Tc≥0.5): 10 | Экстрап.: 2" in eval_joined
+
+
 

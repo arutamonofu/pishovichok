@@ -1,6 +1,7 @@
 {
   "status": "READY",
   "target_id": "CHEMBL203",
+  "target_name": "EGFR (Epidermal Growth Factor Receptor)",
   "pdb_id": "1M17",
   "source": "DEMO_CACHE",
   "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL203.pdb",

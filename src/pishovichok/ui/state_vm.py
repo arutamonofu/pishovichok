@@ -9,11 +9,16 @@
 
 from __future__ import annotations
 
+import html
+import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from pishovichok.config import DEMO_RECEPTOR_PRESETS, RECEPTORS_DIR
+from pishovichok.core.evaluation import resolve_generation_method_label
 from pishovichok.core.scoring import compute_harrington_mpo_breakdown
 from pishovichok.state.schemas import (
     CandidateMolecule,
@@ -30,6 +35,40 @@ PARAM_SOURCE_BADGE_META: dict[ParamSourceLiteral, tuple[str, str]] = {
     "ui_manual": ("Изменено", "blue-7"),
     "critic_loop": ("Авто-фильтр верификации", "amber"),
 }
+
+DOCKING_STRONG_BENCHMARK_KCAL: float = -7.0
+AD_TANIMOTO_THRESHOLD: float = 0.5
+
+
+def resolve_receptor_display_name(
+    pdb_id: str | None,
+    receptor_name: str | None = None,
+    receptors_dir: Path | str | None = None,
+) -> str | None:
+    """Возвращает человекочитаемое название рецептора из DockingResult или data/receptors/*.json."""
+    if receptor_name and str(receptor_name).strip():
+        return str(receptor_name).strip()
+    pdb_clean = (pdb_id or "").strip().upper()
+    if not pdb_clean or pdb_clean in ("-", "NONE", "N/A"):
+        return None
+
+    root = Path(receptors_dir) if receptors_dir is not None else RECEPTORS_DIR
+    if root.is_dir():
+        for json_file in sorted(root.glob("*.json")):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(data.get("pdb_id", "")).strip().upper() == pdb_clean:
+                tname = data.get("target_name") or data.get("receptor_name") or data.get("target_id")
+                if tname and str(tname).strip():
+                    return str(tname).strip()
+
+    for target_id, preset in DEMO_RECEPTOR_PRESETS.items():
+        if str(preset.get("pdb_id", "")).strip().upper() == pdb_clean:
+            tname = preset.get("target_name") or target_id
+            return str(tname)
+    return None
 
 _RESEARCH_STAGE_KEYS: frozenset[str] = frozenset(
     {
@@ -226,6 +265,8 @@ class CandidateRowVM(BaseModel):
     rule_id: str
     applied_smirks: str
     generation_origin: str
+    tanimoto_to_parent: float | None = None
+    generation_method: str = ""
     mpo_score: float
     passes_all: bool
     violations: list[str] = Field(default_factory=list)
@@ -239,6 +280,8 @@ class CandidateRowVM(BaseModel):
     docking_status: str | None = None
     docking_dg_kcal: float | None = None
     docking_pdb_id: str | None = None
+    docking_receptor_name: str | None = None
+    parent_docking_score_kcal: float | None = None
     docking_source: str | None = None
     docking_backend: str | None = None
     docking_interactions: dict[str, list[str]] = Field(default_factory=dict)
@@ -314,6 +357,31 @@ class CandidateRowVM(BaseModel):
         origin_short = origin_map.get(self.generation_origin, self.generation_origin)
         return f"{origin_short} · {self.rule_id}"
 
+    @property
+    def resolved_generation_method(self) -> str:
+        return resolve_generation_method_label(
+            generation_origin=self.generation_origin,
+            explicit_method=self.generation_method,
+        )
+
+    @property
+    def ad_status_label(self) -> str:
+        if self.tanimoto_to_parent is None:
+            return "AD: Н/Д"
+        if self.tanimoto_to_parent >= AD_TANIMOTO_THRESHOLD:
+            return f"Tc {self.tanimoto_to_parent:.2f} · В домене"
+        return f"Tc {self.tanimoto_to_parent:.2f} · Экстраполяция"
+
+    @property
+    def docking_delta_kcal(self) -> float | None:
+        if (
+            self.docking_status == "SUCCESS"
+            and self.docking_dg_kcal is not None
+            and self.parent_docking_score_kcal is not None
+        ):
+            return round(self.docking_dg_kcal - self.parent_docking_score_kcal, 2)
+        return None
+
     def to_aggrid_row(self, session_id: str) -> dict[str, Any]:
         """Формирует лёгкий словарь строки для `ui.aggrid` (без SVG и 3D-координат)."""
         svg_url = f"/api/sessions/{session_id}/mol/{self.candidate_id}/svg?variant=diff&width=320&height=170"
@@ -328,6 +396,91 @@ class CandidateRowVM(BaseModel):
             if self.passes_all
             else f"Нарушения: {', '.join(self.violations)}"
         )
+        gen_method = self.resolved_generation_method
+        gen_badge_styles = {
+            "MMP SMIRKS": ("#EDE9FE", "#5B21B6", "#DDD6FE"),
+            "Изостера CReM": ("#ECFDF5", "#065F46", "#A7F3D0"),
+            "Генеративная модель": ("#EFF6FF", "#1E40AF", "#BFDBFE"),
+        }
+        g_bg, g_fg, g_bd = gen_badge_styles.get(
+            gen_method, ("#F1F5F9", "#334155", "#CBD5E1")
+        )
+        if self.tanimoto_to_parent is None:
+            ad_badge_html = (
+                '<span style="font-size:10px;padding:1px 5px;border-radius:4px;'
+                'background:#F8FAFC;color:#64748B;border:1px solid #E2E8F0;">Tc Н/Д</span>'
+            )
+        elif self.tanimoto_to_parent >= AD_TANIMOTO_THRESHOLD:
+            ad_badge_html = (
+                f'<span style="font-size:10px;font-weight:600;padding:1px 5px;border-radius:4px;'
+                f'background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0;">'
+                f"Tc {self.tanimoto_to_parent:.2f} · В домене</span>"
+            )
+        else:
+            ad_badge_html = (
+                f'<span style="font-size:10px;font-weight:600;padding:1px 5px;border-radius:4px;'
+                f'background:#FFFBEB;color:#92400E;border:1px solid #FDE68A;">'
+                f"Tc {self.tanimoto_to_parent:.2f} · Экстраполяция</span>"
+            )
+        method_rule_html = (
+            '<div style="display:flex;flex-direction:column;justify-content:center;gap:3px;line-height:1.15;padding:4px 0;">'
+            f'<span style="display:inline-block;width:fit-content;font-size:10px;font-weight:600;padding:1px 6px;'
+            f'border-radius:4px;background:{g_bg};color:{g_fg};border:1px solid {g_bd};">'
+            f"{html.escape(gen_method or self.generation_origin)}</span>"
+            f'<span style="font-size:10px;color:#475569;font-family:ui-monospace,monospace;">'
+            f"{html.escape(self.rule_id)}</span>"
+            f"{ad_badge_html}"
+            "</div>"
+        )
+
+        rec_name = resolve_receptor_display_name(
+            self.docking_pdb_id, self.docking_receptor_name
+        )
+        dock_delta = self.docking_delta_kcal
+        if self.docking_status == "SUCCESS" and self.docking_dg_kcal is not None:
+            is_strong = self.docking_dg_kcal <= DOCKING_STRONG_BENCHMARK_KCAL
+            q_bg, q_fg, q_bd, q_lbl = (
+                ("#ECFDF5", "#065F46", "#A7F3D0", f"≤ {DOCKING_STRONG_BENCHMARK_KCAL:.1f} · сильное")
+                if is_strong
+                else ("#FFFBEB", "#92400E", "#FDE68A", f"> {DOCKING_STRONG_BENCHMARK_KCAL:.1f} · слабее порога")
+            )
+            delta_html = (
+                f'<span style="font-size:10px;color:#475569;font-family:ui-monospace,monospace;">'
+                f"Δ к родителю: {dock_delta:+.2f} ккал/моль</span>"
+                if dock_delta is not None
+                else ""
+            )
+            docking_dg_html = (
+                '<div style="display:flex;flex-direction:column;justify-content:center;gap:3px;line-height:1.15;padding:4px 0;">'
+                f'<span style="font-size:11px;font-weight:600;color:#0F172A;">{self.docking_dg_kcal:.2f} ккал/моль</span>'
+                f'<span style="display:inline-block;width:fit-content;font-size:10px;font-weight:600;padding:1px 5px;'
+                f'border-radius:4px;background:{q_bg};color:{q_fg};border:1px solid {q_bd};">{q_lbl}</span>'
+                f"{delta_html}"
+                "</div>"
+            )
+        else:
+            docking_dg_html = (
+                f'<span style="font-size:11px;color:#64748B;">{html.escape(self.docking_dg_display)}</span>'
+            )
+
+        if self.docking_pdb_id:
+            short_rec = (rec_name or "").split(" (", 1)[0]
+            rec_line = (
+                f'<span style="font-size:10px;font-weight:600;color:#0F172A;white-space:normal;line-height:1.15;">'
+                f"{html.escape(short_rec)}</span>"
+                if short_rec
+                else ""
+            )
+            docking_receptor_html = (
+                '<div style="display:flex;flex-direction:column;justify-content:center;gap:2px;line-height:1.15;padding:4px 0;">'
+                f"{rec_line}"
+                f'<span style="font-size:10px;font-family:ui-monospace,monospace;color:#1E40AF;'
+                f'background:#EFF6FF;border:1px solid #BFDBFE;border-radius:4px;padding:1px 5px;width:fit-content;">'
+                f"PDB: {html.escape(self.docking_pdb_id)}</span>"
+                "</div>"
+            )
+        else:
+            docking_receptor_html = '<span style="font-size:11px;color:#94A3B8;">-</span>'
         return {
             "candidate_id": self.candidate_id,
             "preview_html": (
@@ -365,13 +518,26 @@ class CandidateRowVM(BaseModel):
             "pinned": self.pinned,
             "excluded": self.excluded,
             "rule_id": self.rule_id,
+            "generation_method": gen_method,
+            "tanimoto_to_parent": round(self.tanimoto_to_parent, 4)
+            if self.tanimoto_to_parent is not None
+            else None,
+            "ad_status_display": self.ad_status_label,
             "method_rule_display": self.method_rule_label,
+            "method_rule_html": method_rule_html,
             "docking_status": self.docking_status or "PENDING",
             "docking_dg_kcal": round(self.docking_dg_kcal, 2)
             if self.docking_dg_kcal is not None
             else None,
+            "parent_docking_score_kcal": round(self.parent_docking_score_kcal, 2)
+            if self.parent_docking_score_kcal is not None
+            else None,
+            "docking_delta_kcal": dock_delta,
             "docking_dg_display": self.docking_dg_display,
+            "docking_dg_html": docking_dg_html,
             "docking_pdb_id": self.docking_pdb_id or "-",
+            "docking_receptor_name": rec_name or "",
+            "docking_receptor_html": docking_receptor_html,
             "docking_backend": self.docking_backend or "-",
             "docking_interactions_summary": self.docking_interactions_summary,
         }
@@ -498,12 +664,28 @@ class StateViewModel:
                 rule_id=cand.hypothesis_rationale.rule_id,
                 applied_smirks=cand.hypothesis_rationale.applied_smirks,
                 generation_origin=cand.hypothesis_rationale.generation_origin,
+                tanimoto_to_parent=cand.calc_rdkit.tanimoto_to_parent,
+                generation_method=cand.calc_rdkit.generation_method
+                or resolve_generation_method_label(
+                    cand.hypothesis_rationale.generation_origin
+                ),
                 mpo_score=cand.mpo_harrington_score,
                 passes_all=cand.passes_all_constraints,
                 violations=list(cand.constraint_violations),
                 docking_status=cand.docking.status if cand.docking else None,
                 docking_dg_kcal=cand.docking.docking_score_kcal if cand.docking else None,
                 docking_pdb_id=cand.docking.pdb_id if cand.docking else None,
+                docking_receptor_name=(
+                    resolve_receptor_display_name(
+                        cand.docking.pdb_id,
+                        cand.docking.receptor_name,
+                    )
+                    if cand.docking
+                    else None
+                ),
+                parent_docking_score_kcal=(
+                    cand.docking.parent_docking_score_kcal if cand.docking else None
+                ),
                 docking_source=cand.docking.source if cand.docking else None,
                 docking_backend=cand.docking.backend if cand.docking else None,
                 docking_interactions=dict(cand.docking.interactions) if cand.docking else {},

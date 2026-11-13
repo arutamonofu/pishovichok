@@ -1,6 +1,7 @@
 {
   "status": "READY",
   "target_id": "CHEMBL5251",
+  "target_name": "BTK (Bruton's Tyrosine Kinase)",
   "pdb_id": "5P9J",
   "source": "DEMO_CACHE",
   "pdb_path": "/home/arutamonofu/projects/pishovichok/data/receptors/CHEMBL5251.pdb",
