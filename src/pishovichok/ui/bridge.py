@@ -655,10 +655,21 @@ class AgentUIBridge:
                         },
                     )
 
-                # Проверяем, завершён ли граф
+                # Проверяем, завершён ли граф, и заранее фиксируем следующий активный узел
                 snap = await run.io_bound(compiled_graph.get_state, config)
-                if not getattr(snap, "next", None):
+                next_nodes = getattr(snap, "next", None)
+                if not next_nodes:
                     break
+                next_node = str(next_nodes[0])
+                runtime.current_node = next_node
+                await self.registry.broadcast(
+                    session_id,
+                    {
+                        "type": "node_started",
+                        "session_id": session_id,
+                        "node": next_node,
+                    },
+                )
 
             runtime.status = "completed"
             runtime.current_node = None
@@ -943,21 +954,37 @@ class AgentUIBridge:
             workspace_dir = session_dir
             runtime.workspace_dir = session_dir
 
-        start_t = asyncio.get_running_loop().time()
-        updated_pool, dock_summary = await asyncio.to_thread(
-            evaluate_docking_batch,
-            pool,
-            target_id,
-            eff_top_k,
-            eff_exhaust,
-            eff_pdb,
-            eff_box,
-            workspace_dir,
-            candidate_ids,
-            constraints,
-            tool_config,
+        runtime.is_docking_running = True
+        runtime.docking_target_label = (
+            ", ".join(candidate_ids) if candidate_ids else f"топ-{eff_top_k}"
         )
-        duration_ms = round((asyncio.get_running_loop().time() - start_t) * 1000.0, 2)
+        await self.registry.broadcast(
+            session_id,
+            {
+                "type": "docking_started",
+                "session_id": session_id,
+                "target": runtime.docking_target_label,
+            },
+        )
+        try:
+            start_t = asyncio.get_running_loop().time()
+            updated_pool, dock_summary = await asyncio.to_thread(
+                evaluate_docking_batch,
+                pool,
+                target_id,
+                eff_top_k,
+                eff_exhaust,
+                eff_pdb,
+                eff_box,
+                workspace_dir,
+                candidate_ids,
+                constraints,
+                tool_config,
+            )
+            duration_ms = round((asyncio.get_running_loop().time() - start_t) * 1000.0, 2)
+        finally:
+            runtime.is_docking_running = False
+            runtime.docking_target_label = None
 
         updated_pool.sort(
             key=lambda c: (

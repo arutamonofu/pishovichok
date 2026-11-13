@@ -174,25 +174,35 @@ body {
   color: #1E3A8A !important;
 }
 
-/* Трёхколоночная CSS Grid сетка рабочей среды */
+/* Двухколоночная CSS Grid сетка рабочей среды (основная область + инспектор справа) */
 .ide-shell-grid {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 430px;
+  grid-template-columns: minmax(0, 1fr) 430px;
   width: 100%;
   height: calc(100vh - 52px);
   overflow: hidden;
   background-color: var(--bg-canvas);
 }
-.ide-shell-grid--collapsed {
-  grid-template-columns: 28px minmax(0, 1fr) 430px;
-}
 @media (max-width: 1320px) {
   .ide-shell-grid {
-    grid-template-columns: 268px minmax(0, 1fr) 380px;
+    grid-template-columns: minmax(0, 1fr) 380px;
   }
-  .ide-shell-grid--collapsed {
-    grid-template-columns: 28px minmax(0, 1fr) 380px;
-  }
+}
+.ide-shell-grid--welcome {
+  grid-template-columns: minmax(0, 1fr) !important;
+  background-color: #FFFFFF !important;
+}
+
+/* Встроенное поле ввода без двойной рамки внутри единого нейрочат-островка */
+.composer-textarea .q-field__control {
+  padding: 2px 4px !important;
+  min-height: 36px !important;
+  background: transparent !important;
+}
+.composer-textarea .q-field__native {
+  padding: 4px 2px !important;
+  line-height: 1.45 !important;
+  color: var(--text-primary) !important;
 }
 
 /* Всегда заметные аккуратные скроллбары без прыжков макета */
@@ -311,6 +321,25 @@ body {
   align-items: center;
   justify-content: center;
   line-height: 1;
+}
+
+/* Плавающий островок чата поверх таблицы (свёрнутая полупрозрачная пилюля и развёрнутый вид) */
+.floating-island-pill {
+  background-color: rgba(251, 245, 247, 0.82) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  opacity: 0.86;
+  transition: opacity 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
+}
+.floating-island-pill:hover,
+.floating-island-pill:focus-within {
+  background-color: rgba(255, 255, 255, 0.96) !important;
+  opacity: 1;
+}
+.floating-island-surface {
+  background-color: rgba(255, 255, 255, 0.94) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 </style>
 """

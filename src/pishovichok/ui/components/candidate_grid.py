@@ -5,16 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from nicegui import run, ui
+from nicegui import ui
 
-from pishovichok.agents.workflow import (
-    export_candidates_to_csv,
-    export_candidates_to_sdf,
-)
-from pishovichok.config import settings
 from pishovichok.state.graph_state import resolve_tool_config
 from pishovichok.state.schemas import ToolConfig
-from pishovichok.ui.icons import svg_icon
 from pishovichok.ui.session import SessionRuntime
 
 
@@ -233,8 +227,9 @@ class CandidateGrid:
         self._grid: ui.aggrid | None = None
         self._title_label: ui.label | None = None
         self._telemetry_row: ui.row | None = None
-        self._dock_btn: ui.button | None = None
         self._empty_overlay: ui.column | None = None
+        self._empty_spinner: ui.spinner | None = None
+        self._empty_status_label: ui.label | None = None
         self._build()
 
     def _build(self) -> None:
@@ -274,34 +269,6 @@ class CandidateGrid:
                     )
                     self._telemetry_row = ui.row().classes("items-center gap-1 flex-wrap")
 
-                with ui.row().classes("items-center gap-1.5"):
-                    self._dock_btn = (
-                        ui.button(on_click=self._run_manual_docking)
-                        .props("dense unelevated no-caps size=sm color=primary")
-                        .classes("text-[11px] px-2.5 gap-1")
-                        .tooltip("Запустить физический 3D-докинг для топ-кандидатов без перезапуска пайплайна")
-                    )
-                    with self._dock_btn:
-                        ui.html(svg_icon("play", 12), sanitize=False)
-                        ui.label("Запустить 3D-докинг").classes("text-[11px] font-medium")
-
-                    with ui.button(on_click=self._export_csv).props(
-                        "dense outline no-caps size=sm color=grey-8"
-                    ).classes("text-[11px] bg-white border-[#D5C8CD] px-2 gap-1").tooltip(
-                        "Выгрузить таблицу кандидатов в формате CSV"
-                    ):
-                        ui.html(svg_icon("download", 13), sanitize=False)
-                        ui.label(".csv").classes("font-mono text-[11px] text-[#261F22]")
-
-                    with ui.button(on_click=self._export_sdf).props(
-                        "dense outline no-caps size=sm color=grey-8"
-                    ).classes("text-[11px] bg-white border-[#D5C8CD] px-2 gap-1").tooltip(
-                        "Выгрузить структуры и свойства кандидатов в формате SDF"
-                    ):
-                        ui.html(svg_icon("download", 13), sanitize=False)
-                        ui.label(".sdf").classes("font-mono text-[11px] text-[#261F22]")
-
-            self.refresh_telemetry()
             with ui.card().classes(
                 "relative w-full flex-1 min-h-0 bg-white border border-[#E2D9DD] rounded-lg p-0 overflow-hidden shadow-none"
             ):
@@ -312,76 +279,38 @@ class CandidateGrid:
                 ).classes("w-full h-full")
                 self._grid.on("cellClicked", self._handle_cell_clicked)
 
-                # Приветственное пустое состояние с маскотом в полный рост (до появления кандидатов)
+                # Компактный статус ожидания в пустой таблице (без маскота, чтобы он не дублировался после старта)
                 self._empty_overlay = ui.column().classes(
-                    "pointer-events-none absolute inset-0 z-10 items-center justify-center bg-white p-4 pb-32 gap-2"
+                    "pointer-events-none absolute inset-0 z-10 items-center justify-center bg-white/95 p-4 gap-2"
                 )
                 with self._empty_overlay:
-                    ui.html(
-                        '<img src="/static/mascot_full.png" alt="Пишовичок" '
-                        'style="height:134px;width:auto;object-fit:contain;display:block;" />',
-                        sanitize=False,
-                    )
-                    ui.label("ПИШОВИЧОК готов к SAR-дизайну").classes(
-                        "text-sm font-semibold text-[#5C2D3B]"
-                    )
-                    ui.label(
-                        "Откройте готовый сценарий в шапке или опишите задачу в нижнем островке"
-                    ).classes("text-xs text-[#64748B] text-center max-w-sm")
-                self._empty_overlay.set_visibility(len(vm.rows_by_id) == 0)
-
-    async def _run_manual_docking(self) -> None:
-        from pishovichok.ui.bridge import agent_bridge
-
-        cands = list(self.runtime.view_model.candidates_by_id.values())
-        if not cands:
-            ui.notify("Сначала сгенерируйте кандидатов", type="warning")
-            return
-        if self._dock_btn is not None:
-            self._dock_btn.disable()
-        ui.notify("Запущен расчёт 3D-докинга...", type="info")
-        try:
-            summary = await agent_bridge.run_standalone_docking(self.runtime.session_id)
-            status = summary.get("status")
-            if status == "SUCCESS":
-                dg = summary.get("best_score_kcal")
-                dg_txt = f" (лучший ΔG = {dg:.2f} ккал/моль)" if dg is not None else ""
-                ui.notify(f"3D-докинг завершён{dg_txt}", type="positive")
-            else:
-                ui.notify(str(summary.get("message") or f"Статус докинга: {status}"), type="warning")
-        except Exception as exc:
-            ui.notify(f"Ошибка 3D-докинга: {exc}", type="negative")
-        finally:
-            if self._dock_btn is not None:
-                self._dock_btn.enable()
-
-    async def _export_csv(self) -> None:
-        cands = list(self.runtime.view_model.candidates_by_id.values())
-        if not cands:
-            ui.notify("Нет кандидатов для выгрузки", type="warning")
-            return
-        target = settings.resolved_workspace_dir / self.runtime.session_id / "ui_export.csv"
-        await run.io_bound(export_candidates_to_csv, cands, target)
-        ui.download(target)
-
-    async def _export_sdf(self) -> None:
-        cands = list(self.runtime.view_model.candidates_by_id.values())
-        if not cands:
-            ui.notify("Нет кандидатов для выгрузки", type="warning")
-            return
-        target = settings.resolved_workspace_dir / self.runtime.session_id / "ui_export.sdf"
-        await run.io_bound(export_candidates_to_sdf, cands, target)
-        ui.download(target)
+                    self._empty_spinner = ui.spinner("dots", size="md", color="primary")
+                    self._empty_status_label = ui.label(
+                        "Кандидаты ещё не сформированы"
+                    ).classes("text-xs text-[#594D52] text-center max-w-md")
+            self.refresh_telemetry()
 
     def refresh_telemetry(self) -> None:
-        """Обновляет заголовок счётчика и плашки параметров (скрыты в режиме «Синтетик»)."""
+        """Обновляет заголовок счётчика, статус пустой таблицы и плашки параметров."""
         count = len(self.runtime.view_model.rows_by_id)
         if self._title_label is not None:
             self._title_label.set_text(f"Кандидаты и расчётные свойства ({count})")
         if self._empty_overlay is not None:
             self._empty_overlay.set_visibility(count == 0)
-        if self._dock_btn is not None:
-            self._dock_btn.set_visibility(count > 0)
+        is_running = self.runtime.status == "running"
+        if self._empty_spinner is not None:
+            self._empty_spinner.set_visibility(count == 0 and is_running)
+        if self._empty_status_label is not None:
+            if is_running:
+                self._empty_status_label.set_text(
+                    "Идёт расчёт… Кандидаты появятся после оценки ADMET и скоринга"
+                )
+            elif self.runtime.status == "paused_hitl":
+                self._empty_status_label.set_text(
+                    "Расчёт на паузе контроля исследователя"
+                )
+            else:
+                self._empty_status_label.set_text("Кандидаты ещё не сформированы")
         if self._telemetry_row is None:
             return
         self._telemetry_row.clear()

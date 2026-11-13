@@ -433,22 +433,89 @@ class InspectorPane:
 
         cid, cand, row = self._get_selected()
         if cid is None or cand is None or row is None:
+            is_running = self.runtime.status == "running"
             if self._header_title is not None:
                 self._header_title.set_text("Карточка кандидата")
             if self._smiles_label is not None:
-                self._smiles_label.set_text("Выберите строку в таблице или точку на графике")
+                self._smiles_label.set_text(
+                    "Ожидание кандидатов…"
+                    if is_running
+                    else "Выберите строку в таблице или точку на графике"
+                )
             if self._pairwise_box is not None:
                 self._pairwise_box.clear()
+                with self._pairwise_box:
+                    with ui.column().classes(
+                        "w-full h-[170px] items-center justify-center gap-2 border border-dashed border-[#D5C8CD] rounded-md bg-[#FAF8F9]/70 px-4 text-center"
+                    ):
+                        if is_running:
+                            ui.spinner("dots", size="sm", color="primary")
+                            ui.label(
+                                "После завершения оценки здесь появится 2D-сравнение прототипа и выбранного кандидата"
+                            ).classes("text-[11px] text-[#594D52] max-w-[280px]")
+                        else:
+                            ui.html(svg_icon("flask", 20, "text-[#8B495C]/60"), sanitize=False)
+                            ui.label(
+                                "Здесь появится 2D-сравнение прототипа и кандидата с подсветкой изменённого фрагмента"
+                            ).classes("text-[11px] text-[#594D52] max-w-[280px]")
             if self._brics_box is not None:
                 self._brics_box.clear()
+                with self._brics_box:
+                    with ui.column().classes(
+                        "w-full h-[140px] items-center justify-center gap-1.5 border border-dashed border-[#D5C8CD] rounded-md bg-[#FAF8F9]/70 px-4 text-center"
+                    ):
+                        ui.label(
+                            "После выбора кандидата здесь появятся синтетические блоки (BRICS)"
+                        ).classes("text-[11px] text-[#594D52] max-w-[260px]")
             if self._viewer3d is not None:
                 self._viewer3d.clear_viewer()
             if self._desirability_box is not None:
                 self._desirability_box.clear()
+                with self._desirability_box:
+                    if is_running:
+                        for lbl_txt, bar_w in (
+                            ("pIC50", "w-3/4"),
+                            ("cLogP", "w-2/3"),
+                            ("SAscore", "w-4/5"),
+                            ("QED", "w-1/2"),
+                        ):
+                            with ui.row().classes("w-full items-center gap-2"):
+                                ui.label(lbl_txt).classes("text-[10px] text-[#94A3B8] w-12 shrink-0")
+                                ui.element("div").classes(
+                                    f"h-2 {bar_w} rounded bg-[#E2E8F0] animate-pulse"
+                                )
+                    ui.label(
+                        "Профиль желательности Харрингтона появится после оценки кандидатов"
+                        if is_running
+                        else "Здесь отобразятся частные функции желательности Харрингтона (pIC50, cLogP, SAscore, QED, LogS, hERG)"
+                    ).classes("text-[11px] text-[#64748B]")
             if self._docking_box is not None:
                 self._docking_box.clear()
+                with self._docking_box:
+                    if is_running:
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.element("div").classes("h-5 w-24 rounded bg-[#EFF6FF] border border-[#DBEAFE] animate-pulse")
+                            ui.element("div").classes("h-5 flex-1 rounded bg-[#F1F5F9] animate-pulse")
+                    ui.label(
+                        "Ожидание результатов 3D-докинга (ΔG, PDB мишени, ключевые остатки)…"
+                        if is_running
+                        else "Здесь появятся расчётная аффинность ΔG (ккал/моль), PDB-структура мишени и ключевые остатки связывания"
+                    ).classes("text-[11px] text-[#64748B]")
             if self._provenance_box is not None:
                 self._provenance_box.clear()
+                with self._provenance_box:
+                    with ui.card().classes(
+                        "w-full bg-white border border-[#E2E8F0] rounded-lg p-2.5 gap-1.5 shadow-none"
+                    ):
+                        if is_running:
+                            with ui.row().classes("w-full gap-1.5"):
+                                for bg_c in ("bg-[#F5F3FF]", "bg-[#ECFDF5]", "bg-[#FFFBEB]", "bg-[#EFF6FF]"):
+                                    ui.element("div").classes(f"h-3 flex-1 rounded {bg_c} animate-pulse")
+                        ui.label(
+                            "Сбор источников данных: Эксперимент, Расчёт RDKit, Прогноз ADMET и Гипотеза SAR…"
+                            if is_running
+                            else "Здесь появятся источники значений по 4 категориям: Эксперимент, Расчёт RDKit, Прогноз ADMET и Гипотеза SAR"
+                        ).classes("text-[11px] text-[#64748B]")
             return
 
         if self._header_title is not None:

@@ -12,13 +12,13 @@ from pishovichok.core.rendering import (
     render_molecule_svg,
 )
 from pishovichok.state.graph_state import resolve_tool_config
-from pishovichok.ui.bridge import agent_bridge
+from pishovichok.ui.components.agent_rail import render_sar_rules_panel
 from pishovichok.ui.icons import svg_icon
 from pishovichok.ui.session import SessionRuntime
 
 
 class MPOCanvas:
-    """Центральный верхний компонент: компактный график 220px и поповер порогов/весов MPO."""
+    """Центральный верхний компонент: компактный график 250px, поповер порогов/весов и панель правил SAR."""
 
     def __init__(
         self,
@@ -27,112 +27,74 @@ class MPOCanvas:
         on_candidate_selected: Callable[[str], Any] | None = None,
         on_mpo_recalculated: Callable[[], Any] | None = None,
         on_tool_config_changed: Callable[[], Any] | None = None,
+        on_scaffold_selected: Callable[[str], Any] | None = None,
     ) -> None:
         self.runtime = runtime
         self._on_candidate_selected = on_candidate_selected
         self._on_mpo_recalculated = on_mpo_recalculated
         self._on_tool_config_changed = on_tool_config_changed
+        self._on_scaffold_selected = on_scaffold_selected
         self._mode: str = "pareto"
         self._pca_dirty: bool = True
-        self._syncing: bool = False
         self._chart: ui.echart | None = None
         self._mode_toggle: ui.toggle | None = None
-        self._slider_bindings: list[tuple[str, str, ui.slider, ui.label]] = []
+        self._scaffolds_section: ui.column | None = None
+        self._scaffolds_box: ui.row | None = None
+        self._sar_header_label: ui.label | None = None
+        self._sar_box: ui.element | None = None
+        self._sar_rules_pane: ui.column | None = None
         self._build()
 
     def _build(self) -> None:
-        with ui.column().classes("w-full shrink-0 gap-1.5 px-2.5 pt-2 pb-1 bg-[#FAF8F9] text-[#1F181B]"):
-            with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+        with ui.column().classes("w-full h-full gap-1.5 px-2.5 pt-2 pb-1 bg-[#FAF8F9] text-[#1F181B] flex flex-col overflow-hidden"):
+            with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap shrink-0"):
                 ui.label("Многопараметрическая оптимизация (MPO)").classes(
                     "text-xs font-semibold text-[#5C2D3B]"
                 )
-                with ui.row().classes("items-center gap-2 flex-wrap"):
-                    self._mode_toggle = (
-                        ui.toggle(
-                            {
-                                "pareto": "Профиль Парето",
-                                "pca": "Химпространство (PCA)",
-                                "sali": "Перепады активности (SALI)",
-                            },
-                            value=self._mode,
-                            on_change=self._handle_mode_change,
-                        )
-                        .props("dense no-caps toggle-color=primary color=grey-2 text-color=grey-9 size=sm")
-                        .classes("border border-[#D5C8CD] rounded compact-toggle")
+                self._mode_toggle = (
+                    ui.toggle(
+                        {
+                            "pareto": "Профиль Парето",
+                            "pca": "Химпространство (PCA)",
+                            "sali": "Перепады активности (SALI)",
+                            "sar_rules": "Правила SAR",
+                        },
+                        value=self._mode,
+                        on_change=self._handle_mode_change,
                     )
-
-                    with ui.button().props(
-                        "dense outline no-caps size=sm color=grey-8"
-                    ).classes("text-xs bg-white border-[#D5C8CD] px-2.5 py-1 gap-1.5"):
-                        ui.html(svg_icon("sliders", 14), sanitize=False)
-                        ui.label("Пороги и веса MPO").classes("text-xs font-medium text-[#1F181B]")
-                        with ui.menu().props("anchor='bottom right' self='top right'").classes(
-                            "bg-white border border-[#D5C8CD] shadow-lg rounded-lg p-3 w-[540px]"
-                        ):
-                            ui.label("Пороги ограничений и веса Харрингтона (MPO)").classes(
-                                "text-xs font-semibold text-[#0F172A] mb-2"
-                            )
-                            w = self.runtime.view_model.weights
-                            with ui.grid(columns=3).classes("w-full gap-x-4 gap-y-1.5"):
-                                self._make_slider("w_activity", "Вес pIC50", w.w_activity, 0.0, 5.0, 0.1)
-                                self._make_slider("w_logp", "Вес cLogP", w.w_logp, 0.0, 5.0, 0.1)
-                                self._make_slider("w_sa", "Вес SAscore", w.w_sa, 0.0, 5.0, 0.1)
-                                self._make_slider("w_qed", "Вес QED", w.w_qed, 0.0, 5.0, 0.1)
-                                self._make_slider("w_tpsa", "Вес TPSA", w.w_tpsa, 0.0, 5.0, 0.1)
-                                self._make_slider("w_logs", "Вес LogS", w.w_logs, 0.0, 5.0, 0.1)
-                                self._make_slider("w_herg", "Вес hERG", w.w_herg, 0.0, 5.0, 0.1)
-                                self._make_slider("max_logp", "Порог cLogP", w.max_logp, 1.0, 7.0, 0.1)
-                                self._make_slider("max_sa_score", "Порог SAscore", w.max_sa_score, 2.0, 7.0, 0.1)
-                                self._make_slider("max_herg_prob", "Порог hERG", w.max_herg_prob, 0.1, 0.9, 0.05)
-                                self._make_slider("max_mw", "Порог MW", w.max_mw, 300.0, 800.0, 10.0)
+                    .props("dense no-caps toggle-color=primary color=grey-2 text-color=grey-9 size=sm")
+                    .classes("border border-[#D5C8CD] rounded compact-toggle")
+                )
 
             with ui.card().classes(
-                "w-full h-[250px] bg-white border border-[#E2E8F0] rounded-lg p-1 shadow-none overflow-hidden"
+                "w-full flex-1 min-h-0 bg-white border border-[#E2E8F0] rounded-lg p-1.5 shadow-none overflow-hidden flex flex-col"
             ):
                 self._chart = ui.echart(
                     options=self._build_chart_options(),
                     on_point_click=self._handle_point_click,
                 ).classes("w-full h-full")
 
-    def _make_slider(
-        self,
-        attr_name: str,
-        label: str,
-        value: float,
-        min_v: float,
-        max_v: float,
-        step: float,
-    ) -> None:
-        with ui.column().classes("w-full gap-0"):
-            val_lbl = ui.label(f"{label}: {value:.2f}").classes(
-                "text-[11px] text-[#334155]"
-            )
-
-            def _on_change(e: Any, attr: str = attr_name, lbl_text: str = label, lbl_w: ui.label = val_lbl) -> None:
-                if self._syncing:
-                    return
-                v = float(e.value)
-                setattr(self.runtime.view_model.weights, attr, v)
-                lbl_w.set_text(f"{lbl_text}: {v:.2f}")
-                agent_bridge.apply_ui_tool_overrides(
-                    self.runtime,
-                    self.runtime.view_model.weights.to_tool_config_overrides(),
+                self._sar_rules_pane = ui.column().classes(
+                    "w-full h-full overflow-y-auto wetlab-scroll p-1.5 gap-2"
                 )
-                self.runtime.view_model.recalculate_mpo()
-                self.refresh(mark_pca_dirty=False)
-                if self._on_mpo_recalculated is not None:
-                    self._on_mpo_recalculated()
-                if self._on_tool_config_changed is not None:
-                    self._on_tool_config_changed()
+                with self._sar_rules_pane:
+                    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap shrink-0"):
+                        self._sar_header_label = ui.label("Правила SAR (MMP)").classes(
+                            "text-xs font-semibold text-[#5C2D3B]"
+                        )
+                        self._scaffolds_section = ui.row().classes("items-center gap-1.5 flex-wrap")
+                        with self._scaffolds_section:
+                            ui.label("Базовые скаффолды (Bemis–Murcko):").classes(
+                                "text-[11px] font-medium text-[#594D52]"
+                            )
+                            self._scaffolds_box = ui.row().classes("items-center gap-1 flex-wrap")
 
-            sld = ui.slider(
-                min=min_v,
-                max=max_v,
-                step=step,
-                value=value,
-                on_change=_on_change,
-            ).props("dense color=primary")
-            self._slider_bindings.append((attr_name, label, sld, val_lbl))
+                    self._sar_box = ui.element("div").classes(
+                        "w-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2"
+                    )
+                self._sar_rules_pane.set_visibility(False)
+
+            self._refresh_sar_panel()
 
     async def _handle_mode_change(self, e: Any) -> None:
         self._mode = str(e.value)
@@ -325,11 +287,13 @@ class MPOCanvas:
                 "textStyle": {"color": "#0F172A", "fontSize": 12},
             },
             "legend": {
-                "top": 2,
-                "right": 12,
+                "orient": "vertical",
+                "right": 16,
+                "top": "middle",
+                "itemGap": 10,
                 "textStyle": {"color": "#475569", "fontSize": 11},
             },
-            "grid": {"left": 52, "right": 24, "top": 36, "bottom": 34},
+            "grid": {"left": 54, "right": 200, "top": 18, "bottom": 38},
             "xAxis": {
                 "type": "value",
                 "name": "Сходство (Tanimoto)",
@@ -642,12 +606,13 @@ class MPOCanvas:
                 "textStyle": {"color": "#0F172A", "fontSize": 12},
             },
             "legend": {
-                "top": 2,
-                "right": 12,
+                "orient": "vertical",
+                "right": 16,
+                "top": "middle",
                 "itemGap": 10,
                 "textStyle": {"color": "#475569", "fontSize": 11},
             },
-            "grid": {"left": 52, "right": 24, "top": 36, "bottom": 34},
+            "grid": {"left": 54, "right": 235, "top": 18, "bottom": 38},
             "xAxis": {
                 "type": "value",
                 "name": "PC1" if is_pca else "cLogP",
@@ -729,20 +694,28 @@ class MPOCanvas:
             ],
         }
 
+    def _refresh_sar_panel(self) -> None:
+        if getattr(self, "_sar_box", None) is None:
+            return
+        render_sar_rules_panel(
+            self.runtime,
+            scaffolds_section=self._scaffolds_section,
+            scaffolds_box=self._scaffolds_box,
+            sar_header_label=self._sar_header_label,
+            sar_box=self._sar_box,
+            on_scaffold_selected=self._on_scaffold_selected,
+        )
+
     def refresh(self, *, mark_pca_dirty: bool = True) -> None:
-        """Обновляет опции графика и положение слайдеров без пересоздания DOM-элемента."""
+        """Обновляет опции графика и панель правил SAR без пересоздания DOM-элемента."""
         if mark_pca_dirty:
             self._pca_dirty = True
-        w = self.runtime.view_model.weights
-        if self._slider_bindings:
-            self._syncing = True
-            try:
-                for attr_name, lbl_text, sld, val_lbl in self._slider_bindings:
-                    cur = float(getattr(w, attr_name))
-                    sld.set_value(cur)
-                    val_lbl.set_text(f"{lbl_text}: {cur:.2f}")
-            finally:
-                self._syncing = False
+        is_sar_tab = self._mode == "sar_rules"
         if self._chart is not None:
-            self._chart.options.update(self._build_chart_options())
-            self._chart.update()
+            self._chart.set_visibility(not is_sar_tab)
+            if not is_sar_tab:
+                self._chart.options.update(self._build_chart_options())
+                self._chart.update()
+        if getattr(self, "_sar_rules_pane", None) is not None:
+            self._sar_rules_pane.set_visibility(is_sar_tab)
+        self._refresh_sar_panel()

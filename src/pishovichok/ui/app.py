@@ -10,7 +10,7 @@ from fastapi import Request
 from nicegui import Client, app, ui
 
 from pishovichok.config import settings
-from pishovichok.ui.components.agent_rail import AgentRail, TopStatusBar
+from pishovichok.ui.components.agent_rail import TopStatusBar
 from pishovichok.ui.components.candidate_grid import CandidateGrid
 from pishovichok.ui.components.inspector import InspectorPane
 from pishovichok.ui.components.mpo_canvas import MPOCanvas
@@ -83,7 +83,6 @@ async def chemical_ide_page(
     ui.navigate.history.replace(f"/?session_id={runtime.session_id}")
 
     top_bar: TopStatusBar | None = None
-    agent_rail: AgentRail | None = None
     task_island: TaskCommandIsland | None = None
     mpo_canvas: MPOCanvas | None = None
     candidate_grid: CandidateGrid | None = None
@@ -122,6 +121,8 @@ async def chemical_ide_page(
     def _on_drawer_tool_config_changed() -> None:
         if top_bar is not None:
             top_bar.refresh()
+        if task_island is not None:
+            task_island.refresh()
         if candidate_grid is not None:
             candidate_grid.refresh_telemetry()
         if inspector is not None:
@@ -130,6 +131,8 @@ async def chemical_ide_page(
     def _on_external_tool_config_changed() -> None:
         if top_bar is not None:
             top_bar.refresh()
+        if task_island is not None:
+            task_island.refresh()
         if tool_settings is not None:
             tool_settings.refresh()
         if candidate_grid is not None:
@@ -145,22 +148,15 @@ async def chemical_ide_page(
         app.storage.tab["session_id"] = new_sid
         ui.navigate.to(f"/?session_id={new_sid}")
 
-    def _on_csv_uploaded(csv_path: Path) -> None:
-        if task_island is not None:
-            task_island.uploaded_csv_path = csv_path
-            task_island.refresh()
-
     def _toggle_settings() -> None:
         if tool_settings is not None:
             tool_settings.toggle()
 
-    def _on_scenario_selected(scenario_key: str) -> None:
-        if task_island is not None:
-            task_island.apply_scenario_context(scenario_key)
-
     def _on_depth_mode_changed(depth_mode: str) -> None:
-        if agent_rail is not None:
-            agent_rail.refresh()
+        if mpo_canvas is not None:
+            mpo_canvas.refresh(mark_pca_dirty=False)
+        if task_island is not None:
+            task_island.refresh()
         if candidate_grid is not None:
             candidate_grid.refresh_telemetry()
         if inspector is not None:
@@ -169,9 +165,6 @@ async def chemical_ide_page(
     top_bar = TopStatusBar(
         runtime,
         on_session_switched=_on_session_switched,
-        on_csv_uploaded=_on_csv_uploaded,
-        on_toggle_settings=_toggle_settings,
-        on_scenario_selected=_on_scenario_selected,
         on_depth_mode_changed=_on_depth_mode_changed,
     )
 
@@ -191,38 +184,51 @@ async def chemical_ide_page(
         on_tool_config_changed=_on_drawer_tool_config_changed,
     )
 
-    shell_collapsed = False
     shell_grid = ui.element("div").classes("ide-shell-grid")
 
-    def _toggle_left_rail() -> None:
-        nonlocal shell_collapsed
-        shell_collapsed = not shell_collapsed
-        if shell_collapsed:
-            shell_grid.classes(add="ide-shell-grid--collapsed")
-        else:
-            shell_grid.classes(remove="ide-shell-grid--collapsed")
-        if agent_rail is not None:
-            agent_rail.set_collapsed(shell_collapsed)
+    center_col: ui.column
+    mpo_slot: ui.element
+    grid_slot: ui.element
+    welcome_hero: ui.column
+    right_inspector_slot: ui.element
 
     with shell_grid:
-        with ui.element("div").classes("h-full min-h-0 min-w-0 overflow-hidden"):
-            agent_rail = AgentRail(
-                runtime,
-                on_scaffold_selected=lambda smi: (
-                    task_island.load_scaffold(smi) if task_island is not None else None
-                ),
-                on_toggle_collapse=_toggle_left_rail,
+        center_col = ui.column().classes(
+            "relative w-full h-full min-w-0 min-h-0 flex flex-col gap-1 overflow-hidden"
+        )
+        with center_col:
+            # Приветственный блок на чистом экране (исчезает сразу после отправки запроса)
+            welcome_hero = ui.column().classes(
+                "w-full items-center justify-end pb-3 pt-6 gap-2 bg-white shrink-0"
             )
-        with ui.column().classes(
-            "relative w-full h-full min-w-0 min-h-0 flex flex-col gap-2 overflow-hidden"
-        ):
-            mpo_canvas = MPOCanvas(
-                runtime,
-                on_candidate_selected=_select_candidate,
-                on_mpo_recalculated=_on_mpo_recalculated,
-                on_tool_config_changed=_on_external_tool_config_changed,
+            with welcome_hero:
+                ui.html(
+                    '<img src="/static/mascot_full.png" alt="Пишовичок" '
+                    'style="height:150px;width:auto;object-fit:contain;display:block;" />',
+                    sanitize=False,
+                )
+                ui.label("ПИШОВИЧОК готов к SAR-дизайну").classes(
+                    "text-base font-semibold text-[#5C2D3B]"
+                )
+                ui.label(
+                    "Опишите задачу молекулярного дизайна ниже или выберите один из готовых сценариев"
+                ).classes("text-xs text-[#64748B] text-center max-w-md")
+
+            mpo_slot = ui.element("div").classes(
+                "w-full shrink-0 h-[46%] min-h-[290px] max-h-[420px]"
             )
-            with ui.element("div").classes("w-full flex-1 min-h-0 min-w-0 overflow-hidden"):
+            with mpo_slot:
+                mpo_canvas = MPOCanvas(
+                    runtime,
+                    on_candidate_selected=_select_candidate,
+                    on_mpo_recalculated=_on_mpo_recalculated,
+                    on_tool_config_changed=_on_external_tool_config_changed,
+                    on_scaffold_selected=lambda smi: (
+                        task_island.load_scaffold(smi) if task_island is not None else None
+                    ),
+                )
+            grid_slot = ui.element("div").classes("w-full flex-1 min-h-0 min-w-0 overflow-hidden")
+            with grid_slot:
                 candidate_grid = CandidateGrid(
                     runtime,
                     on_candidate_selected=_select_candidate,
@@ -230,20 +236,40 @@ async def chemical_ide_page(
             task_island = TaskCommandIsland(
                 runtime,
                 on_tool_config_changed=_on_external_tool_config_changed,
+                on_toggle_settings=_toggle_settings,
+                on_session_switched=_on_session_switched,
             )
-        with ui.element("div").classes("h-full min-h-0 min-w-0 overflow-hidden"):
+
+        right_inspector_slot = ui.element("div").classes("h-full min-h-0 min-w-0 overflow-hidden")
+        with right_inspector_slot:
             inspector = InspectorPane(
                 runtime,
                 on_row_updated=_on_row_updated,
             )
 
+    def _sync_layout_mode() -> None:
+        is_clean = runtime.is_clean_welcome
+        if is_clean:
+            shell_grid.classes(add="ide-shell-grid--welcome")
+            center_col.classes(add="justify-center bg-white", remove="gap-1")
+        else:
+            shell_grid.classes(remove="ide-shell-grid--welcome")
+            center_col.classes(remove="justify-center bg-white", add="gap-1")
+        right_inspector_slot.set_visibility(not is_clean)
+        mpo_slot.set_visibility(not is_clean)
+        grid_slot.set_visibility(not is_clean)
+        welcome_hero.set_visibility(is_clean)
+        if task_island is not None:
+            task_island.set_floating_mode(not is_clean)
+
+    _sync_layout_mode()
+
     async def _on_runtime_event(event: dict[str, Any]) -> None:
         event_type = str(event.get("type", ""))
         with client:
+            _sync_layout_mode()
             if top_bar is not None:
                 top_bar.refresh()
-            if agent_rail is not None:
-                agent_rail.refresh()
             if task_island is not None:
                 task_island.refresh()
             if tool_settings is not None:
@@ -259,6 +285,8 @@ async def chemical_ide_page(
                     mpo_canvas.refresh(mark_pca_dirty=True)
                 if inspector is not None:
                     inspector.refresh()
+            elif event_type in ("node_started", "docking_started"):
+                pass
             elif event_type in (
                 "node_completed",
                 "pipeline_completed",
@@ -299,7 +327,7 @@ def run_ui(
     ui.run(
         host=host or settings.ui_host,
         port=port or settings.ui_port,
-        title="ПИШОВИЧОК · SAR-дизайн",
+        title="ПИШОВИЧОК",
         dark=False,
         reload=reload,
         native=native,

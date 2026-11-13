@@ -974,12 +974,14 @@ class TestWetLabLightModeRefactoring:
 
         pareto_opts = canvas._build_chart_options()
         assert pareto_opts["backgroundColor"] == "#FFFFFF"
+        assert pareto_opts["legend"]["orient"] == "vertical"
         ok_series = next(s for s in pareto_opts["series"] if s.get("name") == "Кандидаты (допустимые)")
         assert "markLine" in ok_series
         assert "markArea" in ok_series
 
         canvas._mode = "sali"
         sali_opts = canvas._build_chart_options()
+        assert sali_opts["legend"]["orient"] == "vertical"
         assert sali_opts["xAxis"]["name"] == "Сходство (Tanimoto)"
         assert sali_opts["yAxis"]["name"] == "|ΔpIC50|"
         assert len(sali_opts["series"][1]["data"]) == 1
@@ -1059,4 +1061,194 @@ class TestWetLabLightModeRefactoring:
             "Critic Agent: Портфель кандидатов успешно утвержден (валидных: 5/5)."
         )
         assert critic_ru == "Верификация: Портфель кандидатов успешно утвержден (валидных: 5/5)."
+
+
+class TestRedesignActorMetaAndStatus:
+    """Тесты разделения ИИ-агентов/инструментов, хронологии ленты и живого статуса Пишовичка."""
+
+    def test_actor_classification_and_russian_names(self) -> None:
+        from pishovichok.state.schemas import TraceEvent
+        from pishovichok.ui.components.agent_rail import resolve_trace_actor_meta
+
+        def _ev(agent_name: str, phase: str) -> TraceEvent:
+            return TraceEvent(
+                step_index=0,
+                timestamp_iso="2026-11-13T00:00:00Z",
+                agent_name=agent_name,  # type: ignore[arg-type]
+                phase=phase,
+                input_summary="in",
+                action_taken="act",
+                output_summary="out",
+                duration_ms=10.0,
+            )
+
+        res_meta = resolve_trace_actor_meta(_ev("ResearchAgent", "initial_data_ingestion_and_curation"))
+        assert res_meta["kind"] == "agent"
+        assert res_meta["name"] == "Исследователь-агент"
+
+        eval_meta = resolve_trace_actor_meta(_ev("EvaluationAgent", "evaluation_and_admet_it1"))
+        assert eval_meta["kind"] == "agent"
+        assert eval_meta["name"] == "Оценщик-агент"
+
+        critic_meta = resolve_trace_actor_meta(_ev("CriticAgent", "critic_final_approval_it1"))
+        assert critic_meta["kind"] == "agent"
+        assert critic_meta["name"] == "Критик-агент"
+
+        sar_meta = resolve_trace_actor_meta(_ev("SARAgent", "sar_mmp_and_cliffs_extraction"))
+        assert sar_meta["kind"] == "tool"
+        assert "SAR-анализатор" in sar_meta["name"]
+
+        design_meta = resolve_trace_actor_meta(_ev("DesignAgent", "candidate_generation_it1"))
+        assert design_meta["kind"] == "tool"
+        assert "Генератор" in design_meta["name"]
+
+        dock_meta = resolve_trace_actor_meta(_ev("EvaluationAgent", "docking_3d_manual"))
+        assert dock_meta["kind"] == "tool"
+        assert "3D-докинг" in dock_meta["name"]
+
+    def test_clean_welcome_and_pishovichok_live_status(self) -> None:
+        reg = SessionRegistry()
+        rt = reg.get_or_create("sess_welcome_test")
+        assert rt.is_clean_welcome is True
+        assert rt.get_pishovichok_status_text() == ""
+
+        rt.status = "running"
+        rt.current_node = "research"
+        assert rt.is_clean_welcome is False
+        assert "Исследователь-агент" in rt.get_pishovichok_status_text()
+
+        rt.current_node = "sar"
+        assert "SAR-анализатор" in rt.get_pishovichok_status_text()
+
+        rt.current_node = "critic"
+        rt.state["last_executed_stage"] = "sar"
+        assert "Критик-агент" in rt.get_pishovichok_status_text()
+        assert "однородность" in rt.get_pishovichok_status_text()
+
+        rt.current_node = "design"
+        assert "Генератор" in rt.get_pishovichok_status_text()
+
+        rt.current_node = "evaluation"
+        assert "Оценщик-агент" in rt.get_pishovichok_status_text()
+
+        rt.is_docking_running = True
+        rt.docking_target_label = "топ-3"
+        assert "3D-докинг" in rt.get_pishovichok_status_text()
+        assert "топ-3" in rt.get_pishovichok_status_text()
+        rt.is_docking_running = False
+
+        rt.status = "paused_hitl"
+        assert "решения" in rt.get_pishovichok_status_text()
+
+        rt.status = "error"
+        assert "ошибка" in rt.get_pishovichok_status_text().lower()
+
+    def test_timeline_top_to_bottom_and_controls_in_task_island(self) -> None:
+        rail_src = (_SRC_ROOT / "ui" / "components" / "agent_rail.py").read_text(encoding="utf-8")
+        assert "reversed(iter_groups)" not in rail_src
+        assert "reversed(group_events)" not in rail_src
+        assert "Запустить 3D-докинг" not in (_SRC_ROOT / "ui" / "components" / "candidate_grid.py").read_text(encoding="utf-8")
+        island_src = (_SRC_ROOT / "ui" / "components" / "task_island.py").read_text(encoding="utf-8")
+        assert "Запустить 3D-докинг" in island_src
+        assert "Параметры" in island_src
+        assert "Демо" in island_src
+        assert "Журнал верификации и расчёта" in island_src
+        assert "floating-island-pill" in island_src
+        assert "def set_floating_mode" in island_src
+
+        mpo_src = (_SRC_ROOT / "ui" / "components" / "mpo_canvas.py").read_text(encoding="utf-8")
+        assert "Правила SAR (MMP)" in mpo_src
+        assert "Базовые скаффолды (Bemis–Murcko)" in mpo_src
+        assert '"sar_rules": "Правила SAR"' in mpo_src
+
+        app_src = (_SRC_ROOT / "ui" / "app.py").read_text(encoding="utf-8")
+        assert "AgentRail" not in app_src
+        assert "set_floating_mode" in app_src
+
+    def test_pishovichok_journal_summary(self) -> None:
+        from pishovichok.state.schemas import TraceEvent
+        from pishovichok.ui.components.agent_rail import format_pishovichok_journal_summary
+
+        reg = SessionRegistry()
+        rt = reg.get_or_create("sess_journal_summary")
+        assert format_pishovichok_journal_summary(rt) == ("", "neutral")
+
+        rt.status = "completed"
+        rt.state["trace_log"] = [
+            TraceEvent(
+                step_index=0,
+                timestamp_iso="2026-11-13T00:00:00Z",
+                agent_name="ResearchAgent",
+                phase="curation",
+                input_summary="in",
+                action_taken="act",
+                output_summary="Curated 10 molecules.",
+                duration_ms=500.0,
+            ),
+            TraceEvent(
+                step_index=1,
+                timestamp_iso="2026-11-13T00:00:01Z",
+                agent_name="CriticAgent",
+                phase="critic_final_approval_it1",
+                input_summary="in",
+                action_taken="act",
+                output_summary="Critic Agent: Портфель кандидатов успешно утвержден (валидных: 5/5).",
+                verdict_or_routing="approve",
+                duration_ms=700.0,
+            ),
+        ]
+        summary_txt, tone = format_pishovichok_journal_summary(rt)
+        assert tone == "approved"
+        assert "Утверждено (5/5)" in summary_txt
+        assert "шагов: 2" in summary_txt
+        assert "1.2 с" in summary_txt
+
+    def test_apply_scenario_context_after_completion(self) -> None:
+        from pishovichok.ui.components.task_island import DEMO_SCENARIOS, TaskCommandIsland
+
+        class _FakeInput:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set_value(self, value: str) -> None:
+                self.value = value
+
+        class _FakeSketcher:
+            def __init__(self) -> None:
+                self.smiles = ""
+
+            def set_smiles(self, smiles: str) -> None:
+                self.smiles = smiles
+
+        reg = SessionRegistry()
+        rt = reg.get_or_create("sess_apply_demo")
+        island = TaskCommandIsland.__new__(TaskCommandIsland)
+        island.runtime = rt
+        island._query_input = _FakeInput()
+        island._smiles_input = _FakeInput()
+        island._sketcher = _FakeSketcher()
+        island._is_floating = True
+        island._composer_expanded = False
+        island.refresh = lambda: None
+        island._close_panels = lambda: None
+
+        # После завершённого расчёта кнопка "Подставить" должна заполнять промпт и SMILES
+        rt.status = "completed"
+        island._apply_demo_prompt("scenario2_gefitinib")
+        assert island._composer_expanded is True
+        assert island._query_input.value == DEMO_SCENARIOS["scenario2_gefitinib"]["query"]
+        assert island._smiles_input.value == DEMO_SCENARIOS["scenario2_gefitinib"]["lead_smiles"]
+        assert island._sketcher.smiles == DEMO_SCENARIOS["scenario2_gefitinib"]["lead_smiles"]
+
+        # Во время активного расчёта или HITL паузы текущий запрос не перезаписывается
+        island._query_input.set_value("Текущий активный запрос")
+        rt.status = "running"
+        island.apply_scenario_context("scenario1_btk")
+        assert island._query_input.value == "Текущий активный запрос"
+
+        rt.status = "paused_hitl"
+        island.apply_scenario_context("scenario1_btk")
+        assert island._query_input.value == "Текущий активный запрос"
+
+
 

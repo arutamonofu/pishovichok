@@ -160,6 +160,7 @@ class ToolSettingsDrawer:
         self._ban_smarts_error: ui.label | None = None
         self._ban_smarts_chips_row: ui.row | None = None
         self._mpo_weight_sliders: dict[str, tuple[ui.slider, ui.label]] = {}
+        self._mpo_threshold_sliders: dict[str, tuple[str, ui.slider, ui.label]] = {}
         self._hitl_select: ui.select | None = None
 
         self._build()
@@ -717,7 +718,7 @@ class ToolSettingsDrawer:
             mpo_card = ui.column().classes("w-full gap-1.5 bg-white p-2 rounded border border-[#E2E8F0]")
             self._cards["mpo_weights"] = mpo_card
             with mpo_card:
-                self._render_param_header("mpo_weights", "Веса Харрингтона MPO (синхр. с графиком)")
+                self._render_param_header("mpo_weights", "Веса Харрингтона (MPO)")
                 with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-1"):
                     for w_key, w_label in _MPO_WEIGHT_FIELDS:
                         w_val = float(tc.mpo_weights.get(w_key, 1.0))
@@ -739,6 +740,49 @@ class ToolSettingsDrawer:
                                 on_change=_on_w,
                             ).props("dense color=primary")
                             self._mpo_weight_sliders[w_key] = (sld, lbl)
+
+            with ui.column().classes("w-full gap-1.5 bg-white p-2 rounded border border-[#E2E8F0]"):
+                ui.label("Пороги ограничений (MPO и график Парето)").classes(
+                    "text-[11px] font-semibold text-[#1E293B]"
+                )
+                w_vm = self.runtime.view_model.weights
+                threshold_specs = [
+                    ("max_logp", "Порог cLogP", 1.0, 7.0, 0.1),
+                    ("max_sa_score", "Порог SAscore", 2.0, 7.0, 0.1),
+                    ("max_herg_prob", "Порог hERG", 0.1, 0.9, 0.05),
+                    ("max_mw", "Порог MW", 300.0, 800.0, 10.0),
+                ]
+                with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-1"):
+                    for attr_name, t_label, min_v, max_v, step_v in threshold_specs:
+                        cur_v = float(getattr(w_vm, attr_name))
+                        with ui.column().classes("w-full gap-0"):
+                            t_lbl = ui.label(f"{t_label}: {cur_v:.2f}").classes(
+                                "text-[11px] text-[#334155]"
+                            )
+
+                            def _on_thr(
+                                e: Any,
+                                attr: str = attr_name,
+                                tl: str = t_label,
+                                lb: ui.label = t_lbl,
+                            ) -> None:
+                                if self._syncing:
+                                    return
+                                v = float(e.value)
+                                setattr(self.runtime.view_model.weights, attr, v)
+                                lb.set_text(f"{tl}: {v:.2f}")
+                                self.runtime.view_model.recalculate_mpo()
+                                if self._on_local_mpo_updated is not None:
+                                    self._on_local_mpo_updated()
+
+                            t_sld = ui.slider(
+                                min=min_v,
+                                max=max_v,
+                                step=step_v,
+                                value=cur_v,
+                                on_change=_on_thr,
+                            ).props("dense color=primary")
+                            self._mpo_threshold_sliders[attr_name] = (t_label, t_sld, t_lbl)
 
             with ui.grid(columns=2).classes("w-full gap-2"):
                 self._add_select(
@@ -1153,6 +1197,11 @@ class ToolSettingsDrawer:
                 w_val = float(tc.mpo_weights.get(w_key, 1.0))
                 sld.set_value(w_val)
                 lbl.set_text(f"{w_label}: {w_val:.2f}")
+            w_vm = self.runtime.view_model.weights
+            for attr_name, (t_label, t_sld, t_lbl) in self._mpo_threshold_sliders.items():
+                cur_v = float(getattr(w_vm, attr_name))
+                t_sld.set_value(cur_v)
+                t_lbl.set_text(f"{t_label}: {cur_v:.2f}")
             if self._protected_smarts_input is not None:
                 self._protected_smarts_input.set_value(str(tc.protected_smarts or ""))
             if self._protected_smarts_error is not None:

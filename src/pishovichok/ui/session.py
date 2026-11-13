@@ -68,8 +68,58 @@ class SessionRuntime:
     svg_cache: dict[tuple[str, str, int, int], str] = field(default_factory=dict)
     depth_mode: Literal["lab", "expert"] = "lab"
     active_scenario_key: str | None = None
+    is_docking_running: bool = False
+    docking_target_label: str | None = None
     error_message: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def is_clean_welcome(self) -> bool:
+        """True на чистом стартовом экране до отправки первого запроса или открытия сессии."""
+        return (
+            self.status == "idle"
+            and not self.is_docking_running
+            and not self.state.get("trace_log")
+            and len(self.view_model.rows_by_id) == 0
+        )
+
+    def get_pishovichok_status_text(self) -> str:
+        """Возвращает живую реплику маскота о текущем выполняемом действии."""
+        if self.is_docking_running:
+            target = (
+                f" ({self.docking_target_label})"
+                if self.docking_target_label
+                else ""
+            )
+            return f"Выполняю физический 3D-докинг{target}…"
+        if self.status == "paused_hitl":
+            return "Жду вашего решения: проверьте скаффолды или утвердите продолжение."
+        if self.status == "error":
+            return "Возникла ошибка расчёта — проверьте детали в журнале."
+        if self.status != "running":
+            return ""
+
+        node = self.current_node or "research"
+        if node == "research":
+            is_refilter = bool(self.state.get("assay_filter_strict")) or int(
+                self.state.get("data_refilter_iteration") or 0
+            ) > 0
+            if is_refilter:
+                return "Повторно фильтрую выборку по строгому протоколу BAO…"
+            return "Исследователь-агент: разбираю запрос и подготавливаю данные ChEMBL / CSV…"
+        if node == "sar":
+            return "SAR-анализатор (rdMMPA / SALI): ищу парные трансформации и перепады активности…"
+        if node == "critic":
+            last_stage = str(self.state.get("last_executed_stage") or "")
+            if last_stage in ("sar", "research"):
+                return "Критик-агент: проверяю однородность экспериментальных протоколов…"
+            return "Критик-агент: верифицирую кандидатов и формирую отчёт…"
+        if node == "design":
+            it_num = int(self.state.get("design_iteration") or 0) + 1
+            return f"Генератор (CReM / GraphGA): создаю структуры-кандидаты (итерация {it_num})…"
+        if node == "evaluation":
+            return "Оценщик-агент: считаю RDKit, ADMET, индекс Харрингтона и докинг…"
+        return "Выполняю вычислительный шаг графа…"
 
     def resolve_molecule_for_svg(
         self, mol_id: str, variant: str = "diff"
