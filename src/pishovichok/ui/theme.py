@@ -292,6 +292,26 @@ body {
   background: var(--brand-plum-hover) !important;
   background-color: var(--brand-plum-hover) !important;
 }
+
+/* Отступ и выравнивание иконки с текстом внутри кнопок и плашек (.q-btn__content) */
+.q-btn__content:not(:has(> .q-icon.on-left)):not(:has(> .q-icon.on-right)) {
+  gap: 6px;
+}
+.q-btn.gap-1 > .q-btn__content:not(:has(> .q-icon.on-left)):not(:has(> .q-icon.on-right)) {
+  gap: 5px;
+}
+.q-btn.gap-1\\.5 > .q-btn__content:not(:has(> .q-icon.on-left)):not(:has(> .q-icon.on-right)) {
+  gap: 6px;
+}
+.q-btn.gap-2 > .q-btn__content:not(:has(> .q-icon.on-left)):not(:has(> .q-icon.on-right)) {
+  gap: 8px;
+}
+.q-btn__content > div:has(> svg) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
 </style>
 """
 

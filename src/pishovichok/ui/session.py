@@ -178,15 +178,14 @@ def _read_saved_session_sync(
 
     candidates: list[CandidateMolecule] = []
     if candidates_file.is_file():
-        df_cands = (
+        cand_rows = (
             duckdb.connect()
-            .execute(f"SELECT * FROM '{candidates_file.as_posix()}'")
-            .df()
+            .sql(f"SELECT * FROM '{candidates_file.as_posix()}'")
+            .to_arrow_table()
+            .to_pylist()
         )
-        for _, row in df_cands.iterrows():
-            candidates.append(
-                CandidateMolecule.from_flat_parquet_record(row.to_dict())
-            )
+        for row in cand_rows:
+            candidates.append(CandidateMolecule.from_flat_parquet_record(row))
 
     ref_points: list[ReferencePointVM] = []
     if curated_file.is_file():
@@ -194,12 +193,13 @@ def _read_saved_session_sync(
             from rdkit import Chem
             from rdkit.Chem import Descriptors
 
-            df_cur = (
+            cur_rows = (
                 duckdb.connect()
-                .execute(f"SELECT * FROM '{curated_file.as_posix()}' LIMIT 250")
-                .df()
+                .sql(f"SELECT * FROM '{curated_file.as_posix()}' LIMIT 250")
+                .to_arrow_table()
+                .to_pylist()
             )
-            for _, row in df_cur.iterrows():
+            for row in cur_rows:
                 smi = str(row.get("canonical_smiles") or "")
                 mol = Chem.MolFromSmiles(smi) if smi else None
                 if mol is None:
@@ -265,9 +265,13 @@ def _read_saved_session_sync(
                     )
                 )
 
-            pairs_df = conn.sql(f"SELECT * FROM read_parquet('{mmp_posix}') LIMIT 250").df()
+            pair_rows = (
+                conn.sql(f"SELECT * FROM read_parquet('{mmp_posix}') LIMIT 250")
+                .to_arrow_table()
+                .to_pylist()
+            )
             cliff_idx = 0
-            for _, prow in pairs_df.iterrows():
+            for prow in pair_rows:
                 tanimoto = float(prow.get("tanimoto_similarity") or 0.0)
                 abs_d = abs(float(prow.get("delta_pic50") or 0.0))
                 sali = float(prow.get("sali_index") or 0.0)

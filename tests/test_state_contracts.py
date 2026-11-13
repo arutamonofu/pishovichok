@@ -690,3 +690,20 @@ def test_graph_ga_tool_config_and_candidate_contracts() -> None:
         assert roundtrip.hypothesis_rationale.rule_id == rule_id
 
 
+def test_from_flat_parquet_record_handles_nan_and_empty_optional_fields() -> None:
+    """Проверяет устойчивость `from_flat_parquet_record` к NaN/None из pandas/DuckDB."""
+    cand = _sample_candidate()
+    flat = cand.to_flat_parquet_record()
+    flat["docking_json"] = float("nan")
+    flat["alert_penalty_mode"] = float("nan")
+    flat["constraint_violations_json"] = float("nan")
+    flat["highlighted_atom_indices_json"] = ""
+
+    restored = CandidateMolecule.from_flat_parquet_record(flat)
+    assert restored.docking is None
+    assert restored.alert_penalty_mode == "veto"
+    assert restored.constraint_violations == []
+    assert restored.highlighted_atom_indices == []
+
+
+

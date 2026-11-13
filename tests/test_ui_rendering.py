@@ -336,6 +336,24 @@ class TestScenarioArtifactExports:
         assert len(rt.view_model.rows_by_id) > 0
         assert len(rt.state.get("trace_log", [])) > 0
 
+    def test_restore_workspace_with_null_docking_parquet(
+        self, tmp_path: Path
+    ) -> None:
+        from pishovichok.state.storage import write_candidates_parquet
+
+        sess_dir = tmp_path / "sess_null_docking"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        cand = _make_dummy_candidate("CAND_NULL_DOCK_01")
+        assert cand.docking is None
+        write_candidates_parquet([cand], sess_dir, "evaluated_candidates.parquet")
+
+        reg = SessionRegistry(base_workspace_dir=tmp_path)
+        rt = asyncio.run(reg.restore_from_workspace("sess_null_docking"))
+        assert rt is not None
+        assert cand.candidate_id in rt.view_model.rows_by_id
+        assert rt.view_model.candidates_by_id[cand.candidate_id].docking is None
+
+
 
 class TestUIComponentAndCheckpointFixes:
     """Регрессионные тесты для 3D-вьюера и строгой msgpack-сериализации чекпоинтов."""

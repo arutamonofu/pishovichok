@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -534,6 +535,19 @@ class CandidateMolecule(BaseModel):
     @classmethod
     def from_flat_parquet_record(cls, row: dict[str, Any]) -> CandidateMolecule:
         """Восстанавливает типизированный CandidateMolecule из строки evaluated_candidates.parquet."""
+        raw_alert_mode = row.get("alert_penalty_mode")
+        raw_violations = row.get("constraint_violations_json")
+        raw_highlights = row.get("highlighted_atom_indices_json")
+        raw_docking = row.get("docking_json")
+
+        docking: DockingResult | None = None
+        if not _is_missing_scalar(raw_docking):
+            docking = (
+                DockingResult.model_validate(raw_docking)
+                if isinstance(raw_docking, dict)
+                else DockingResult.model_validate_json(raw_docking)
+            )
+
         return cls(
             candidate_id=str(row["candidate_id"]),
             canonical_smiles=str(row["canonical_smiles"]),
@@ -553,17 +567,45 @@ class CandidateMolecule(BaseModel):
             ),
             mpo_harrington_score=float(row["mpo_harrington_score"]),
             passes_all_constraints=bool(row["passes_all_constraints"]),
-            alert_penalty_mode=row.get("alert_penalty_mode") or "veto",
-            constraint_violations=json.loads(
-                row.get("constraint_violations_json") or "[]"
+            alert_penalty_mode=(
+                "veto" if _is_missing_scalar(raw_alert_mode) else str(raw_alert_mode)
             ),
-            highlighted_atom_indices=json.loads(
-                row.get("highlighted_atom_indices_json") or "[]"
+            constraint_violations=(
+                []
+                if _is_missing_scalar(raw_violations)
+                else (
+                    list(raw_violations)
+                    if isinstance(raw_violations, list)
+                    else json.loads(raw_violations)
+                )
             ),
-            docking=DockingResult.model_validate_json(row["docking_json"])
-            if row.get("docking_json")
-            else None,
+            highlighted_atom_indices=(
+                []
+                if _is_missing_scalar(raw_highlights)
+                else (
+                    list(raw_highlights)
+                    if isinstance(raw_highlights, list)
+                    else json.loads(raw_highlights)
+                )
+            ),
+            docking=docking,
         )
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    """Проверяет отсутствие значения (None, NaN, pandas.NA, пустая строка)."""
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if getattr(type(value), "__name__", "") == "NAType":
+        return True
+    try:
+        return bool(value != value)
+    except Exception:
+        return False
 
 
 # ============================================================================
