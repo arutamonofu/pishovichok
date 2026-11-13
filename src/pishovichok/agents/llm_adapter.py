@@ -1,6 +1,6 @@
 """Адаптер языковой модели с каскадной отказоустойчивостью (Слой 3).
 
-Реализует трехуровневый каскад (Раздел 1.2 ARCHITECTURE.md):
+Реализует трехуровневый каскад:
 - Уровень 1: Облачный OpenAI-совместимый API (OpenAI / DeepSeek / OpenRouter / vLLM)
   через `ChatOpenAI.with_structured_output(..., method="json_schema", strict=True)`.
 - Уровень 2: Локальный эндпоинт Ollama (`http://localhost:11434/v1`).

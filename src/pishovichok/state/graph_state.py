@@ -1,6 +1,5 @@
 """Схема глобального состояния мультиагентного графа LangGraph (Blackboard + Fat Pointers).
 
-Соответствует Разделу 5.3 ARCHITECTURE.md.
 В память графа передаются только неизменяемые указатели `ParquetPointer` и компактные
 агрегированные сводки, исключая попадание сырых таблиц молекул в контекстное окно LLM.
 """
@@ -23,7 +22,7 @@ from pishovichok.state.schemas import (
     TraceEvent,
 )
 
-# Запрещенные ключи в состоянии графа (Инвариант 2 из Раздела 5.4 ARCHITECTURE.md)
+# Запрещенные ключи в состоянии графа
 FORBIDDEN_RAW_COLLECTION_KEYS: frozenset[str] = frozenset(
     {
         "all_molecules",

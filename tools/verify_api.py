@@ -1,6 +1,6 @@
 """Инструмент предварительной программной интроспекции API рантайма (API Pre-Verification Protocol).
 
-Реализует 4-этапный протокол из Раздела 2 ARCHITECTURE.md:
+Реализует 4-этапный протокол:
 1. Import Discovery (Обнаружение пути импорта)
 2. Signature Inspection (Интроспекция сигнатур через inspect.signature)
 3. In-Memory Probe (Минимальный синтетический вызов в RAM / временном буфере)
@@ -170,7 +170,7 @@ def verify_tabular_and_schema_apis() -> dict[str, Any]:
             ],
         }
 
-    # 3. Проверка критичных вызовов RDKit (Gotchas из Раздела 2.4 ARCHITECTURE.md)
+    # 3. Проверка критичных вызовов RDKit
     mol = Chem.MolFromSmiles("COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1.Cl")
     clean_mol = rdMolStandardize.Cleanup(mol)
     chooser = rdMolStandardize.LargestFragmentChooser()

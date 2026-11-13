@@ -35,7 +35,11 @@ from pishovichok.agents.research_node import research_node
 from pishovichok.agents.sar_node import sar_node
 from pishovichok.state.graph_state import SARGraphState, create_initial_graph_state
 from pishovichok.state.schemas import CandidateMolecule, QueryConstraints, ToolConfig
-from pishovichok.state.storage import create_session_workspace, export_trace_log
+from pishovichok.state.storage import (
+    create_session_workspace,
+    export_session_meta,
+    export_trace_log,
+)
 
 
 def build_sar_graph(
@@ -278,6 +282,7 @@ def run_sar_pipeline(
 
     if export_artifacts:
         trace_path = export_trace_log(final_state.get("trace_log", []), session_dir)
+        export_session_meta(dict(final_state), session_dir)
         top_candidates = final_state.get("top_candidates", [])
         if top_candidates:
             csv_path = export_candidates_to_csv(

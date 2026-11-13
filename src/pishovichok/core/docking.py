@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import math
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen, Lipinski, rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
-from pishovichok.config import DEMO_RECEPTOR_PRESETS, DOCKING_MAX_BOX_VOLUME
+from pishovichok.config import DEMO_RECEPTOR_PRESETS, DOCKING_MAX_BOX_VOLUME, settings
 from pishovichok.core.receptor_resolver import resolve_receptor
 
 PROLIF_INTERACTION_TYPES: tuple[str, ...] = (
@@ -427,6 +429,36 @@ def _docking_worker(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _docking_cache_file(
+    *,
+    clean_smiles: str,
+    pdb_id: str,
+    pdbqt_path: str,
+    box_center: list[float],
+    box_size: list[float],
+    exhaustiveness: int,
+) -> Path | None:
+    """Возвращает путь к файлу локального кэша 3D-докинга по хэшу параметров и рецептора."""
+    try:
+        pdbqt_bytes = Path(pdbqt_path).read_bytes()
+    except OSError:
+        return None
+    pdbqt_sha = hashlib.sha256(pdbqt_bytes).hexdigest()
+    key_payload = json.dumps(
+        {
+            "clean_smiles": clean_smiles,
+            "pdb_id": str(pdb_id).upper(),
+            "pdbqt_sha256": pdbqt_sha,
+            "box_center": [round(float(v), 3) for v in box_center],
+            "box_size": [round(float(v), 3) for v in box_size],
+            "exhaustiveness": int(exhaustiveness),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    return settings.resolved_data_dir / "docking_cache" / f"{digest}.json"
+
+
 def run_docking(
     ligand_smiles: str,
     target_id: str | None,
@@ -436,6 +468,7 @@ def run_docking(
     box_size: list[float] | None = None,
     output_sdf_path: str | None = None,
     receptors_dir: Path | str | None = None,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     """Выполняет 3D-докинг одного лиганда в активный центр белка-мишени.
 
@@ -520,6 +553,49 @@ def run_docking(
             ),
         }
 
+    eff_exhaust = max(1, min(16, int(exhaustiveness)))
+    cache_path = (
+        _docking_cache_file(
+            clean_smiles=clean_smiles,
+            pdb_id=str(receptor_meta["pdb_id"]),
+            pdbqt_path=str(receptor_meta["pdbqt_path"]),
+            box_center=eff_box_center,
+            box_size=eff_box_size,
+            exhaustiveness=eff_exhaust,
+        )
+        if use_cache
+        else None
+    )
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("status") == "SUCCESS" and cached.get("pose_sdf_block"):
+                pose_sdf_block = str(cached["pose_sdf_block"])
+                saved_sdf_path: str | None = None
+                if output_sdf_path and pose_sdf_block:
+                    sdf_out = Path(output_sdf_path)
+                    sdf_out.parent.mkdir(parents=True, exist_ok=True)
+                    sdf_out.write_text(pose_sdf_block, encoding="utf-8")
+                    saved_sdf_path = sdf_out.as_posix()
+                return {
+                    "status": "SUCCESS",
+                    "pdb_id": receptor_meta.get("pdb_id"),
+                    "receptor_name": receptor_name,
+                    "source": receptor_meta.get("source"),
+                    "docking_score_kcal": cached.get("docking_score_kcal"),
+                    "backend": cached.get("backend"),
+                    "interactions": cached.get("interactions", {}),
+                    "pose_sdf_path": saved_sdf_path,
+                    "pose_sdf_block": pose_sdf_block,
+                    "receptor_pdb_path": receptor_meta.get("pdb_path"),
+                    "box_center": eff_box_center,
+                    "box_size": eff_box_size,
+                    "key_residues": list(receptor_meta.get("key_residues", [])),
+                    "message": cached.get("message"),
+                }
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
     payload = {
         "clean_smiles": clean_smiles,
         "pdbqt_path": receptor_meta["pdbqt_path"],
@@ -527,7 +603,7 @@ def run_docking(
         "pdb_id": receptor_meta["pdb_id"],
         "box_center": eff_box_center,
         "box_size": eff_box_size,
-        "exhaustiveness": max(1, min(16, int(exhaustiveness))),
+        "exhaustiveness": eff_exhaust,
         "key_residues": list(receptor_meta.get("key_residues", [])),
     }
 
@@ -562,7 +638,31 @@ def run_docking(
         }
 
     pose_sdf_block = worker_res.get("pose_sdf_block")
-    saved_sdf_path: str | None = None
+    if (
+        cache_path is not None
+        and worker_res.get("status") == "SUCCESS"
+        and pose_sdf_block
+    ):
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "status": "SUCCESS",
+                        "docking_score_kcal": worker_res.get("docking_score_kcal"),
+                        "backend": worker_res.get("backend"),
+                        "interactions": worker_res.get("interactions", {}),
+                        "pose_sdf_block": pose_sdf_block,
+                        "message": worker_res.get("message"),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    saved_sdf_path = None
     if output_sdf_path and pose_sdf_block:
         sdf_out = Path(output_sdf_path)
         sdf_out.parent.mkdir(parents=True, exist_ok=True)

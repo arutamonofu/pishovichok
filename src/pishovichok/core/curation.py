@@ -185,7 +185,7 @@ def standardize_smiles(
     *,
     tool_config: ToolConfig | None = None,
 ) -> tuple[str, str, str] | None:
-    """Контракт стандартизации из Раздела 3.2 ARCHITECTURE.md.
+    """Контракт стандартизации молекул.
 
     Возвращает `(canonical_smiles, inchi_key, scaffold_smiles)` при успехе либо `None` при ошибке.
     """
@@ -288,7 +288,7 @@ def _load_chembl_target_rows(
     *,
     tool_config: ToolConfig | None = None,
 ) -> tuple[list[dict[str, Any]], Literal["chembl_parquet", "chembl_api"]]:
-    """Реализует 3-уровневый каскад загрузки данных ChEMBL (Раздел 1.2 ARCHITECTURE.md):
+    """Реализует 3-уровневый каскад загрузки данных ChEMBL:
     Уровень 1: Локальный кэш `/data/chembl/<target>.parquet` через DuckDB.
     Уровень 2: REST API `chembl_webresource_client` (опционально, при наличии сети).
     Уровень 3: Резервный слепок `/data/chembl/fallback_targets.parquet`.
@@ -619,7 +619,7 @@ def curate_chembl_or_csv(
     salts_stripped_count = 0
     censored_values_count = 0
 
-    # Группируем по (inchi_key, bao_format, standard_type) согласно Разделу 6.1.1 ARCHITECTURE.md
+    # Группируем по (inchi_key, bao_format, standard_type)
     dedup_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
 
     for row in active_rows:

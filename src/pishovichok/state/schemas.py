@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# Обязательные колонки 4 сессионных Parquet-таблиц согласно Разделу 5.1 ARCHITECTURE.md
+# Обязательные колонки 4 сессионных Parquet-таблиц
 PARQUET_TABLE_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "raw_dataset": (
         "raw_row_id",

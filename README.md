@@ -21,7 +21,7 @@ flowchart LR
     critic -- "approve" --> END((END))
 ```
 
-Подробности устройства описаны в [ARCHITECTURE.md](ARCHITECTURE.md) и [SPEC.md](SPEC.md).
+Подробности устройства описаны в [SPEC.md](SPEC.md).
 
 ## Быстрый старт
 
@@ -107,7 +107,7 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-Результаты абляционного тестирования (6 задач, `docking_mode='skip'`, подробнее в [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md)):
+Результаты абляционного тестирования (6 задач, `docking_mode='skip'`):
 
 | Метрика | Baseline (Zero-shot LLM) | МАС (1 итерация) | МАС (Полный цикл + критик) |
 | :--- | :---: | :---: | :---: |

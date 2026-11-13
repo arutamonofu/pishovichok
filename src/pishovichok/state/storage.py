@@ -236,3 +236,66 @@ def export_trace_log(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return out_path
+
+
+def export_session_meta(
+    state: dict[str, Any],
+    session_dir: str | Path,
+    filename: str = "session_meta.json",
+) -> Path:
+    """Сохраняет компактные метаданные сессии (ограничения, ToolConfig, референс лидера и курацию) для быстрого восстановления."""
+    target_dir = Path(session_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = target_dir / filename
+
+    qc = state.get("query_constraints")
+    tc = state.get("tool_config")
+    lead_ref = state.get("lead_reference_metrics")
+    cur_sum = state.get("curation_summary")
+
+    payload: dict[str, Any] = {
+        "user_query": state.get("user_query") or "",
+        "uploaded_csv_path": state.get("uploaded_csv_path"),
+        "assay_filter_strict": bool(state.get("assay_filter_strict", False)),
+        "active_bao_filter": state.get("active_bao_filter"),
+        "enriched_with_chembl_background": bool(
+            state.get("enriched_with_chembl_background", False)
+        ),
+        "param_sources": dict(state.get("param_sources") or {}),
+        "node_telemetry": dict(state.get("node_telemetry") or {}),
+        "query_constraints": (
+            qc.model_dump(mode="json") if hasattr(qc, "model_dump") else qc
+        ),
+        "tool_config": (
+            tc.model_dump(mode="json") if hasattr(tc, "model_dump") else tc
+        ),
+        "lead_reference_metrics": (
+            lead_ref.model_dump(mode="json")
+            if hasattr(lead_ref, "model_dump")
+            else lead_ref
+        ),
+        "curation_summary": (
+            cur_sum.model_dump(mode="json")
+            if hasattr(cur_sum, "model_dump")
+            else cur_sum
+        ),
+    }
+    out_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return out_path
+
+
+def load_session_meta(
+    session_dir: str | Path,
+    filename: str = "session_meta.json",
+) -> dict[str, Any] | None:
+    """Читает `session_meta.json` из директории сессии, если он существует и валиден."""
+    meta_path = Path(session_dir).resolve() / filename
+    if not meta_path.is_file():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None

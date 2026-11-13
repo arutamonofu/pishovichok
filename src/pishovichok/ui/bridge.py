@@ -44,6 +44,7 @@ from pishovichok.state.schemas import (
 from pishovichok.state.storage import (
     compute_file_sha256,
     create_session_workspace,
+    export_session_meta,
     export_trace_log,
     read_candidates_parquet,
     write_candidates_parquet,
@@ -143,8 +144,9 @@ def _export_session_artifacts_sync(
     state: SARGraphState,
     session_dir: Path,
 ) -> None:
-    """Экспортирует артефакты сессии (`trace_log.json`, `candidates.csv`, `candidates.sdf`, `report.md`)."""
+    """Экспортирует артефакты сессии (`trace_log.json`, `session_meta.json`, `candidates.csv`, `candidates.sdf`, `report.md`)."""
     export_trace_log(state.get("trace_log", []), session_dir)
+    export_session_meta(dict(state), session_dir)
     top_candidates = state.get("top_candidates", [])
     if top_candidates:
         export_candidates_to_csv(top_candidates, session_dir / "candidates.csv")
@@ -1046,6 +1048,7 @@ class AgentUIBridge:
         state["trace_log"] = [*existing_trace, dock_event]
         if workspace_dir is not None:
             await asyncio.to_thread(export_trace_log, state["trace_log"], workspace_dir)
+            await asyncio.to_thread(export_session_meta, dict(state), workspace_dir)
 
         lead_ref = state.get("lead_reference_metrics")
         new_ids = runtime.view_model.upsert_candidates(updated_pool, lead_reference=lead_ref)

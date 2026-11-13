@@ -55,7 +55,7 @@ def calculate_sali(
 ) -> float:
     """Вычисляет индекс ландшафта 'структура–активность' (Structure-Activity Landscape Index, SALI).
 
-    Формула (Раздел 5 SPEC.md и Раздел 3.3 ARCHITECTURE.md):
+    Формула (Раздел 5 SPEC.md):
         SALI(i, j) = |pIC50(i) - pIC50(j)| / (1.0 - Tanimoto(i, j) + epsilon)
     """
     eps = epsilon if epsilon is not None else settings.sali_epsilon
@@ -592,7 +592,7 @@ def extract_mmp_with_background_fallback(
 ) -> tuple[ParquetPointer, list[SARRule], list[ActivityCliff], bool]:
     """Обертка над `extract_mmp_and_cliffs` с автоматическим обогащением фоновыми правилами ChEMBL.
 
-    Реализует детерминированный фолбэк из Раздела 3.3 и 6.3 ARCHITECTURE.md для Сценария 3:
+    Реализует детерминированный фолбэк для Сценария 3:
     если в загруженной малой лабораторной серии CSV найдено менее `min_rules_threshold`
     статистически значимых правил SAR, автоматически извлекаются гомогенные правила MMP
     по целевой мишени из локального кэша `/data/chembl/` и выставляется флаг

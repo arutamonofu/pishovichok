@@ -1,6 +1,6 @@
 """Модуль расчета физико-химических дескрипторов, подструктурных фильтров и ретросинтеза BRICS (Слой 1).
 
-Выполняется на 100% детерминированно без вызовов LLM (Разделы 3.5, 3.6 и 6.1.4 ARCHITECTURE.md):
+Выполняется на 100% детерминированно без вызовов LLM:
 1. Расчет дескрипторов RDKit: `ExactMolWt`, `MolLogP`, `TPSA`, `NumHDonors`, `NumHAcceptors`,
    `NumRotatableBonds`, `FractionCSP3`, `QED.qed` и числа нарушений правила пяти Липински.
 2. Расчет индекса синтетической доступности Эртля (`SAscore` в диапазоне `[1.0, 10.0]`) через
@@ -114,7 +114,7 @@ def calculate_sa_score(mol: Chem.Mol) -> float:
             raw_score = float(scorer.calculateScore(mol))
             return round(max(1.0, min(10.0, raw_score)), 4)
 
-    # Детерминированный аналитический фолбэк (Раздел 3.5 ARCHITECTURE.md)
+    # Детерминированный аналитический фолбэк
     bertz = float(GraphDescriptors.BertzCT(mol))
     chiral_centers = len(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
     spiro_atoms = rdMolDescriptors.CalcNumSpiroAtoms(mol)

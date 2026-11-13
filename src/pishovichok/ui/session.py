@@ -24,11 +24,13 @@ from pishovichok.state.graph_state import SARGraphState, create_initial_graph_st
 from pishovichok.state.schemas import (
     ActivityCliff,
     CandidateMolecule,
+    DatasetCurationSummary,
     QueryConstraints,
     SARRule,
+    ToolConfig,
     TraceEvent,
 )
-from pishovichok.state.storage import create_session_workspace
+from pishovichok.state.storage import create_session_workspace, load_session_meta
 from pishovichok.ui.state_vm import ReferencePointVM, StateViewModel
 
 HITLMode = Literal["auto", "pause_after_scaffolds", "pause_before_critic"]
@@ -367,6 +369,7 @@ def _read_saved_session_sync(
     report_md = (
         report_file.read_text(encoding="utf-8") if report_file.is_file() else None
     )
+    session_meta = load_session_meta(sess_dir)
 
     return {
         "session_dir": sess_dir,
@@ -377,6 +380,7 @@ def _read_saved_session_sync(
         "activity_cliffs": activity_cliffs,
         "mmp_pairs_preview": mmp_pairs_preview,
         "report_md": report_md,
+        "session_meta": session_meta,
     }
 
 
@@ -446,6 +450,46 @@ class SessionRegistry:
             runtime = self.get_or_create(session_id=session_id)
             candidates: list[CandidateMolecule] = payload["candidates"]
             trace_events: list[TraceEvent] = payload["trace_events"]
+            session_meta: dict[str, Any] | None = payload.get("session_meta")
+
+            lead_ref: CandidateMolecule | None = None
+            if isinstance(session_meta, dict):
+                if session_meta.get("user_query"):
+                    runtime.state["user_query"] = str(session_meta["user_query"])
+                if session_meta.get("uploaded_csv_path") is not None:
+                    runtime.state["uploaded_csv_path"] = session_meta["uploaded_csv_path"]
+                runtime.state["assay_filter_strict"] = bool(
+                    session_meta.get("assay_filter_strict", False)
+                )
+                if session_meta.get("active_bao_filter") is not None:
+                    runtime.state["active_bao_filter"] = session_meta["active_bao_filter"]
+                runtime.state["enriched_with_chembl_background"] = bool(
+                    session_meta.get("enriched_with_chembl_background", False)
+                )
+                if isinstance(session_meta.get("param_sources"), dict):
+                    runtime.state["param_sources"] = dict(session_meta["param_sources"])
+                if isinstance(session_meta.get("node_telemetry"), dict):
+                    runtime.state["node_telemetry"] = dict(session_meta["node_telemetry"])
+                raw_qc = session_meta.get("query_constraints")
+                if isinstance(raw_qc, dict):
+                    qc_obj = QueryConstraints.model_validate(raw_qc)
+                    runtime.state["query_constraints"] = qc_obj
+                    runtime.view_model.sync_constraints(qc_obj)
+                raw_tc = session_meta.get("tool_config")
+                if isinstance(raw_tc, dict):
+                    tc_obj = ToolConfig.model_validate(raw_tc)
+                    runtime.state["tool_config"] = tc_obj
+                    runtime.view_model.sync_tool_config(tc_obj)
+                raw_lead = session_meta.get("lead_reference_metrics")
+                if isinstance(raw_lead, dict):
+                    lead_ref = CandidateMolecule.model_validate(raw_lead)
+                    runtime.state["lead_reference_metrics"] = lead_ref
+                raw_cur = session_meta.get("curation_summary")
+                if isinstance(raw_cur, dict):
+                    runtime.state["curation_summary"] = (
+                        DatasetCurationSummary.model_validate(raw_cur)
+                    )
+
             runtime.state["trace_log"] = trace_events
             runtime.state["top_candidates"] = candidates[:20]
             runtime.state["extracted_sar_rules"] = payload.get("sar_rules", [])
@@ -469,7 +513,7 @@ class SessionRegistry:
             runtime.view_model.clear_candidates()
             runtime.view_model.reference_points = payload["ref_points"]
             runtime.view_model.mmp_pairs_preview = payload.get("mmp_pairs_preview", [])
-            runtime.view_model.upsert_candidates(candidates)
+            runtime.view_model.upsert_candidates(candidates, lead_reference=lead_ref)
             return runtime
 
     def subscribe(
