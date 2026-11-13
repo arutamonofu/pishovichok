@@ -25,10 +25,10 @@ from pishovichok.state.schemas import (
 ApplyModeLiteral = Literal["instant_mpo", "evaluation", "design", "sar", "research"]
 
 PARAM_SOURCE_BADGE_META: dict[ParamSourceLiteral, tuple[str, str]] = {
-    "default": ("default", "slate"),
-    "nl_query": ("Из NL-запроса", "sky"),
-    "ui_manual": ("Manual UI", "purple"),
-    "critic_loop": ("Critic Auto-Tune", "amber"),
+    "default": ("", "slate"),
+    "nl_query": ("Из запроса", "sky"),
+    "ui_manual": ("Изменено", "blue-7"),
+    "critic_loop": ("Авто-фильтр верификации", "amber"),
 }
 
 _RESEARCH_STAGE_KEYS: frozenset[str] = frozenset(
@@ -194,6 +194,9 @@ class CandidateRowVM(BaseModel):
     scaffold_smiles: str
     parent_chembl_id: str
     parent_exp_pic50: float
+    parent_bao_format: str = "BAO_0000357"
+    parent_assay_type: str = "B"
+    parent_source_dataset: str = "ChEMBL"
     predicted_pic50: float
     delta_activity: float
     clogp: float
@@ -234,37 +237,89 @@ class CandidateRowVM(BaseModel):
     def status_label(self) -> str:
         has_alert = (self.pains_count + self.brenk_count + self.extra_alerts_count) > 0
         if has_alert and self.alert_penalty_mode == "veto":
-            return "⛔ Veto"
+            return "Вето"
         if self.passes_all:
-            return "✅ OK"
-        return "⚠️ Компромисс"
+            return "Соответствует"
+        return "Компромисс"
+
+    @property
+    def alerts_label(self) -> str:
+        total = self.pains_count + self.brenk_count + self.extra_alerts_count
+        if total == 0:
+            return "Чисто"
+        parts: list[str] = []
+        if self.pains_count > 0:
+            parts.append(f"PAINS:{self.pains_count}")
+        if self.brenk_count > 0:
+            parts.append(f"Brenk:{self.brenk_count}")
+        if self.extra_alerts_count > 0:
+            parts.append(f"Доп:{self.extra_alerts_count}")
+        if self.alert_penalty_mode == "veto":
+            return f"Вето ({' '.join(parts)})"
+        return " ".join(parts)
+
+    @property
+    def method_rule_label(self) -> str:
+        origin_map = {
+            "mmp_smirks_rule": "MMP",
+            "crem_fragment_replacement": "CReM",
+            "bioisostere_catalog": "Биоизостер",
+        }
+        origin_short = origin_map.get(self.generation_origin, self.generation_origin)
+        return f"{origin_short} · {self.rule_id}"
 
     def to_aggrid_row(self, session_id: str) -> dict[str, Any]:
         """Формирует лёгкий словарь строки для `ui.aggrid` (без SVG и 3D-координат)."""
-        svg_url = f"/api/sessions/{session_id}/mol/{self.candidate_id}/svg"
+        svg_url = f"/api/sessions/{session_id}/mol/{self.candidate_id}/svg?variant=diff&width=320&height=170"
+        herg_risk_map = {
+            "low": "низкий",
+            "moderate": "средний",
+            "high": "высокий",
+        }
+        herg_risk_ru = herg_risk_map.get(self.herg_risk_level, self.herg_risk_level)
+        mpo_tip = (
+            "Соответствует всем порогам"
+            if self.passes_all
+            else f"Нарушения: {', '.join(self.violations)}"
+        )
         return {
             "candidate_id": self.candidate_id,
             "preview_html": (
-                f'<img src="{svg_url}" loading="lazy" '
-                f'alt="{self.candidate_id}" '
-                f'style="height:54px;width:auto;display:block;margin:2px auto;border-radius:4px;background:#fff;" />'
+                f'<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:96px;gap:2px;" '
+                f'title="{self.candidate_id}">'
+                f'<img src="{svg_url}" loading="lazy" alt="{self.candidate_id}" '
+                f'style="height:74px;width:156px;object-fit:contain;display:block;background:#FFFFFF;" />'
+                f'<span style="font-size:10px;line-height:1.1;color:#475569;font-family:ui-monospace,monospace;white-space:nowrap;">'
+                f"{self.candidate_id}</span></div>"
             ),
             "parent_chembl_id": self.parent_chembl_id,
+            "parent_exp_pic50": round(self.parent_exp_pic50, 2),
+            "parent_bao_tooltip": (
+                f"Протокол BAO: {self.parent_bao_format} | Тип теста: {self.parent_assay_type} | Источник: {self.parent_source_dataset}"
+            ),
             "predicted_pic50": round(self.predicted_pic50, 2),
             "delta_activity": round(self.delta_activity, 2),
+            "pred_pic50_display": f"{self.predicted_pic50:.2f} ({self.delta_activity:+.2f})",
             "clogp": round(self.clogp, 2),
             "delta_clogp": round(self.delta_clogp, 2),
+            "clogp_display": f"{self.clogp:.2f} ({self.delta_clogp:+.2f})",
             "tpsa": round(self.tpsa, 1),
             "delta_tpsa": round(self.delta_tpsa, 1),
             "sa_score": round(self.sa_score, 2),
+            "qed": round(self.qed, 2),
+            "alerts_display": self.alerts_label,
             "herg_prob": round(self.herg_prob, 2),
+            "herg_display": f"{self.herg_prob:.2f} ({herg_risk_ru})",
+            "log_s_aq": round(self.log_s_aq, 2),
             "delta_herg": round(self.delta_herg, 2),
             "critic_status": self.status_label,
             "mpo_score": round(self.mpo_score, 3),
+            "mpo_tooltip": mpo_tip,
             "passes_all": self.passes_all,
             "pinned": self.pinned,
             "excluded": self.excluded,
             "rule_id": self.rule_id,
+            "method_rule_display": self.method_rule_label,
         }
 
 
@@ -294,6 +349,7 @@ class StateViewModel:
         self.row_order: list[str] = []
         self.emitted_to_grid_ids: set[str] = set()
         self.reference_points: list[ReferencePointVM] = []
+        self.mmp_pairs_preview: list[dict[str, Any]] = []
         self.lead_reference: CandidateMolecule | None = None
         self.lead_pca_coords: tuple[float, float] | None = None
         self.pinned_ids: set[str] = set()
@@ -364,6 +420,9 @@ class StateViewModel:
                 scaffold_smiles=cand.scaffold_smiles,
                 parent_chembl_id=cand.parent_chembl_id,
                 parent_exp_pic50=cand.parent_exp_pic50,
+                parent_bao_format=cand.parent_bao_format,
+                parent_assay_type=cand.parent_assay_type,
+                parent_source_dataset=cand.parent_source_dataset,
                 predicted_pic50=cand.pred_admet.predicted_pic50,
                 delta_activity=delta_act,
                 clogp=cand.calc_rdkit.clogp,

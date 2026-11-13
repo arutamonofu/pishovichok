@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field
 from pishovichok.config import settings
 from pishovichok.state.graph_state import SARGraphState, create_initial_graph_state
 from pishovichok.state.schemas import (
+    ActivityCliff,
     CandidateMolecule,
     QueryConstraints,
+    SARRule,
     TraceEvent,
 )
 from pishovichok.state.storage import create_session_workspace
@@ -64,6 +66,8 @@ class SessionRuntime:
         default_factory=dict
     )
     svg_cache: dict[tuple[str, str, int, int], str] = field(default_factory=dict)
+    depth_mode: Literal["lab", "expert"] = "lab"
+    active_scenario_key: str | None = None
     error_message: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -98,11 +102,11 @@ class SessionRuntime:
         if variant == "parent":
             return (
                 cand.parent_smiles,
-                None,
+                cand.canonical_smiles,
                 cand.scaffold_smiles,
                 [],
                 True,
-                cand.parent_chembl_id,
+                "",
             )
         if variant == "scaffold":
             return (cand.scaffold_smiles, None, None, [], True, "Scaffold")
@@ -128,6 +132,27 @@ class SessionRuntime:
             "",
         )
 
+    def resolve_brics_fragment(self, mol_id: str, frag_idx: int) -> str | None:
+        """Возвращает SMILES фрагмента BRICS по индексу для ленивого SVG-рендера."""
+        cand: CandidateMolecule | None = self.view_model.candidates_by_id.get(mol_id)
+        if cand is None:
+            return None
+        frags = cand.calc_rdkit.brics_fragments
+        if 0 <= frag_idx < len(frags):
+            return frags[frag_idx]
+        return None
+
+    def resolve_rule_for_svg(self, rule_id: str) -> tuple[str, str, float] | None:
+        """Возвращает `(from_fragment, to_fragment, mean_delta_pic50)` для 2D-превью правила SAR."""
+        for rule in self.state.get("extracted_sar_rules", []):
+            if getattr(rule, "rule_id", None) == rule_id:
+                return (
+                    str(rule.from_fragment),
+                    str(rule.to_fragment),
+                    float(rule.mean_delta_pic50),
+                )
+        return None
+
 
 def _read_saved_session_sync(
     session_id: str,
@@ -143,6 +168,7 @@ def _read_saved_session_sync(
     trace_file = sess_dir / "trace_log.json"
     candidates_file = sess_dir / "evaluated_candidates.parquet"
     curated_file = sess_dir / "curated_dataset.parquet"
+    mmp_file = sess_dir / "mmp_pairs.parquet"
     report_file = sess_dir / "report.md"
 
     trace_events: list[TraceEvent] = []
@@ -195,6 +221,95 @@ def _read_saved_session_sync(
         except Exception:  # noqa: BLE001
             ref_points = []
 
+    sar_rules: list[SARRule] = []
+    activity_cliffs: list[ActivityCliff] = []
+    mmp_pairs_preview: list[dict[str, Any]] = []
+    if mmp_file.is_file():
+        try:
+            conn = duckdb.connect()
+            mmp_posix = mmp_file.as_posix()
+            agg_sql = f"""
+                SELECT
+                    smirks_transformation,
+                    from_fragment,
+                    to_fragment,
+                    COUNT(*) AS support_pairs_count,
+                    AVG(delta_pic50) AS mean_delta_pic50,
+                    COALESCE(STDDEV_SAMP(delta_pic50), 0.0) AS std_delta_pic50,
+                    AVG(delta_clogp) AS mean_delta_clogp,
+                    AVG(delta_tpsa) AS mean_delta_tpsa,
+                    BOOL_AND(pair_assay_homogeneous) AS all_pairs_homog,
+                    LIST_SORT(LIST_DISTINCT(LIST_CONCAT(LIST(bao_lhs), LIST(bao_rhs)))) AS bao_formats,
+                    LIST(pair_id) AS pair_ids
+                FROM read_parquet('{mmp_posix}')
+                GROUP BY smirks_transformation, from_fragment, to_fragment
+                ORDER BY support_pairs_count DESC, mean_delta_pic50 DESC
+                LIMIT 25
+            """
+            for idx_r, rec in enumerate(conn.sql(agg_sql).to_arrow_table().to_pylist(), start=1):
+                bao_list = [str(b) for b in (rec.get("bao_formats") or [])]
+                sar_rules.append(
+                    SARRule(
+                        rule_id=f"R{idx_r}",
+                        smirks=str(rec["smirks_transformation"]),
+                        from_fragment=str(rec["from_fragment"]),
+                        to_fragment=str(rec["to_fragment"]),
+                        mean_delta_pic50=round(float(rec["mean_delta_pic50"]), 4),
+                        std_delta_pic50=round(max(0.0, float(rec["std_delta_pic50"] or 0.0)), 4),
+                        support_pairs_count=int(rec["support_pairs_count"]),
+                        mean_delta_clogp=round(float(rec["mean_delta_clogp"] or 0.0), 4),
+                        mean_delta_tpsa=round(float(rec["mean_delta_tpsa"] or 0.0), 4),
+                        assay_homogeneous=bool(rec["all_pairs_homog"]) and len(bao_list) <= 1,
+                        participating_bao_formats=bao_list or ["BAO_0000357"],
+                        example_pair_ids=[str(p) for p in (rec.get("pair_ids") or [])][:5],
+                    )
+                )
+
+            pairs_df = conn.sql(f"SELECT * FROM read_parquet('{mmp_posix}') LIMIT 250").df()
+            cliff_idx = 0
+            for _, prow in pairs_df.iterrows():
+                tanimoto = float(prow.get("tanimoto_similarity") or 0.0)
+                abs_d = abs(float(prow.get("delta_pic50") or 0.0))
+                sali = float(prow.get("sali_index") or 0.0)
+                is_cliff = bool(prow.get("is_activity_cliff") or False)
+                mmp_pairs_preview.append(
+                    {
+                        "pair_id": str(prow.get("pair_id") or ""),
+                        "mol_id_lhs": str(prow.get("mol_id_lhs") or ""),
+                        "mol_id_rhs": str(prow.get("mol_id_rhs") or ""),
+                        "tanimoto": round(tanimoto, 4),
+                        "abs_delta_pic50": round(abs_d, 4),
+                        "sali_index": round(sali, 2),
+                        "is_cliff": is_cliff,
+                        "smirks": str(prow.get("smirks_transformation") or ""),
+                    }
+                )
+                if is_cliff:
+                    cliff_idx += 1
+                    p_lhs = float(prow.get("pic50_lhs") or 0.0)
+                    p_rhs = float(prow.get("pic50_rhs") or 0.0)
+                    lhs_act = p_lhs >= p_rhs
+                    activity_cliffs.append(
+                        ActivityCliff(
+                            cliff_id=f"CLIFF_{cliff_idx:02d}",
+                            mol_id_active=str(prow["mol_id_lhs"] if lhs_act else prow["mol_id_rhs"]),
+                            mol_id_inactive=str(prow["mol_id_rhs"] if lhs_act else prow["mol_id_lhs"]),
+                            smiles_active=str(prow["smiles_lhs"] if lhs_act else prow["smiles_rhs"]),
+                            smiles_inactive=str(prow["smiles_rhs"] if lhs_act else prow["smiles_lhs"]),
+                            pic50_active=p_lhs if lhs_act else p_rhs,
+                            pic50_inactive=p_rhs if lhs_act else p_lhs,
+                            abs_delta_pic50=round(abs_d, 4),
+                            tanimoto_similarity=round(tanimoto, 4),
+                            sali_index=max(0.01, round(sali, 4)),
+                            smirks_difference=str(prow.get("smirks_transformation") or ""),
+                            assay_homogeneous=bool(prow.get("pair_assay_homogeneous", True)),
+                        )
+                    )
+        except Exception:  # noqa: BLE001
+            sar_rules = []
+            activity_cliffs = []
+            mmp_pairs_preview = []
+
     report_md = (
         report_file.read_text(encoding="utf-8") if report_file.is_file() else None
     )
@@ -204,6 +319,9 @@ def _read_saved_session_sync(
         "trace_events": trace_events,
         "candidates": candidates,
         "ref_points": ref_points,
+        "sar_rules": sar_rules,
+        "activity_cliffs": activity_cliffs,
+        "mmp_pairs_preview": mmp_pairs_preview,
         "report_md": report_md,
     }
 
@@ -276,12 +394,27 @@ class SessionRegistry:
             trace_events: list[TraceEvent] = payload["trace_events"]
             runtime.state["trace_log"] = trace_events
             runtime.state["top_candidates"] = candidates[:20]
+            runtime.state["extracted_sar_rules"] = payload.get("sar_rules", [])
+            runtime.state["detected_activity_cliffs"] = payload.get("activity_cliffs", [])
             runtime.state["final_report_markdown"] = payload["report_md"]
             runtime.state["critic_verdict"] = "approve" if candidates else None
+            runtime.state["data_refilter_iteration"] = sum(
+                1 for ev in trace_events if ev.verdict_or_routing == "refilter_data"
+            )
+            redesign_count = sum(
+                1 for ev in trace_events if ev.verdict_or_routing == "redesign_molecules"
+            )
+            if redesign_count > 0:
+                runtime.state["design_iteration"] = redesign_count + 1
+            elif candidates:
+                runtime.state["design_iteration"] = max(
+                    (c.generation_iteration for c in candidates), default=1
+                )
             runtime.status = "completed" if candidates else "idle"
             runtime.svg_cache.clear()
             runtime.view_model.clear_candidates()
             runtime.view_model.reference_points = payload["ref_points"]
+            runtime.view_model.mmp_pairs_preview = payload.get("mmp_pairs_preview", [])
             runtime.view_model.upsert_candidates(candidates)
             return runtime
 

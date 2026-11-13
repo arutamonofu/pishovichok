@@ -27,15 +27,15 @@ function ensure3DmolLoaded() {
 
 export default {
   template: `
-    <div style="position:relative; width:100%; height:100%; min-height:260px; border-radius:8px; overflow:hidden; border:1px solid rgba(148,163,184,0.25); background:#0f172a;">
+    <div style="position:relative; width:100%; height:100%; min-height:260px; border-radius:8px; overflow:hidden; border:1px solid #E2E8F0; background:#F8FAFC;">
       <div ref="container" style="width:100%; height:100%; min-height:260px;"></div>
-      <div v-if="empty" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:12px; pointer-events:none; text-align:center; padding:12px;">
-        Нажмите «Показать 3D (ETKDGv3)» для генерации конформера
+      <div v-if="empty" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#475569; font-size:12px; pointer-events:none; text-align:center; padding:12px;">
+        Генерация 3D-конформера (ETKDGv3)...
       </div>
     </div>
   `,
   props: {
-    backgroundColor: { type: String, default: '#0f172a' },
+    backgroundColor: { type: String, default: '#F8FAFC' },
   },
   data() {
     return {

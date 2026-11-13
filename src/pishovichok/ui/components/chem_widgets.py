@@ -23,7 +23,7 @@ class MoleculeViewer3D(
     def __init__(self, height: str = "290px") -> None:
         super().__init__()
         self._props["height"] = height
-        self.classes("w-full rounded-lg border border-slate-700 bg-slate-950")
+        self.classes("w-full rounded-lg border border-[#E2E8F0] bg-[#F8FAFC]")
 
     def load_molblock(
         self,
@@ -57,7 +57,7 @@ class MoleculeSketcher(
         super().__init__()
         self._props["initialSmiles"] = initial_smiles
         self._props["height"] = height
-        self.classes("w-full rounded-lg border border-slate-700 bg-white")
+        self.classes("w-full rounded-lg border border-[#E2E8F0] bg-white")
         if on_smiles_change is not None:
             self.on(
                 "smiles-changed",
@@ -86,7 +86,7 @@ class KetcherSketcher(
         super().__init__()
         self._props["initialSmiles"] = initial_smiles
         self._props["height"] = height
-        self.classes("w-full rounded-lg border border-slate-700 bg-white")
+        self.classes("w-full rounded-lg border border-[#E2E8F0] bg-white")
         if on_smiles_change is not None:
             self.on(
                 "smiles-changed",

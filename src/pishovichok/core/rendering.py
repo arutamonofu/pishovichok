@@ -22,22 +22,23 @@ from sklearn.decomposition import PCA
 from pishovichok.core.fingerprints import compute_mol_fingerprint
 from pishovichok.state.schemas import ToolConfig
 
-# Палитра стандартных цветов для подсветки (RGB строго в [0.0, 1.0])
-COLOR_ACTIVITY_GAIN: tuple[float, float, float] = (0.1, 0.8, 0.2)  # Зелёный
-COLOR_ACTIVITY_LOSS: tuple[float, float, float] = (0.9, 0.2, 0.2)  # Красный
-COLOR_CORE_REFERENCE: tuple[float, float, float] = (0.2, 0.4, 0.9)  # Синий
-COLOR_NEUTRAL_ACCENT: tuple[float, float, float] = (0.95, 0.65, 0.15)  # Оранжевый
+# Палитра мягких пастельных цветов для подсветки на светлом фоне (RGB строго в [0.0, 1.0])
+# Не перекрывает чёрные линии связей и символы атомов в rdMolDraw2D.
+COLOR_ACTIVITY_GAIN: tuple[float, float, float] = (0.73, 0.97, 0.82)  # Пастельный зелёный
+COLOR_ACTIVITY_LOSS: tuple[float, float, float] = (0.99, 0.80, 0.83)  # Пастельный розовый
+COLOR_CORE_REFERENCE: tuple[float, float, float] = (0.75, 0.85, 0.99)  # Пастельный синий
+COLOR_NEUTRAL_ACCENT: tuple[float, float, float] = (0.99, 0.91, 0.73)  # Пастельный янтарный
 
 
 def _render_placeholder_svg(message: str, width: int, height: int) -> str:
-    """Генерирует заглушку SVG с сообщением об ошибке."""
+    """Генерирует заглушку SVG с сообщением об ошибке в светлой теме."""
     safe_msg = html.escape(message)
     return (
         f"<svg width='{width}' height='{height}' xmlns='http://www.w3.org/2000/svg' "
-        f"style='border:1px dashed #475569; border-radius:6px; background:#0f172a;'>"
-        f"<rect width='100%' height='100%' fill='#0f172a'/>"
+        f"style='border:1px dashed #CBD5E1; border-radius:6px; background:#FFFFFF;'>"
+        f"<rect width='100%' height='100%' fill='#FFFFFF'/>"
         f"<text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' "
-        f"fill='#94a3b8' font-family='sans-serif' font-size='13'>{safe_msg}</text>"
+        f"fill='#475569' font-family='sans-serif' font-size='13'>{safe_msg}</text>"
         f"</svg>"
     )
 
@@ -100,7 +101,12 @@ def render_molecule_svg(
         drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
         opts = drawer.drawOptions()
         opts.clearBackground = clear_background
-        opts.bondLineWidth = 2
+        opts.setBackgroundColour((1.0, 1.0, 1.0, 1.0))
+        opts.bondLineWidth = 2.0
+        opts.padding = 0.08
+        if legend:
+            opts.legendFraction = 0.14
+            opts.legendFontSize = 13
 
         rdMolDraw2D.PrepareAndDrawMolecule(
             drawer,
@@ -114,12 +120,94 @@ def render_molecule_svg(
     except (RuntimeError, ValueError, TypeError):
         try:
             fallback_drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
-            fallback_drawer.drawOptions().clearBackground = clear_background
+            fb_opts = fallback_drawer.drawOptions()
+            fb_opts.clearBackground = clear_background
+            fb_opts.setBackgroundColour((1.0, 1.0, 1.0, 1.0))
             rdMolDraw2D.PrepareAndDrawMolecule(fallback_drawer, mol, legend=legend)
             fallback_drawer.FinishDrawing()
             return fallback_drawer.GetDrawingText()
         except (RuntimeError, ValueError, TypeError) as exc:
             return _render_placeholder_svg(f"Ошибка рендеринга: {exc}", width, height)
+
+
+def render_parent_leaving_svg(
+    parent_smiles: str,
+    candidate_smiles: str | None = None,
+    scaffold_smiles: str | None = None,
+    width: int = 280,
+    height: int = 190,
+    legend: str = "",
+) -> str:
+    """Рендерит 2D SVG родительской молекулы на белом фоне с подсветкой уходящего фрагмента (розовый)."""
+    if not parent_smiles or not isinstance(parent_smiles, str):
+        return _render_placeholder_svg("Пустой SMILES", width, height)
+
+    parent_mol = Chem.MolFromSmiles(parent_smiles.strip())
+    if parent_mol is None:
+        return _render_placeholder_svg("Невалидный SMILES", width, height)
+
+    leaving_indices: list[int] = []
+    if candidate_smiles:
+        cand_mol = Chem.MolFromSmiles(candidate_smiles.strip())
+        if cand_mol is not None:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError):
+                mcs_res = rdFMCS.FindMCS([parent_mol, cand_mol], timeout=1)
+                if mcs_res and mcs_res.smartsString:
+                    patt = Chem.MolFromSmarts(mcs_res.smartsString)
+                    if patt is not None:
+                        matched = set(parent_mol.GetSubstructMatch(patt))
+                        if matched:
+                            leaving_indices = [
+                                idx
+                                for idx in range(parent_mol.GetNumAtoms())
+                                if idx not in matched
+                            ]
+
+    colors_map = {idx: COLOR_ACTIVITY_LOSS for idx in leaving_indices}
+    return render_molecule_svg(
+        smiles=parent_smiles,
+        highlight_atoms=leaving_indices,
+        highlight_colors=colors_map,
+        width=width,
+        height=height,
+        legend=legend,
+        clear_background=True,
+        align_to_scaffold_smiles=scaffold_smiles,
+    )
+
+
+def render_rule_transformation_svg(
+    from_fragment: str,
+    to_fragment: str,
+    delta_pic50: float = 0.0,
+    width: int = 340,
+    height: int = 120,
+) -> str:
+    """Рендерит компактный 2D SVG превью трансформации правила SAR (`R_from -> R_to`) для ховера."""
+    half_w = max(110, (width - 36) // 2)
+    svg_l = render_molecule_svg(
+        smiles=from_fragment,
+        width=half_w,
+        height=height,
+        clear_background=True,
+    )
+    svg_r = render_molecule_svg(
+        smiles=to_fragment,
+        width=half_w,
+        height=height,
+        clear_background=True,
+    )
+    arrow_color = "#059669" if delta_pic50 >= 0 else "#E11D48"
+    return (
+        f"<svg width='{width}' height='{height}' xmlns='http://www.w3.org/2000/svg' "
+        f"style='background:#FFFFFF;'>"
+        f"<rect width='100%' height='100%' fill='#FFFFFF'/>"
+        f"<g transform='translate(0,0)'>{svg_l}</g>"
+        f"<text x='{half_w + 18}' y='{height // 2 + 5}' text-anchor='middle' "
+        f"fill='{arrow_color}' font-family='sans-serif' font-size='20' font-weight='bold'>→</text>"
+        f"<g transform='translate({half_w + 36},0)'>{svg_r}</g>"
+        f"</svg>"
+    )
 
 
 def render_aligned_diff_svg(
@@ -212,7 +300,7 @@ def render_mmp_pair_svgs(
     svg_l = render_molecule_svg(
         smiles=smiles_lhs,
         highlight_atoms=hl_atoms_l,
-        highlight_colors={idx: color for idx in hl_atoms_l},
+        highlight_colors={idx: COLOR_ACTIVITY_LOSS for idx in hl_atoms_l},
         width=width,
         height=height,
         legend="",
@@ -279,7 +367,7 @@ def render_mmp_pair_svg(
           <div style="font-size:13px; font-weight:bold; color:#24292e; margin-bottom:4px;">{title_l_html}</div>
           <div>{svg_l}</div>
         </div>
-        <div style="font-size:24px; color:#586069; padding:0 10px;">➔</div>
+        <div style="font-size:20px; color:#475569; padding:0 10px;">→</div>
         <div style="flex:1; display:flex; flex-direction:column; align-items:center;">
           <div style="font-size:13px; font-weight:bold; color:#24292e; margin-bottom:4px;">{title_r_html}</div>
           <div>{svg_r}</div>

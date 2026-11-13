@@ -1,4 +1,4 @@
-"""Точка входа NiceGUI 4.0 для трёхпанельной рабочей среды исследователя («Chemical IDE»)."""
+"""Точка входа NiceGUI 4.0 для трёхпанельной рабочей среды («ПИШОВИЧОК · SAR-дизайн»)."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from pishovichok.ui.components.agent_rail import AgentRail, TopStatusBar
 from pishovichok.ui.components.candidate_grid import CandidateGrid
 from pishovichok.ui.components.inspector import InspectorPane
 from pishovichok.ui.components.mpo_canvas import MPOCanvas
+from pishovichok.ui.components.task_island import TaskCommandIsland
 from pishovichok.ui.components.tool_settings import ToolSettingsDrawer
 from pishovichok.ui.routes import router as api_router
 from pishovichok.ui.session import SessionRuntime, session_registry
+from pishovichok.ui.theme import build_theme_head_css
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ASSETS_REGISTERED = False
@@ -39,12 +41,24 @@ async def chemical_ide_page(
     request: Request,
     session_id: str | None = None,
 ) -> None:
-    """Главная страница Chemical IDE с сохранением состояния графа при перезагрузке (F5)."""
+    """Главная страница «ПИШОВИЧОК · SAR-дизайн» с сохранением состояния графа при перезагрузке (F5)."""
     register_ui_assets_and_routes()
-    ui.dark_mode(True)
+    ui.dark_mode(False)
+    ui.colors(
+        primary="#8B495C",
+        secondary="#73394B",
+        accent="#A6687A",
+        dark="#261F22",
+        positive="#059669",
+        negative="#E11D48",
+        info="#6D597A",
+        warning="#D97706",
+    )
     ui.add_head_html(
+        '<link rel="icon" type="image/png" href="/static/favicon.png" />'
         '<script src="/static/3Dmol-min.js"></script>'
         '<script src="/static/jsme/jsme.nocache.js"></script>'
+        + build_theme_head_css()
     )
 
     await client.connected()
@@ -70,6 +84,7 @@ async def chemical_ide_page(
 
     top_bar: TopStatusBar | None = None
     agent_rail: AgentRail | None = None
+    task_island: TaskCommandIsland | None = None
     mpo_canvas: MPOCanvas | None = None
     candidate_grid: CandidateGrid | None = None
     inspector: InspectorPane | None = None
@@ -131,18 +146,33 @@ async def chemical_ide_page(
         ui.navigate.to(f"/?session_id={new_sid}")
 
     def _on_csv_uploaded(csv_path: Path) -> None:
-        if agent_rail is not None:
-            agent_rail.uploaded_csv_path = csv_path
+        if task_island is not None:
+            task_island.uploaded_csv_path = csv_path
+            task_island.refresh()
 
     def _toggle_settings() -> None:
         if tool_settings is not None:
             tool_settings.toggle()
+
+    def _on_scenario_selected(scenario_key: str) -> None:
+        if task_island is not None:
+            task_island.apply_scenario_context(scenario_key)
+
+    def _on_depth_mode_changed(depth_mode: str) -> None:
+        if agent_rail is not None:
+            agent_rail.refresh()
+        if candidate_grid is not None:
+            candidate_grid.refresh_telemetry()
+        if inspector is not None:
+            inspector.refresh()
 
     top_bar = TopStatusBar(
         runtime,
         on_session_switched=_on_session_switched,
         on_csv_uploaded=_on_csv_uploaded,
         on_toggle_settings=_toggle_settings,
+        on_scenario_selected=_on_scenario_selected,
+        on_depth_mode_changed=_on_depth_mode_changed,
     )
 
     tool_settings = ToolSettingsDrawer(
@@ -150,52 +180,62 @@ async def chemical_ide_page(
         on_local_mpo_updated=_on_drawer_local_mpo_updated,
         on_3d_pca_params_updated=_on_drawer_3d_pca_updated,
         on_protected_smarts_changed=lambda sm: (
-            agent_rail.set_protected_smarts(sm) if agent_rail is not None else None
+            task_island.set_protected_smarts(sm) if task_island is not None else None
         ),
         get_sketcher_smiles=lambda: (
-            agent_rail.get_sketcher_smiles() if agent_rail is not None else ""
+            task_island.get_sketcher_smiles() if task_island is not None else ""
         ),
         set_sketcher_smiles=lambda smi: (
-            agent_rail.set_sketcher_smiles(smi) if agent_rail is not None else None
+            task_island.set_sketcher_smiles(smi) if task_island is not None else None
         ),
         on_tool_config_changed=_on_drawer_tool_config_changed,
     )
 
-    with (
-        ui.element("div").classes("w-full h-[calc(100vh-52px)] bg-slate-950 overflow-hidden"),
-        ui.splitter(value=24, limits=(16, 42)).classes("w-full h-full") as outer_split,
-    ):
-        with outer_split.before:
+    shell_collapsed = False
+    shell_grid = ui.element("div").classes("ide-shell-grid")
+
+    def _toggle_left_rail() -> None:
+        nonlocal shell_collapsed
+        shell_collapsed = not shell_collapsed
+        if shell_collapsed:
+            shell_grid.classes(add="ide-shell-grid--collapsed")
+        else:
+            shell_grid.classes(remove="ide-shell-grid--collapsed")
+        if agent_rail is not None:
+            agent_rail.set_collapsed(shell_collapsed)
+
+    with shell_grid:
+        with ui.element("div").classes("h-full min-h-0 min-w-0 overflow-hidden"):
             agent_rail = AgentRail(
+                runtime,
+                on_scaffold_selected=lambda smi: (
+                    task_island.load_scaffold(smi) if task_island is not None else None
+                ),
+                on_toggle_collapse=_toggle_left_rail,
+            )
+        with ui.column().classes(
+            "relative w-full h-full min-w-0 min-h-0 flex flex-col gap-2 overflow-hidden"
+        ):
+            mpo_canvas = MPOCanvas(
+                runtime,
+                on_candidate_selected=_select_candidate,
+                on_mpo_recalculated=_on_mpo_recalculated,
+                on_tool_config_changed=_on_external_tool_config_changed,
+            )
+            with ui.element("div").classes("w-full flex-1 min-h-0 min-w-0 overflow-hidden"):
+                candidate_grid = CandidateGrid(
+                    runtime,
+                    on_candidate_selected=_select_candidate,
+                )
+            task_island = TaskCommandIsland(
                 runtime,
                 on_tool_config_changed=_on_external_tool_config_changed,
             )
-        with (
-            outer_split.after,
-            ui.splitter(value=62, limits=(38, 82)).classes("w-full h-full") as mid_split,
-        ):
-                    with mid_split.before, ui.splitter(
-                        horizontal=True,
-                        value=48,
-                        limits=(24, 76),
-                    ).classes("w-full h-full") as center_split:
-                        with center_split.before:
-                            mpo_canvas = MPOCanvas(
-                                runtime,
-                                on_candidate_selected=_select_candidate,
-                                on_mpo_recalculated=_on_mpo_recalculated,
-                                on_tool_config_changed=_on_external_tool_config_changed,
-                            )
-                        with center_split.after:
-                            candidate_grid = CandidateGrid(
-                                runtime,
-                                on_candidate_selected=_select_candidate,
-                            )
-                    with mid_split.after:
-                        inspector = InspectorPane(
-                            runtime,
-                            on_row_updated=_on_row_updated,
-                        )
+        with ui.element("div").classes("h-full min-h-0 min-w-0 overflow-hidden"):
+            inspector = InspectorPane(
+                runtime,
+                on_row_updated=_on_row_updated,
+            )
 
     async def _on_runtime_event(event: dict[str, Any]) -> None:
         event_type = str(event.get("type", ""))
@@ -204,6 +244,8 @@ async def chemical_ide_page(
                 top_bar.refresh()
             if agent_rail is not None:
                 agent_rail.refresh()
+            if task_island is not None:
+                task_island.refresh()
             if tool_settings is not None:
                 tool_settings.refresh()
             if candidate_grid is not None:
@@ -257,8 +299,8 @@ def run_ui(
     ui.run(
         host=host or settings.ui_host,
         port=port or settings.ui_port,
-        title="Pishovichok · Chemical IDE",
-        dark=True,
+        title="ПИШОВИЧОК · SAR-дизайн",
+        dark=False,
         reload=reload,
         native=native,
         workers=1,

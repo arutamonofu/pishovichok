@@ -505,14 +505,14 @@ class TestUIComponentAndCheckpointFixes:
         canvas._mode = "pareto"
         opts_pareto = canvas._build_chart_options()
         lead_series_pareto = next(
-            s for s in opts_pareto["series"] if s["name"] == "Lead"
+            s for s in opts_pareto["series"] if s["name"] == "Прототип"
         )
         assert len(lead_series_pareto["data"]) == 1
-        assert lead_series_pareto["data"][0]["name"] == f"Lead ({cand.parent_chembl_id})"
+        assert lead_series_pareto["data"][0]["name"] == f"Прототип ({cand.parent_chembl_id})"
 
         canvas._mode = "pca"
         opts_pca = canvas._build_chart_options()
-        lead_series_pca = next(s for s in opts_pca["series"] if s["name"] == "Lead")
+        lead_series_pca = next(s for s in opts_pca["series"] if s["name"] == "Прототип")
         assert len(lead_series_pca["data"]) == 1
         assert lead_series_pca["data"][0]["value"] == [-0.5, 0.25]
 
@@ -761,7 +761,7 @@ class TestToolSettingsAndTelemetry:
         param_chips, stat_chips = format_node_telemetry_chips(telemetry, param_sources)  # type: ignore[arg-type]
         chip_map = {c["key"]: c for c in param_chips}
         assert chip_map["fp_type"]["color"] == "sky"
-        assert chip_map["protected_smarts"]["color"] == "purple"
+        assert chip_map["protected_smarts"]["color"] == "blue-7"
         assert chip_map["max_candidates_pool"]["color"] == "amber"
         assert chip_map["mmpa_max_cuts"]["color"] == "slate"
         assert ("rules_count", "6") in stat_chips
@@ -793,3 +793,212 @@ class TestToolSettingsAndTelemetry:
         assert "empirical_only" in insp_telem["admet"]
         assert "fcfp/r3/4096" in insp_telem["sar_fp"]
         assert "BRICS≥4" in insp_telem["rdkit_filters"]
+
+
+class TestWetLabLightModeRefactoring:
+    """Тесты Clean Wet-Lab Light Mode, 4-категорийных колонок, маршрутов SVG и контекстной CTA."""
+
+    def test_light_mode_rendering_and_pastel_highlights(self) -> None:
+        from pishovichok.core.rendering import (
+            COLOR_ACTIVITY_GAIN,
+            COLOR_ACTIVITY_LOSS,
+            render_molecule_svg,
+            render_parent_leaving_svg,
+            render_rule_transformation_svg,
+        )
+
+        assert COLOR_ACTIVITY_GAIN == (0.73, 0.97, 0.82)
+        assert COLOR_ACTIVITY_LOSS == (0.99, 0.80, 0.83)
+
+        svg = render_molecule_svg("c1ccccc1O", width=260, height=200)
+        assert "<svg" in svg
+        assert "#FFFFFF" in svg or "#ffffff" in svg.lower()
+
+        parent_svg = render_parent_leaving_svg("c1ccccc1Cl", "c1ccccc1F")
+        assert "<svg" in parent_svg
+
+        rule_svg = render_rule_transformation_svg("*Cl", "*F", delta_pic50=0.45)
+        assert "<svg" in rule_svg
+
+    def test_brics_and_rule_svg_routes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from nicegui import run as nicegui_run
+
+        from pishovichok.state.schemas import SARRule
+        from pishovichok.ui.routes import router as api_router
+        from pishovichok.ui.session import SessionRegistry
+
+        sid = "sess_wetlab_routes"
+        registry = SessionRegistry()
+        monkeypatch.setattr("pishovichok.ui.routes.session_registry", registry)
+        rt = registry.get_or_create(sid)
+        cand = _make_dummy_candidate("C_BRICS")
+        rule = SARRule(
+            rule_id="R1",
+            smirks="[*:1]O>>[*:1]OC",
+            from_fragment="*O",
+            to_fragment="*OC",
+            mean_delta_pic50=0.55,
+            support_pairs_count=7,
+            mean_delta_clogp=0.2,
+            mean_delta_tpsa=-9.2,
+            assay_homogeneous=True,
+            participating_bao_formats=["BAO_0000357"],
+        )
+        rt.view_model.upsert_candidates([cand])
+        rt.state["extracted_sar_rules"] = [rule]
+
+        nicegui_run.setup()
+        try:
+            app = FastAPI()
+            app.include_router(api_router)
+            client = TestClient(app)
+
+            r_parent = client.get(f"/api/sessions/{sid}/mol/C_BRICS/svg?variant=parent")
+            assert r_parent.status_code == 200
+            assert "<svg" in r_parent.text
+
+            r_brics = client.get(f"/api/sessions/{sid}/mol/C_BRICS/brics/0/svg")
+            assert r_brics.status_code == 200
+            assert "<svg" in r_brics.text
+
+            r_rule = client.get(f"/api/sessions/{sid}/rule/R1/svg")
+            assert r_rule.status_code == 200
+            assert "<svg" in r_rule.text
+        finally:
+            nicegui_run.tear_down()
+
+    def test_theme_tokens_and_4_group_aggrid_columns(self) -> None:
+        from pishovichok.ui.components.candidate_grid import build_candidate_column_defs
+        from pishovichok.ui.state_vm import StateViewModel
+        from pishovichok.ui.theme import THEME_CSS, build_theme_head_css
+
+        css = build_theme_head_css()
+        assert THEME_CSS == css
+        assert "#F8FAFC" in css
+        assert "#7C3AED" in css
+        assert "#059669" in css
+        assert "#D97706" in css
+        assert "#2563EB" in css
+
+        cols = build_candidate_column_defs()
+        assert len(cols) == 4  # 4 grouped categories (12 leaf columns)
+        group_headers = [c["headerName"] for c in cols]
+        assert group_headers == [
+            "1. Эксперимент",
+            "2. Расчёт RDKit",
+            "3. Прогноз ADMET",
+            "4. Гипотеза SAR",
+        ]
+        total_leaf_cols = sum(len(grp["children"]) for grp in cols)
+        assert total_leaf_cols == 12
+        struct_col = cols[0]["children"][0]
+        assert struct_col["field"] == "preview_html"
+        assert ":cellRenderer" in struct_col
+        assert struct_col.get("pinned") == "left"
+        for grp in cols:
+            assert "children" in grp and len(grp["children"]) >= 2
+            for child in grp["children"]:
+                assert "minWidth" in child
+
+        cand = _make_dummy_candidate("C1", pic50=8.23, clogp=3.89)
+        vm = StateViewModel("s1")
+        vm.upsert_candidates([cand])
+        row = vm.rows_by_id["C1"].to_aggrid_row("s1")
+        assert row["clogp_display"] == "3.89 (+0.10)"
+        assert row["pred_pic50_display"] == "8.23 (+0.73)"
+        assert row["alerts_display"] == "Чисто"
+        assert row["method_rule_display"] == "CReM · rule_1"
+        assert "BAO_0000357" in row["parent_bao_tooltip"]
+
+    def test_mpo_canvas_light_thresholds_and_sali_tab(self) -> None:
+        from pishovichok.state.schemas import ActivityCliff, QueryConstraints
+        from pishovichok.ui.components.mpo_canvas import MPOCanvas
+        from pishovichok.ui.state_vm import StateViewModel
+
+        vm = StateViewModel("sess_mpo_light")
+        vm.upsert_candidates([_make_dummy_candidate("C1", pic50=8.0, clogp=3.1)])
+        vm.query_constraints = QueryConstraints(
+            scenario_type="target_based_sar",
+            target_chembl_id="CHEMBL5251",
+            max_logp=3.5,
+        )
+        vm.weights.max_logp = 3.5
+        vm.activity_cliffs = [
+            ActivityCliff(
+                cliff_id="AC1",
+                mol_id_active="CHEMBL2",
+                mol_id_inactive="CHEMBL1",
+                smiles_active="c1ccccc1Cl",
+                smiles_inactive="c1ccccc1",
+                pic50_active=8.4,
+                pic50_inactive=6.1,
+                abs_delta_pic50=2.3,
+                tanimoto_similarity=0.88,
+                sali_index=19.2,
+                smirks_difference="[cH:1]>>[c:1]Cl",
+                assay_homogeneous=True,
+            )
+        ]
+
+        from types import SimpleNamespace
+
+        canvas = object.__new__(MPOCanvas)
+        canvas._mode = "pareto"
+        canvas.runtime = SimpleNamespace(
+            view_model=vm,
+            state={
+                "query_constraints": vm.query_constraints,
+                "detected_activity_cliffs": vm.activity_cliffs,
+            },
+        )
+
+        pareto_opts = canvas._build_chart_options()
+        assert pareto_opts["backgroundColor"] == "#FFFFFF"
+        ok_series = next(s for s in pareto_opts["series"] if s.get("name") == "Кандидаты (допустимые)")
+        assert "markLine" in ok_series
+        assert "markArea" in ok_series
+
+        canvas._mode = "sali"
+        sali_opts = canvas._build_chart_options()
+        assert sali_opts["xAxis"]["name"] == "Сходство (Tanimoto)"
+        assert sali_opts["yAxis"]["name"] == "|ΔpIC50|"
+        assert len(sali_opts["series"][1]["data"]) == 1
+
+    def test_tool_settings_contextual_primary_cta(self) -> None:
+        from pishovichok.ui.components.tool_settings import resolve_primary_cta_spec
+
+        mode_empty, _, _, _ = resolve_primary_cta_spec([])
+        assert mode_empty == "instant_mpo"
+
+        mode_design, _, _, _ = resolve_primary_cta_spec(["crem_mode"])
+        assert mode_design == "design"
+
+        mode_eval, _, _, _ = resolve_primary_cta_spec(["admet_backend"])
+        assert mode_eval == "evaluation"
+
+        mode_sar, _, _, _ = resolve_primary_cta_spec(["mmpa_max_cuts"])
+        assert mode_sar == "sar"
+
+    def test_zero_emojis_and_banned_terms_in_ui(self) -> None:
+        ui_files = list((_SRC_ROOT / "ui").rglob("*.py"))
+        assert ui_files
+        banned_emojis = [
+            "🧪", "🔄", "✅", "⚠️", "✂️", "🌐", "📌", "🚫",
+            "📁", "🧹", "🎛️", "⚡", "🧬", "👁", "⛔", "🔬",
+        ]
+        banned_terms = [
+            "AG GRID",
+            "PROVENANCE",
+            "Dropzone",
+            "Wet-Lab CSV Dropzone",
+            "Chemical IDE",
+        ]
+        for path in ui_files:
+            content = path.read_text(encoding="utf-8")
+            for emoji in banned_emojis:
+                assert emoji not in content, f"Found banned emoji {emoji!r} in {path}"
+            for term in banned_terms:
+                assert term not in content, f"Found banned term {term!r} in {path}"
+

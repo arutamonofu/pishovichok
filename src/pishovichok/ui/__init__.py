@@ -1,4 +1,4 @@
-"""Слой 4: графический интерфейс Chemical IDE на базе NiceGUI 4.0."""
+"""Слой 4: графический интерфейс «ПИШОВИЧОК · SAR-дизайн» на базе NiceGUI 4.0."""
 
 from __future__ import annotations
 
