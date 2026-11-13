@@ -186,11 +186,21 @@ class InspectorPane:
                                 self._conformer_title = ui.label("3D-конформер (ETKDGv3)").classes(
                                     "text-[11px] font-medium text-[#594D52]"
                                 )
-                                with ui.button(on_click=self._load_3d_conformer).props(
-                                    "dense flat size=sm no-caps color=primary"
-                                ).classes("text-[11px] gap-1"):
-                                    ui.html(svg_icon("refresh", 13), sanitize=False)
-                                    ui.label("Пересчитать").classes("text-[11px]")
+                                with ui.row().classes("items-center gap-1"):
+                                    with ui.button(on_click=self._load_3d_conformer).props(
+                                        "dense flat size=sm no-caps color=primary"
+                                    ).classes("text-[11px] gap-1"):
+                                        ui.html(svg_icon("refresh", 13), sanitize=False)
+                                        ui.label("Пересчитать").classes("text-[11px]")
+                                    fullscreen_3d_btn = (
+                                        ui.button(on_click=self._open_3d_fullscreen_modal)
+                                        .props("dense flat size=sm color=grey-7")
+                                        .classes("p-1 min-w-0")
+                                        .tooltip("Развернуть 3D-конформер на весь экран")
+                                    )
+                                    fullscreen_3d_btn._props["title"] = "На весь экран"
+                                    with fullscreen_3d_btn:
+                                        ui.html(svg_icon("maximize", 13), sanitize=False)
                             self._conformer_container = ui.column().classes("w-full gap-1")
                             ui.label("ЛКМ — вращение · Колесо — зум · ПКМ — сдвиг").classes(
                                 "text-[10px] text-[#64748B] text-center w-full"
@@ -301,6 +311,61 @@ class InspectorPane:
             modal_3d = MoleculeViewer3D(height="320px")
             if molblock:
                 modal_3d.load_molblock(molblock, list(cand.highlighted_atom_indices))
+        dlg.open()
+
+    async def _open_3d_fullscreen_modal(self) -> None:
+        """Открывает 3D-конформер выбранного кандидата в полноэкранном модальном окне."""
+        cid, cand, _ = self._get_selected()
+        if cid is None or cand is None:
+            ui.notify("Сначала выберите кандидата", type="info")
+            return
+        tool_config = resolve_tool_config(self.runtime.state)
+        cache_key = (
+            f"{cid}_{tool_config.etkdg_variant}_{tool_config.force_field}_"
+            f"{tool_config.num_conformers}_{tool_config.conformer_opt_max_iters}_"
+            f"{tool_config.conformer_random_seed}"
+        )
+        molblock = self._mol3d_cache.get(cache_key)
+        if molblock is None:
+            molblock, _ = await run.cpu_bound(
+                generate_3d_conformer_molblock,
+                cand.canonical_smiles,
+                num_conformers=tool_config.num_conformers,
+                random_seed=tool_config.conformer_random_seed,
+                tool_config=tool_config,
+            )
+            if molblock:
+                self._mol3d_cache[cache_key] = molblock
+
+        with ui.dialog().classes("w-full h-full p-2 md:p-6") as dlg, ui.card().classes(
+            "w-[94vw] h-[88vh] max-w-6xl bg-white border border-[#CBD5E1] rounded-2xl p-4 gap-2.5 shadow-2xl flex flex-col overflow-hidden"
+        ):
+            with ui.row().classes("w-full items-center justify-between gap-2 shrink-0 pb-1 border-b border-[#E2D9DD]"):
+                with ui.row().classes("items-center gap-2 min-w-0"):
+                    ui.label(f"3D-конформер: {cid}").classes(
+                        "text-sm md:text-base font-semibold text-[#5C2D3B] truncate"
+                    )
+                    ui.label(f"({tool_config.etkdg_variant} + {tool_config.force_field})").classes(
+                        "text-xs text-[#594D52]"
+                    )
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("ЛКМ — вращение · Колесо — зум · ПКМ — сдвиг").classes(
+                        "text-[11px] text-[#64748B] hidden sm:block"
+                    )
+                    with ui.button(on_click=dlg.close).props("dense flat size=sm color=grey-8").classes(
+                        "p-1 min-w-0"
+                    ):
+                        ui.html(svg_icon("close", 18), sanitize=False)
+
+            ui.label(cand.canonical_smiles).classes(
+                "text-xs mono-code px-3 py-1.5 w-full break-all bg-[#FAF8F9] rounded-lg shrink-0 border border-[#E2D9DD]"
+            )
+
+            with ui.column().classes("w-full flex-1 min-h-0 relative"):
+                fs_viewer = MoleculeViewer3D(height="100%")
+                if molblock:
+                    fs_viewer.load_molblock(molblock, list(cand.highlighted_atom_indices))
+
         dlg.open()
 
     def _get_selected(self) -> tuple[str | None, Any, Any]:
