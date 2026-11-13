@@ -305,11 +305,25 @@ def build_hypothesis_rationale(
     pred_admet: PredADMETMetrics,
 ) -> SARHypothesisRationale:
     """Формирует объект Категории 4 знаний (`SARHypothesisRationale`) с детерминированным обоснованием."""
-    origin_label = {
-        "mmp_smirks_rule": f"правила MMP {raw_cand.rule_id} ({raw_cand.support_pairs_count} пар в однородном тесте)",
-        "crem_fragment_replacement": f"контекстной замены фрагментов CReM (r=3, {raw_cand.rule_id})",
-        "bioisostere_catalog": f"медико-химического каталога биоизостеров ({raw_cand.rule_id})",
-    }[raw_cand.generation_origin]
+    if raw_cand.rule_id == "GEN-GA" or raw_cand.generation_origin == "graph_ga":
+        origin_label = (
+            "эволюционной рекомбинации BRICS (GraphGA, GEN-GA) с сохранением MCS-ядра"
+        )
+    elif raw_cand.rule_id == "CREM-GROW":
+        origin_label = (
+            "контекстного наращивания фрагментов CReM (r=3, CREM-GROW) с сохранением MCS-ядра"
+        )
+    elif raw_cand.rule_id == "CREM-MUT":
+        origin_label = (
+            "изостерической мутации CReM (r=3, CREM-MUT) с сохранением MCS-ядра"
+        )
+    else:
+        origin_label = {
+            "mmp_smirks_rule": f"правила MMP {raw_cand.rule_id} ({raw_cand.support_pairs_count} пар в однородном тесте)",
+            "crem_fragment_replacement": f"контекстной замены фрагментов CReM (r=3, {raw_cand.rule_id})",
+            "bioisostere_catalog": f"медико-химического каталога биоизостеров ({raw_cand.rule_id})",
+            "graph_ga": f"эволюционного отбора GraphGA ({raw_cand.rule_id})",
+        }[raw_cand.generation_origin]
 
     logp_dir = (
         f"снижает cLogP на {abs(calc_rdkit.delta_clogp_vs_parent):.2f}"

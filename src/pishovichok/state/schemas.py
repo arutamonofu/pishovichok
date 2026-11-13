@@ -286,7 +286,10 @@ class SARHypothesisRationale(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     generation_origin: Literal[
-        "mmp_smirks_rule", "crem_fragment_replacement", "bioisostere_catalog"
+        "mmp_smirks_rule",
+        "crem_fragment_replacement",
+        "bioisostere_catalog",
+        "graph_ga",
     ] = Field(..., description="Механизм порождения модификации")
     rule_id: str = Field(
         ...,
@@ -739,6 +742,7 @@ class TraceEvent(BaseModel):
     verdict_or_routing: str | None = None
     fallback_triggered: str | None = None
     duration_ms: float = Field(..., ge=0.0)
+    parameters_used: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParentSeed(BaseModel):
@@ -770,7 +774,10 @@ class GeneratedRawCandidate(BaseModel):
     replaced_group_smiles: str
     introduced_group_smiles: str
     generation_origin: Literal[
-        "mmp_smirks_rule", "crem_fragment_replacement", "bioisostere_catalog"
+        "mmp_smirks_rule",
+        "crem_fragment_replacement",
+        "bioisostere_catalog",
+        "graph_ga",
     ]
     historical_mean_delta_pic50: float
     historical_std_delta_pic50: float = Field(default=0.0, ge=0.0)
@@ -870,6 +877,9 @@ class ToolConfig(BaseModel):
     use_bioisostere_catalog: bool = True
     bioisostere_fallback_threshold: int = Field(default=5, ge=0)
     crem_max_fragment_heavy_atoms: int = Field(default=4, ge=1)
+    ga_population_size: int = Field(default=20, ge=6, le=60)
+    ga_generations: int = Field(default=2, ge=1, le=5)
+    enable_crem_grow: bool = Field(default=True)
 
     # 4. Оценка, дескрипторы, фильтры, BRICS, ADMET, MPO и 3D
     active_filter_catalogs: list[FilterCatalogLiteral] = Field(

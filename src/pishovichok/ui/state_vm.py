@@ -90,6 +90,9 @@ _DESIGN_STAGE_KEYS: frozenset[str] = frozenset(
         "max_parent_seeds",
         "use_bioisostere_catalog",
         "bioisostere_fallback_threshold",
+        "ga_population_size",
+        "ga_generations",
+        "enable_crem_grow",
         "max_iterations",
         "strict_property_thresholds",
         "critic_fallback_min_tpsa",
@@ -260,10 +263,17 @@ class CandidateRowVM(BaseModel):
 
     @property
     def method_rule_label(self) -> str:
+        if self.rule_id == "GEN-GA" or self.generation_origin == "graph_ga":
+            return "GraphGA (BRICS)"
+        if self.rule_id == "CREM-GROW":
+            return "CReM Grow"
+        if self.rule_id == "CREM-MUT":
+            return "CReM Mutate"
         origin_map = {
             "mmp_smirks_rule": "MMP",
             "crem_fragment_replacement": "CReM",
             "bioisostere_catalog": "Биоизостер",
+            "graph_ga": "GraphGA",
         }
         origin_short = origin_map.get(self.generation_origin, self.generation_origin)
         return f"{origin_short} · {self.rule_id}"

@@ -55,6 +55,7 @@ _ORIGIN_LABELS: dict[str, str] = {
     "mmp_smirks_rule": "Правило MMP",
     "crem_fragment_replacement": "Замена CReM",
     "bioisostere_catalog": "Каталог биоизостеров",
+    "graph_ga": "Эволюция GraphGA (BRICS)",
 }
 
 _ADMET_MODEL_LABELS: dict[str, str] = {
@@ -566,10 +567,15 @@ class InspectorPane:
                     ],
                 )
 
-                origin_ru = _ORIGIN_LABELS.get(
-                    cand.hypothesis_rationale.generation_origin,
-                    cand.hypothesis_rationale.generation_origin,
-                )
+                if cand.hypothesis_rationale.rule_id == "CREM-GROW":
+                    origin_ru = "Наращивание CReM (Grow)"
+                elif cand.hypothesis_rationale.rule_id == "CREM-MUT":
+                    origin_ru = "Мутация CReM (Mutate)"
+                else:
+                    origin_ru = _ORIGIN_LABELS.get(
+                        cand.hypothesis_rationale.generation_origin,
+                        cand.hypothesis_rationale.generation_origin,
+                    )
                 violations_txt = (
                     ", ".join(row.violations) if row.violations else "Соответствует"
                 )
@@ -579,13 +585,15 @@ class InspectorPane:
                     ("Ограничения", violations_txt),
                     ("Индекс MPO", f"{row.mpo_score:.3f}"),
                 ]
+                raw_smirks = str(cand.hypothesis_rationale.applied_smirks or "")
+                compact_smirks = (
+                    f"{raw_smirks[:69]}..." if len(raw_smirks) > 72 else raw_smirks
+                )
                 self._prov_card_badges(
                     "cat-hypothesis-left",
                     "4. Гипотеза SAR",
                     sar_items,
-                    mono_footer=cand.hypothesis_rationale.applied_smirks
-                    if is_expert
-                    else None,
+                    mono_footer=compact_smirks if is_expert else None,
                 )
 
     def _prov_card_badges(

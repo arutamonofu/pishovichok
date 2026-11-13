@@ -580,6 +580,29 @@ class ToolSettingsDrawer:
             self._add_checkbox("freeze_murcko_core", "Фиксировать каркас Bemis-Murcko (freeze_murcko_core)")
             self._add_checkbox("use_bioisostere_catalog", "Использовать каталог биоизостеров")
 
+            self._section_header("Эволюционный генератор (GraphGA + CReM Grow)")
+            with ui.grid(columns=2).classes("w-full gap-2"):
+                self._add_number(
+                    "ga_population_size",
+                    "Размер популяции (GraphGA)",
+                    min_val=6,
+                    max_val=60,
+                    step=2,
+                    is_int=True,
+                )
+                self._add_number(
+                    "ga_generations",
+                    "Число поколений эволюции",
+                    min_val=1,
+                    max_val=5,
+                    step=1,
+                    is_int=True,
+                )
+            self._add_checkbox(
+                "enable_crem_grow",
+                "Наращивание фрагментов (CReM Grow)",
+            )
+
             tc = resolve_tool_config(self.runtime.state)
             ps_card = ui.column().classes("w-full gap-1 bg-white p-2 rounded border border-[#E2E8F0]")
             self._cards["protected_smarts"] = ps_card

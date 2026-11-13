@@ -970,3 +970,60 @@ def test_agent_nodes_track_param_sources_and_telemetry(tmp_path: Path) -> None:
     assert state["node_telemetry"]["evaluation"]["active_params"]["admet_backend"] == "empirical_only"
     assert len(state["top_candidates"]) <= 4
 
+
+def test_generate_graph_ga_candidates_respects_constraints() -> None:
+    """Проверяет GraphGA + CReM grow/mutate на seed=42: валидность RDKit, родитель, rule_id и logP <= max_logp."""
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+
+    from pishovichok.config import settings
+    from pishovichok.core import generate_graph_ga_candidates
+
+    seed_molecules = [
+        {
+            "chembl_id": "CHEMBL913",
+            "smiles": "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
+            "exp_pic50": 8.1,
+            "bao_format": "BAO_0000357",
+        },
+        {
+            "chembl_id": "CHEMBL553",
+            "smiles": "COc1cc2ncnc(Nc3cccc(C#C)c3)c2cc1OCCOC",
+            "exp_pic50": 7.9,
+            "bao_format": "BAO_0000357",
+        },
+    ]
+    constraints = {
+        "max_logp": 3.5,
+        "min_tpsa": 65.0,
+        "max_sascore": 4.5,
+        "max_mw": 550.0,
+    }
+
+    candidates = generate_graph_ga_candidates(
+        seed_molecules=seed_molecules,
+        constraints=constraints,
+        crem_db_path=settings.crem_db_path,
+        population_size=12,
+        generations=2,
+        enable_crem_grow=True,
+        protect_scaffold=False,
+        seed=42,
+    )
+    assert len(candidates) > 0
+
+    seed_ids = {s["chembl_id"] for s in seed_molecules}
+    rule_ids = set()
+    for cand in candidates:
+        mol = Chem.MolFromSmiles(cand["smiles"])
+        assert mol is not None, f"Невалидный SMILES: {cand['smiles']}"
+        assert cand["parent_chembl_id"] in seed_ids
+        assert cand["rule_id"] in ("GEN-GA", "CREM-GROW", "CREM-MUT")
+        assert "| MCS: " in cand["applied_smirks"]
+        logp = float(Descriptors.MolLogP(mol))
+        assert logp <= 3.5, f"Превышен max_logp=3.5: {logp:.2f} для {cand['smiles']}"
+        rule_ids.add(cand["rule_id"])
+
+    assert rule_ids.intersection({"GEN-GA", "CREM-GROW"})
+
+

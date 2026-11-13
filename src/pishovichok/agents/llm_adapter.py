@@ -112,6 +112,9 @@ class ToolConfigOverrides(BaseModel):
     use_bioisostere_catalog: bool | None = None
     bioisostere_fallback_threshold: int | None = None
     crem_max_fragment_heavy_atoms: int | None = None
+    ga_population_size: int | None = None
+    ga_generations: int | None = None
+    enable_crem_grow: bool | None = None
 
     # 4. Оценка, дескрипторы, фильтры, BRICS, ADMET, MPO и 3D
     active_filter_catalogs: list[FilterCatalogLiteral] | None = None
@@ -818,6 +821,33 @@ class LLMAdapter:
         ):
             overrides["use_bioisostere_catalog"] = False
 
+        m_ga_pop = re.search(
+            r"(?:ga_population_size\s*(?:=|:)?\s*(\d+)|популяц\w*\s*(?:graphga|ga)?\s*(?:=|:|\s)\s*(\d+))",
+            text_lower,
+        )
+        if m_ga_pop:
+            ga_pop_val = int(m_ga_pop.group(1) or m_ga_pop.group(2))
+            if 6 <= ga_pop_val <= 60:
+                overrides["ga_population_size"] = ga_pop_val
+
+        m_ga_gen = re.search(
+            r"(?:ga_generations\s*(?:=|:)?\s*(\d+)|поколен\w*\s*(?:эволюц\w*|graphga|ga)?\s*(?:=|:|\s)\s*(\d+))",
+            text_lower,
+        )
+        if m_ga_gen:
+            ga_gen_val = int(m_ga_gen.group(1) or m_ga_gen.group(2))
+            if 1 <= ga_gen_val <= 5:
+                overrides["ga_generations"] = ga_gen_val
+
+        if (
+            "без crem grow" in text_lower
+            or "отключи crem grow" in text_lower
+            or "enable_crem_grow=false" in text_lower
+        ):
+            overrides["enable_crem_grow"] = False
+        elif "enable_crem_grow=true" in text_lower:
+            overrides["enable_crem_grow"] = True
+
         # --- 4. Фильтры, дескрипторы, BRICS, ADMET, MPO, 3D ---
         catalog_tokens: list[FilterCatalogLiteral] = []
         has_extra_catalog = False
@@ -1150,7 +1180,7 @@ class LLMAdapter:
                 facts_text = "\n".join(
                     f"Кандидат {c.candidate_id}:\n"
                     f"- Родитель: {c.parent_chembl_id} (pIC50={c.parent_exp_pic50:.2f}, BAO={c.parent_bao_format})\n"
-                    f"- Правило: {c.hypothesis_rationale.applied_smirks} ({c.hypothesis_rationale.rule_id})\n"
+                    f"- Правило/метод: {c.hypothesis_rationale.applied_smirks} ({c.hypothesis_rationale.rule_id}, origin={c.hypothesis_rationale.generation_origin})\n"
                     f"- Статистика MMP: support={c.hypothesis_rationale.support_pairs_count}, ΔpIC50={c.hypothesis_rationale.historical_mean_delta_pic50:+.2f}, однороден={c.hypothesis_rationale.assay_homogeneous}\n"
                     f"- Детерминированный сдвиг: ΔcLogP={c.calc_rdkit.delta_clogp_vs_parent:+.2f}, ΔTPSA={c.calc_rdkit.delta_tpsa_vs_parent:+.1f}, SAscore={c.calc_rdkit.sa_score:.2f}\n"
                     f"- ADMET: прогноз pIC50={c.pred_admet.predicted_pic50:.2f}, hERG prob={c.pred_admet.herg_liability_prob:.2f} ({c.pred_admet.herg_risk_level}), растворимость={c.pred_admet.solubility_class}\n"

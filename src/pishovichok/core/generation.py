@@ -19,17 +19,33 @@
 from __future__ import annotations
 
 import contextlib
+import random
 import sqlite3
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import BRICS, QED, AllChem, Descriptors, rdFMCS
 from rdkit.Chem.Scaffolds import MurckoScaffold
+
+try:
+    from crem.crem import grow_mol as _crem_pkg_grow_mol
+    from crem.crem import mutate_mol as _crem_pkg_mutate_mol
+except ImportError:  # pragma: no cover - fallback if crem is absent
+    _crem_pkg_grow_mol = None
+    _crem_pkg_mutate_mol = None
 
 from pishovichok.config import settings
 from pishovichok.core.bioisosteres import select_bioisostere_rules
 from pishovichok.core.curation import standardize_molecule_detailed
+from pishovichok.core.evaluation import (
+    calculate_sa_score,
+    check_structural_alerts_detailed,
+)
+from pishovichok.core.fingerprints import (
+    compute_fp_similarity,
+    compute_mol_fingerprint,
+)
 from pishovichok.core.sar_analysis import (
     canonicalize_substituent_smiles,
     fragment_molecule_mmpa,
@@ -775,6 +791,7 @@ def generate_candidate_structures(
     *,
     crem_db_path: Path | str | None = None,
     tool_config: ToolConfig | None = None,
+    force_graph_ga: bool = False,
 ) -> list[GeneratedRawCandidate]:
     """Генерирует пул валидных молекул-кандидатов по 3-уровневому каскаду (SMIRKS -> CReM -> Биоизостеры)."""
     cfg = tool_config or ToolConfig()
@@ -933,4 +950,625 @@ def generate_candidate_structures(
                 if len(generated_candidates) >= pool_limit:
                     return generated_candidates
 
+    # 4. Эволюционный генератор молекулярных графов (GraphGA + CReM grow/mutate)
+    min_viable_pool = max(cfg.top_k_output, min(10, pool_limit))
+    should_run_ga = (
+        cfg.generation_engine != "mmp_only"
+        and (
+            force_graph_ga
+            or generation_iteration > 1
+            or len(generated_candidates) < min_viable_pool
+        )
+    )
+    if should_run_ga and len(generated_candidates) < pool_limit:
+        eff_crem_path = (
+            Path(crem_db_path) if crem_db_path is not None else settings.crem_db_path
+        )
+        seed_dicts = [
+            {
+                "chembl_id": p.mol_id,
+                "smiles": p.canonical_smiles,
+                "exp_pic50": p.exp_pic50,
+                "bao_format": p.bao_format,
+                "scaffold_smiles": p.scaffold_smiles,
+            }
+            for p in parent_molecules
+        ]
+        parent_by_id = {p.mol_id: p for p in parent_molecules}
+        ga_constraints = constraints.model_dump()
+        ga_constraints["exclude_halogens"] = (
+            "exclude_halogens" in constraints.preferred_substituent_types
+        )
+        ga_candidates = generate_graph_ga_candidates(
+            seed_molecules=seed_dicts,
+            constraints=ga_constraints,
+            crem_db_path=eff_crem_path,
+            population_size=cfg.ga_population_size,
+            generations=cfg.ga_generations,
+            crem_radius=3,
+            max_replacements=cfg.crem_max_replacements,
+            enable_crem_grow=cfg.enable_crem_grow,
+            protect_scaffold=constraints.freeze_scaffold,
+            seed=42 + generation_iteration,
+        )
+        exclude_halogens = "exclude_halogens" in constraints.preferred_substituent_types
+        needed = max(0, pool_limit - len(generated_candidates))
+        for item in ga_candidates[: max(needed * 2, 12)]:
+            prod_smi = item["smiles"]
+            if prod_smi in global_seen_smiles:
+                continue
+            prod_mol = Chem.MolFromSmiles(prod_smi)
+            if prod_mol is None:
+                continue
+            if exclude_halogens and any(
+                a.GetAtomicNum() in (9, 17, 35, 53) for a in prod_mol.GetAtoms()
+            ):
+                continue
+
+            parent = parent_by_id.get(item["parent_chembl_id"], parent_molecules[0])
+            parent_mol = Chem.MolFromSmiles(parent.canonical_smiles)
+            if parent_mol is not None:
+                is_preserved, scaf_smi = verify_scaffold_preservation(
+                    parent_mol,
+                    prod_mol,
+                    freeze_scaffold=eff_freeze,
+                    tool_config=cfg,
+                )
+                if not is_preserved:
+                    continue
+            else:
+                scaf_smi = MurckoScaffold.MurckoScaffoldSmiles(
+                    mol=prod_mol, includeChirality=False
+                )
+
+            rule_id = str(item["rule_id"])
+            origin: Literal[
+                "mmp_smirks_rule",
+                "crem_fragment_replacement",
+                "bioisostere_catalog",
+                "graph_ga",
+            ] = "graph_ga" if rule_id == "GEN-GA" else "crem_fragment_replacement"
+
+            if cfg.generation_engine == "crem_only" and origin == "graph_ga":
+                continue
+
+            highlights: list[int] = []
+            if parent_mol is not None:
+                with contextlib.suppress(Exception):
+                    mcs = rdFMCS.FindMCS(
+                        [prod_mol, parent_mol],
+                        ringMatchesRingOnly=True,
+                        completeRingsOnly=True,
+                        timeout=1,
+                    )
+                    if mcs and mcs.smartsString:
+                        mcs_pat = Chem.MolFromSmarts(mcs.smartsString)
+                        if mcs_pat is not None:
+                            match = prod_mol.GetSubstructMatch(mcs_pat)
+                            if match:
+                                match_set = set(match)
+                                highlights = [
+                                    idx
+                                    for idx in range(prod_mol.GetNumAtoms())
+                                    if idx not in match_set
+                                ]
+
+            global_seen_smiles.add(prod_smi)
+            generated_candidates.append(
+                GeneratedRawCandidate(
+                    smiles=prod_smi,
+                    scaffold_smiles=scaf_smi,
+                    generation_iteration=generation_iteration,
+                    parent_seed=parent,
+                    rule_id=rule_id,
+                    applied_smirks=str(item["applied_smirks"]),
+                    replaced_group_smiles="*",
+                    introduced_group_smiles="*",
+                    generation_origin=origin,
+                    historical_mean_delta_pic50=float(item["expected_delta_pic50"]),
+                    historical_std_delta_pic50=0.45,
+                    support_pairs_count=1 if origin == "crem_fragment_replacement" else 0,
+                    assay_homogeneous=False,
+                    highlighted_atom_indices=highlights,
+                )
+            )
+            if len(generated_candidates) >= pool_limit:
+                return generated_candidates
+
     return generated_candidates
+
+
+generate_candidates_pipeline = generate_candidate_structures
+
+
+_CURATED_GROW_FRAGMENTS: tuple[str, ...] = (
+    "O",
+    "N",
+    "C",
+    "CO",
+    "CN",
+    "C(=O)N",
+    "C(=O)O",
+    "S(=O)(=O)N",
+    "OCC",
+    "NCC",
+    "C1COC1",
+    "c1ccncc1",
+    "OC",
+    "NC",
+    "C#N",
+)
+
+
+def _mol_has_halogen(mol: Chem.Mol) -> bool:
+    return any(atom.GetAtomicNum() in (9, 17, 35, 53) for atom in mol.GetAtoms())
+
+
+def _compute_ga_fitness(smiles: str, constraints: dict) -> float:
+    """Вычисляет приспособленность молекулы для GraphGA с учетом QED, ограничений и алертов."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return 0.0
+
+    pains_count, _pains, brenk_count, *_rest = check_structural_alerts_detailed(mol)
+    if pains_count > 0 or brenk_count > 0:
+        return 0.0
+
+    if constraints.get("exclude_halogens") and _mol_has_halogen(mol):
+        return 0.0
+
+    qed_val = float(QED.qed(mol))
+    logp = float(Descriptors.MolLogP(mol))
+    tpsa = float(Descriptors.TPSA(mol))
+    mw = float(Descriptors.ExactMolWt(mol))
+    sa = float(calculate_sa_score(mol))
+
+    penalty = 0.0
+    max_logp = constraints.get("max_logp")
+    if max_logp is not None and logp > float(max_logp):
+        penalty += 0.35 * (logp - float(max_logp)) + 0.15
+
+    min_logp = constraints.get("min_logp")
+    if min_logp is not None and logp < float(min_logp):
+        penalty += 0.35 * (float(min_logp) - logp) + 0.15
+
+    max_sascore = constraints.get("max_sascore")
+    if max_sascore is None:
+        max_sascore = constraints.get("max_sa_score")
+    if max_sascore is not None and sa > float(max_sascore):
+        penalty += 0.25 * (sa - float(max_sascore)) + 0.10
+
+    min_tpsa = constraints.get("min_tpsa")
+    if min_tpsa is not None and tpsa < float(min_tpsa):
+        penalty += 0.02 * (float(min_tpsa) - tpsa) + 0.10
+
+    max_mw = constraints.get("max_mw")
+    if max_mw is not None and mw > float(max_mw):
+        penalty += 0.005 * (mw - float(max_mw)) + 0.10
+
+    return max(0.0, round(qed_val - penalty, 6))
+
+
+def _is_native_crem_db(db_path: Path | None, radius: int = 3) -> bool:
+    if db_path is None or not db_path.exists():
+        return False
+    table = f"radius{int(radius)}"
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            cur = conn.cursor()
+            cur.execute(f"PRAGMA table_info({table})")
+            cols = {row[1] for row in cur.fetchall()}
+            return {"env", "core_smi", "core_num_atoms"}.issubset(cols)
+    except sqlite3.Error:
+        return False
+
+
+def _get_murcko_protected_ids(mol: Chem.Mol) -> list[int]:
+    with contextlib.suppress(Exception):
+        scaf = MurckoScaffold.GetScaffoldForMol(mol)
+        if scaf is None or scaf.GetNumAtoms() == 0:
+            return []
+        match = mol.GetSubstructMatch(scaf)
+        return list(match) if match else []
+    return []
+
+
+def _standardize_mol_or_none(raw_smi: str) -> tuple[str, Chem.Mol] | None:
+    std = standardize_molecule_detailed(raw_smi)
+    if std is None or not std.canonical_smiles:
+        return None
+    mol = Chem.MolFromSmiles(std.canonical_smiles)
+    if mol is None:
+        return None
+    return std.canonical_smiles, mol
+
+
+def _brics_crossover_children(
+    pop_smiles: list[str],
+    rng: random.Random,
+    max_children: int = 24,
+) -> list[tuple[str, str, str]]:
+    """Рекомбинация пар молекул через BRICSDecompose + BRICSBuild."""
+    fragments: set[str] = set()
+    for smi in pop_smiles[:6]:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        with contextlib.suppress(Exception):
+            frags = BRICS.BRICSDecompose(mol, minFragmentSize=2)
+            fragments.update(frags)
+
+    if len(fragments) < 2:
+        return []
+
+    frag_list = sorted(fragments)
+    rng.shuffle(frag_list)
+    frag_mols = [Chem.MolFromSmiles(f) for f in frag_list[:8]]
+    frag_mols = [m for m in frag_mols if m is not None]
+    if len(frag_mols) < 2:
+        return []
+
+    results: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    with contextlib.suppress(Exception):
+        builder = BRICS.BRICSBuild(
+            frag_mols, onlyCompleteMols=True, maxDepth=2
+        )
+        for idx, prod in enumerate(builder):
+            if idx >= max_children * 2 or len(results) >= max_children:
+                break
+            if prod is None:
+                continue
+            raw_smi = Chem.MolToSmiles(prod, isomericSmiles=False)
+            std_res = _standardize_mol_or_none(raw_smi)
+            if std_res is None:
+                continue
+            canon_smi, std_mol = std_res
+            heavy = std_mol.GetNumHeavyAtoms()
+            if heavy < 8 or heavy > 45:
+                continue
+            if canon_smi not in seen:
+                seen.add(canon_smi)
+                results.append((canon_smi, "GEN-GA", "BRICS_crossover"))
+    return results
+
+
+def _attach_fragment_rdkit(
+    mol: Chem.Mol,
+    frag_smi: str,
+    protected_set: set[int],
+    rng: random.Random,
+) -> str | None:
+    """Присоединяет небольшой фрагмент к периферийному атому с доступной валентностью."""
+    frag = Chem.MolFromSmiles(frag_smi)
+    if frag is None or frag.GetNumHeavyAtoms() > 5:
+        return None
+    candidate_atoms = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetIdx() not in protected_set
+        and atom.GetTotalNumHs() > 0
+        and atom.GetAtomicNum() in (6, 7, 8)
+    ]
+    if not candidate_atoms:
+        return None
+    attach_idx = rng.choice(candidate_atoms)
+    combo = Chem.CombineMols(mol, frag)
+    rw = Chem.RWMol(combo)
+    frag_attach_idx = mol.GetNumAtoms()
+    rw.AddBond(attach_idx, frag_attach_idx, Chem.BondType.SINGLE)
+    with contextlib.suppress(Exception):
+        out_mol = rw.GetMol()
+        Chem.SanitizeMol(out_mol)
+        std_res = _standardize_mol_or_none(
+            Chem.MolToSmiles(out_mol, isomericSmiles=False)
+        )
+        if std_res is not None:
+            return std_res[0]
+    return None
+
+
+def _crem_grow_children(
+    pop_smiles: list[str],
+    crem_db_path: Path | None,
+    crem_radius: int,
+    max_replacements: int,
+    protect_scaffold: bool,
+    rng: random.Random,
+    exclude_halogens: bool = False,
+) -> list[tuple[str, str, str]]:
+    """Направленное наращивание заместителей (max_atoms=5) через crem.grow_mol или RDKit-фолбэк."""
+    results: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    use_native = (
+        _crem_pkg_grow_mol is not None
+        and _is_native_crem_db(crem_db_path, radius=crem_radius)
+    )
+
+    for smi in pop_smiles[:6]:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        protected_ids = _get_murcko_protected_ids(mol) if protect_scaffold else None
+        if use_native and crem_db_path is not None:
+            with contextlib.suppress(Exception):
+                grown = list(
+                    _crem_pkg_grow_mol(
+                        mol,
+                        str(crem_db_path),
+                        radius=crem_radius,
+                        min_atoms=1,
+                        max_atoms=5,
+                        max_replacements=max_replacements,
+                        protected_ids=protected_ids,
+                        return_mol=False,
+                        seed=rng.randint(1, 100000),
+                    )
+                )
+                for g_smi in grown:
+                    std_res = _standardize_mol_or_none(str(g_smi))
+                    if std_res is not None and std_res[0] not in seen:
+                        seen.add(std_res[0])
+                        results.append((std_res[0], "CREM-GROW", "CReM_grow"))
+                continue
+
+        # Fallback для кастомной БД replacements_sa2.db или без native CReM
+        protected_set = set(protected_ids or [])
+        frags = list(_CURATED_GROW_FRAGMENTS)
+        rng.shuffle(frags)
+        produced = 0
+        for frag_smi in frags:
+            if produced >= max(3, max_replacements // max(1, len(pop_smiles))):
+                break
+            if exclude_halogens and any(h in frag_smi for h in ("F", "Cl", "Br", "I")):
+                continue
+            new_smi = _attach_fragment_rdkit(mol, frag_smi, protected_set, rng)
+            if new_smi and new_smi not in seen:
+                seen.add(new_smi)
+                results.append((new_smi, "CREM-GROW", "CReM_grow"))
+                produced += 1
+
+    return results
+
+
+def _crem_mutate_children(
+    pop_smiles: list[str],
+    crem_db_path: Path | None,
+    crem_radius: int,
+    max_replacements: int,
+    protect_scaffold: bool,
+    rng: random.Random,
+    exclude_halogens: bool = False,
+) -> list[tuple[str, str, str]]:
+    """Изостерическая мутация через crem.mutate_mol или локальную таблицу CReM."""
+    results: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    use_native = (
+        _crem_pkg_mutate_mol is not None
+        and _is_native_crem_db(crem_db_path, radius=crem_radius)
+    )
+
+    if use_native and crem_db_path is not None:
+        for smi in pop_smiles:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            protected_ids = _get_murcko_protected_ids(mol) if protect_scaffold else None
+            with contextlib.suppress(Exception):
+                mutated = list(
+                    _crem_pkg_mutate_mol(
+                        mol,
+                        str(crem_db_path),
+                        radius=crem_radius,
+                        max_replacements=max_replacements,
+                        protected_ids=protected_ids,
+                        return_mol=False,
+                        seed=rng.randint(1, 100000),
+                    )
+                )
+                for m_smi in mutated:
+                    std_res = _standardize_mol_or_none(str(m_smi))
+                    if std_res is not None and std_res[0] not in seen:
+                        seen.add(std_res[0])
+                        results.append(
+                            (std_res[0], "CREM-MUT", "CReM_mutate")
+                        )
+        return results
+
+    resolved_db = crem_db_path if crem_db_path is not None else settings.crem_db_path
+    specs = _load_crem_replacements_from_db(
+        crem_db_path=resolved_db,
+        max_sa_score=5.0,
+    )
+    for smi in pop_smiles[:6]:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        produced = 0
+        for spec in specs:
+            if produced >= max_replacements:
+                break
+            if exclude_halogens and spec.contains_halogen:
+                continue
+            products = apply_smirks_to_molecule(
+                parent_mol=mol,
+                from_fragment=spec.from_fragment,
+                to_fragment=spec.to_fragment,
+                freeze_scaffold=protect_scaffold,
+            )
+            for prod_smi, _scaf_smi, _highlights in products:
+                std_res = _standardize_mol_or_none(prod_smi)
+                if std_res is not None and std_res[0] not in seen:
+                    seen.add(std_res[0])
+                    results.append((std_res[0], "CREM-MUT", "CReM_mutate"))
+                    produced += 1
+                    if produced >= max_replacements:
+                        break
+
+    return results
+
+
+def generate_graph_ga_candidates(
+    seed_molecules: list[dict],
+    constraints: dict,
+    crem_db_path: Path | None = None,
+    population_size: int = 20,
+    generations: int = 3,
+    crem_radius: int = 3,
+    max_replacements: int = 15,
+    enable_crem_grow: bool = True,
+    protect_scaffold: bool = False,
+    seed: int = 42,
+) -> list[dict]:
+    """Эволюционный генератор молекулярных графов (BRICS crossover + CReM grow/mutate)."""
+    if not seed_molecules:
+        return []
+
+    rng = random.Random(seed)
+    normalized_seeds: list[dict[str, Any]] = []
+    seed_smiles_set: set[str] = set()
+    seed_fps: list[tuple[dict[str, Any], Chem.Mol, Any]] = []
+
+    for idx, s in enumerate(seed_molecules):
+        raw_smi = str(s.get("smiles") or "").strip()
+        if not raw_smi:
+            continue
+        std_res = _standardize_mol_or_none(raw_smi)
+        if std_res is None:
+            continue
+        canon_smi, std_mol = std_res
+        entry = {
+            "chembl_id": str(s.get("chembl_id") or f"SEED-{idx + 1}"),
+            "smiles": canon_smi,
+            "exp_pic50": float(s.get("exp_pic50", 6.5)),
+            "bao_format": str(s.get("bao_format") or settings.dominant_bao_default),
+        }
+        normalized_seeds.append(entry)
+        seed_smiles_set.add(canon_smi)
+        seed_fps.append((entry, std_mol, compute_mol_fingerprint(std_mol)))
+
+    if not normalized_seeds:
+        return []
+
+    exclude_halogens = bool(constraints.get("exclude_halogens", False))
+    population: list[str] = [s["smiles"] for s in normalized_seeds]
+    provenance: dict[str, tuple[str, str]] = {}
+
+    for _gen in range(max(1, int(generations))):
+        offspring: list[tuple[str, str, str]] = []
+        offspring.extend(
+            _brics_crossover_children(
+                population, rng=rng, max_children=max(10, population_size)
+            )
+        )
+        if enable_crem_grow:
+            offspring.extend(
+                _crem_grow_children(
+                    population,
+                    crem_db_path=crem_db_path,
+                    crem_radius=crem_radius,
+                    max_replacements=max_replacements,
+                    protect_scaffold=protect_scaffold,
+                    rng=rng,
+                    exclude_halogens=exclude_halogens,
+                )
+            )
+        offspring.extend(
+            _crem_mutate_children(
+                population,
+                crem_db_path=crem_db_path,
+                crem_radius=crem_radius,
+                max_replacements=max_replacements,
+                protect_scaffold=protect_scaffold,
+                rng=rng,
+                exclude_halogens=exclude_halogens,
+            )
+        )
+
+        pool_set: dict[str, float] = {}
+        for smi in population:
+            pool_set[smi] = _compute_ga_fitness(smi, constraints)
+        for smi, r_id, op_name in offspring:
+            if smi not in provenance:
+                provenance[smi] = (r_id, op_name)
+            if smi not in pool_set:
+                pool_set[smi] = _compute_ga_fitness(smi, constraints)
+
+        ranked = sorted(
+            pool_set.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        population = [smi for smi, _score in ranked[: max(1, int(population_size))]]
+
+    # Отбираем финальных кандидатов (исключая исходные seed-молекулы)
+    final_pool = [
+        (smi, _compute_ga_fitness(smi, constraints))
+        for smi in population
+        if smi not in seed_smiles_set and smi in provenance
+    ]
+    # Дополнительно подмешаем лучшие дочерние, если population оказался полон seed
+    if not final_pool:
+        final_pool = sorted(
+            (
+                (smi, _compute_ga_fitness(smi, constraints))
+                for smi in provenance
+                if smi not in seed_smiles_set
+            ),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[:population_size]
+
+    # Если задан max_logp, оставляем структуры, укладывающиеся в порог (если такие есть)
+    max_logp = constraints.get("max_logp")
+    if max_logp is not None and final_pool:
+        compliant = []
+        for smi, fit in final_pool:
+            m = Chem.MolFromSmiles(smi)
+            if m is not None and float(Descriptors.MolLogP(m)) <= float(max_logp):
+                compliant.append((smi, fit))
+        if compliant:
+            final_pool = compliant
+
+    output: list[dict] = []
+    for smi, fit in sorted(final_pool, key=lambda kv: (-kv[1], kv[0])):
+        cand_mol = Chem.MolFromSmiles(smi)
+        if cand_mol is None:
+            continue
+        cand_fp = compute_mol_fingerprint(cand_mol)
+
+        best_parent = normalized_seeds[0]
+        best_parent_mol = seed_fps[0][1]
+        best_sim = -1.0
+        for entry, p_mol, p_fp in seed_fps:
+            sim = compute_fp_similarity(cand_fp, p_fp)
+            if sim > best_sim:
+                best_sim = sim
+                best_parent = entry
+                best_parent_mol = p_mol
+
+        mcs_smarts = "*"
+        with contextlib.suppress(Exception):
+            mcs_res = rdFMCS.FindMCS(
+                [cand_mol, best_parent_mol],
+                ringMatchesRingOnly=True,
+                completeRingsOnly=True,
+                timeout=1,
+            )
+            if mcs_res and mcs_res.smartsString:
+                mcs_smarts = mcs_res.smartsString
+
+        rule_id, operation = provenance[smi]
+        expected_delta = round((fit - 0.5) * 0.4, 4)
+        output.append(
+            {
+                "smiles": smi,
+                "parent_chembl_id": best_parent["chembl_id"],
+                "parent_smiles": best_parent["smiles"],
+                "parent_exp_pic50": float(best_parent["exp_pic50"]),
+                "parent_bao_format": str(best_parent["bao_format"]),
+                "rule_id": rule_id,
+                "applied_smirks": f"{operation} | MCS: {mcs_smarts}",
+                "expected_delta_pic50": expected_delta,
+            }
+        )
+
+    return output

@@ -41,6 +41,8 @@ from pishovichok.core.generation import (
     compute_highlighted_atoms,
     fragment_contains_halogen,
     generate_candidate_structures,
+    generate_candidates_pipeline,
+    generate_graph_ga_candidates,
     select_parent_seeds_from_curated,
     verify_scaffold_preservation,
 )
@@ -113,6 +115,8 @@ __all__ = [
     "fragment_molecule_mmpa",
     "generate_3d_conformer_molblock",
     "generate_candidate_structures",
+    "generate_candidates_pipeline",
+    "generate_graph_ga_candidates",
     "harrington_one_sided_desirability",
     "molecule_svg_to_data_uri",
     "parse_activity_cell",

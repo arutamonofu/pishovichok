@@ -579,3 +579,114 @@ def test_nl_tool_config_parsing_across_subsystems() -> None:
     assert parsed_overrides.get("admet_backend") == "empirical_only"
     assert parsed_overrides.get("force_field") == "UFF"
 
+
+def test_graph_ga_tool_config_and_candidate_contracts() -> None:
+    """Проверяет новые поля ToolConfig, сериализацию GEN-GA/CREM-GROW и парсинг GA-параметров."""
+    from pishovichok.agents.llm_adapter import LLMAdapter
+    from pishovichok.state.schemas import (
+        CalcRDKitMetrics,
+        CandidateMolecule,
+        GeneratedRawCandidate,
+        ParentSeed,
+        PredADMETMetrics,
+        SARHypothesisRationale,
+        ToolConfig,
+    )
+
+    tc = ToolConfig()
+    assert tc.ga_population_size == 20
+    assert tc.ga_generations == 2
+    assert tc.enable_crem_grow is True
+
+    adapter = LLMAdapter()
+    ga_overrides = adapter._deterministic_parse_tool_config(
+        "Запусти с популяцией 24, поколений 3, без crem grow"
+    )
+    assert ga_overrides.get("ga_population_size") == 24
+    assert ga_overrides.get("ga_generations") == 3
+    assert ga_overrides.get("enable_crem_grow") is False
+
+    parent = ParentSeed(
+        mol_id="CHEMBL913",
+        canonical_smiles="COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
+        scaffold_smiles="c1ccc(Nc2ncnc3ccccc23)cc1",
+        exp_pic50=8.1,
+        exp_ic50_nm=7.9,
+        bao_format="BAO_0000357",
+        assay_type="B",
+        source_dataset="test",
+    )
+    for rule_id, origin in (("GEN-GA", "graph_ga"), ("CREM-GROW", "crem_fragment_replacement")):
+        raw = GeneratedRawCandidate(
+            smiles="COc1cc2ncnc(Nc3ccccc3)c2cc1O",
+            scaffold_smiles="c1ccc(Nc2ncnc3ccccc23)cc1",
+            generation_iteration=2,
+            parent_seed=parent,
+            rule_id=rule_id,
+            applied_smirks="BRICS_crossover | MCS: c1ccc2ncncc2c1",
+            replaced_group_smiles="*",
+            introduced_group_smiles="*",
+            generation_origin=origin,
+            historical_mean_delta_pic50=0.15,
+            historical_std_delta_pic50=0.45,
+            support_pairs_count=0,
+            assay_homogeneous=False,
+        )
+        assert raw.rule_id == rule_id
+        cand = CandidateMolecule(
+            candidate_id=f"CAND-{rule_id}",
+            canonical_smiles=raw.smiles,
+            scaffold_smiles=raw.scaffold_smiles,
+            generation_iteration=2,
+            parent_chembl_id=parent.mol_id,
+            parent_smiles=parent.canonical_smiles,
+            parent_exp_pic50=parent.exp_pic50,
+            parent_exp_ic50_nm=parent.exp_ic50_nm,
+            parent_bao_format=parent.bao_format,
+            parent_assay_type=parent.assay_type,
+            parent_source_dataset=parent.source_dataset,
+            calc_rdkit=CalcRDKitMetrics(
+                mw=320.0,
+                clogp=2.5,
+                tpsa=78.0,
+                hbd=2,
+                hba=5,
+                rotatable_bonds=3,
+                fsp3=0.25,
+                sa_score=2.4,
+                qed=0.75,
+                lipinski_violations=0,
+                pains_alerts_count=0,
+                brenk_alerts_count=0,
+                delta_clogp_vs_parent=-1.2,
+                delta_tpsa_vs_parent=9.0,
+            ),
+            pred_admet=PredADMETMetrics(
+                model_source="rdkit_analytical_qsar",
+                log_s_aq=-3.1,
+                solubility_class="high",
+                bbb_permeability_prob=0.25,
+                herg_liability_prob=0.18,
+                herg_risk_level="low",
+                cyp3a4_inhibition_prob=0.15,
+                predicted_pic50=8.2,
+                prediction_confidence="medium",
+            ),
+            hypothesis_rationale=SARHypothesisRationale(
+                generation_origin=origin,
+                rule_id=rule_id,
+                applied_smirks=raw.applied_smirks,
+                replaced_group_smiles="*",
+                introduced_group_smiles="*",
+                support_pairs_count=0,
+                historical_mean_delta_pic50=0.15,
+                assay_homogeneous=False,
+                text_summary="Тестовая гипотеза",
+            ),
+            mpo_harrington_score=0.72,
+            passes_all_constraints=True,
+        )
+        roundtrip = CandidateMolecule.model_validate_json(cand.model_dump_json())
+        assert roundtrip.hypothesis_rationale.rule_id == rule_id
+
+

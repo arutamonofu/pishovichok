@@ -103,6 +103,8 @@ class AppSettings(BaseSettings):
     )
     default_top_k_candidates: int = Field(default=5, ge=1, le=20)
     max_candidates_pool: int = Field(default=30, ge=5, le=200)
+    default_ga_population: int = Field(default=20, ge=6, le=60)
+    default_ga_generations: int = Field(default=2, ge=1, le=5)
 
     # Приоритет каскада ADMET
     preferred_admet_backend: Literal[

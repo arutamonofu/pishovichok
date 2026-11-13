@@ -111,7 +111,7 @@ def determine_prediction_confidence(
         return "high"
     if (
         generation_origin == "mmp_smirks_rule" and support_pairs_count >= 1
-    ) or generation_origin == "crem_fragment_replacement":
+    ) or generation_origin in ("crem_fragment_replacement", "graph_ga"):
         return "medium"
     return "low"
 

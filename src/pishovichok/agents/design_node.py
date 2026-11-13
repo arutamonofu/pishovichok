@@ -57,6 +57,7 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
 
     # 2. Направленная генерация сырых структур-кандидатов
     sar_rules = state.get("extracted_sar_rules", [])
+    force_graph_ga = design_iteration > 1 or bool(state.get("critic_feedback"))
     raw_candidates = generate_candidate_structures(
         parent_molecules=parent_seeds,
         sar_rules=sar_rules,
@@ -64,6 +65,20 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
         generation_iteration=design_iteration,
         max_candidates_pool=tool_config.max_candidates_pool,
         tool_config=tool_config,
+        force_graph_ga=force_graph_ga,
+    )
+
+    smirks_count = sum(
+        1 for c in raw_candidates if c.generation_origin == "mmp_smirks_rule"
+    )
+    crem_count = sum(
+        1 for c in raw_candidates if c.generation_origin == "crem_fragment_replacement"
+    )
+    bioisostere_count = sum(
+        1 for c in raw_candidates if c.generation_origin == "bioisostere_catalog"
+    )
+    graph_ga_count = sum(
+        1 for c in raw_candidates if c.generation_origin == "graph_ga"
     )
 
     # 3. Сохранение сырого пула на диск сессии для изоляции памяти графа (Fat Pointer)
@@ -78,8 +93,20 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
     step_idx = len(state.get("trace_log", []))
     output_text = (
         f"Generated {len(raw_candidates)} candidate structures from {len(parent_seeds)} parent seeds "
-        f"(iteration={design_iteration}, preferred_types={constraints.preferred_substituent_types})."
+        f"(iteration={design_iteration}, SMIRKS={smirks_count}, CReM={crem_count}, GraphGA={graph_ga_count}, "
+        f"preferred_types={constraints.preferred_substituent_types})."
     )
+
+    ga_params_used: dict[str, object] = {
+        "ga_population_size": tool_config.ga_population_size,
+        "ga_generations": tool_config.ga_generations,
+        "enable_crem_grow": tool_config.enable_crem_grow,
+        "force_graph_ga": force_graph_ga,
+        "smirks_candidates": smirks_count,
+        "crem_candidates": crem_count,
+        "bioisostere_candidates": bioisostere_count,
+        "graph_ga_candidates": graph_ga_count,
+    }
 
     trace_event = TraceEvent(
         step_index=step_idx,
@@ -91,12 +118,13 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
             f"prefs={constraints.preferred_substituent_types}"
         ),
         action_taken=(
-            f"Applied SMIRKS transformations and bioisosteric substitutions with "
-            f"scaffold_locked={constraints.freeze_scaffold}"
+            f"Applied SMIRKS transformations, CReM grow/mutate and GraphGA BRICS crossover "
+            f"(force_ga={force_graph_ga}, scaffold_locked={constraints.freeze_scaffold})"
         ),
         output_summary=output_text,
         verdict_or_routing="proceed_to_evaluation",
         fallback_triggered=None,
+        parameters_used=ga_params_used,
         duration_ms=round(duration_ms, 2),
     )
 
@@ -115,11 +143,19 @@ def design_node(state: SARGraphState) -> dict[str, Any]:
             "max_parent_seeds": tool_config.max_parent_seeds,
             "max_candidates_pool": tool_config.max_candidates_pool,
             "use_bioisostere_catalog": tool_config.use_bioisostere_catalog,
+            "ga_population_size": tool_config.ga_population_size,
+            "ga_generations": tool_config.ga_generations,
+            "enable_crem_grow": tool_config.enable_crem_grow,
+            "force_graph_ga": force_graph_ga,
         },
         "stats": {
             "design_iteration": design_iteration,
             "parent_seeds_count": len(parent_seeds),
             "raw_candidates_count": len(raw_candidates),
+            "smirks_candidates": smirks_count,
+            "crem_candidates": crem_count,
+            "bioisostere_candidates": bioisostere_count,
+            "graph_ga_candidates": graph_ga_count,
             "duration_ms": round(duration_ms, 2),
         },
     }
