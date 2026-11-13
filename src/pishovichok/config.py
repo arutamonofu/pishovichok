@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -14,8 +15,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _default_project_root() -> Path:
-    """Определяет корневую директорию репозитория относительно пакета src/pishovichok/."""
-    return Path(__file__).resolve().parents[2]
+    """Определяет корневую директорию проекта (устойчиво к wheel-установке в Docker)."""
+    env_root = os.environ.get("PISHOVICHOK_PROJECT_ROOT")
+    if env_root:
+        return Path(env_root)
+    package_parent = Path(__file__).resolve().parents[2]
+    if (package_parent / "data").is_dir():
+        return package_parent
+    cwd = Path.cwd()
+    if (cwd / "data").is_dir():
+        return cwd
+    return package_parent
 
 
 DATA_DIR: Path = _default_project_root() / "data"
