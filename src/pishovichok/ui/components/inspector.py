@@ -332,11 +332,15 @@ class InspectorPane:
             if has_docking
             else f"3D-конформер: {cid}"
         )
-        modal_subtitle = (
-            f"(PDB: {cand.docking.resolved_pdb_id or '—'} · ΔG = {cand.docking.binding_affinity_kcal:.2f} ккал/моль)"
-            if has_docking and cand.docking.binding_affinity_kcal is not None
-            else f"({tool_config.etkdg_variant} + {tool_config.force_field})"
-        )
+        if has_docking:
+            score_str = (
+                f" · ΔG = {cand.docking.docking_score_kcal:.2f} ккал/моль"
+                if cand.docking.docking_score_kcal is not None
+                else ""
+            )
+            modal_subtitle = f"(PDB: {cand.docking.pdb_id or '—'}{score_str})"
+        else:
+            modal_subtitle = f"({tool_config.etkdg_variant} + {tool_config.force_field})"
 
         molblock: str | None = None
         receptor_pdb = ""
