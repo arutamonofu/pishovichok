@@ -96,10 +96,8 @@ uv run ruff format .
 | Validity (%) | 96.67% | 100.00% | 100.00% |
 | Uniqueness (%) | 61.85% | 100.00% | 100.00% |
 | MedChem Filters Pass (%) | 77.96% | 97.17% | 100.00% |
-| Complete Pass Rate (%) | 36.11% | 11.83% | 3.13% |
 | Top-5 Mean MPO Score | 0.1292 | 0.7146 | 0.7434 |
 | IntDiv1 | 0.1416 | 0.3581 | 0.3806 |
-| Task Success Rate (%) | 50.00% | 50.00% | 50.00% |
 
 Воспроизведение:
 
