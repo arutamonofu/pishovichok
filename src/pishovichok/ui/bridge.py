@@ -821,8 +821,7 @@ class AgentUIBridge:
                 coords = await run.cpu_bound(
                     compute_chemical_space_projection,
                     all_smiles,
-                    None,
-                    resolve_tool_config(runtime.state),
+                    tool_config=resolve_tool_config(runtime.state),
                 )
                 n_cands = len(cand_ids)
                 cand_coord_map = {

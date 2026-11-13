@@ -25,6 +25,7 @@ from pishovichok.state.schemas import (
     CandidateMolecule,
     PredADMETMetrics,
     SARHypothesisRationale,
+    ToolConfig,
 )
 from pishovichok.ui.bridge import AgentUIBridge
 from pishovichok.ui.routes import router as api_router
@@ -153,10 +154,22 @@ class TestCoreRendering:
                 "c1ccc(Nc2ncnc3ccccc23)cc1",
                 "COc1ccc(Nc2ncnc3ccccc23)cc1",
                 "Fc1ccc(Nc2ncnc3ccccc23)cc1",
-            ]
+            ],
+            tool_config=ToolConfig(),
         )
         assert len(coords) == 3
         assert all(len(pt) == 2 for pt in coords)
+
+        tool_cfg = ToolConfig()
+        molblock_kw, hl_kw = generate_3d_conformer_molblock(
+            "COc1ccc(Nc2ncnc3ccccc23)cc1",
+            num_conformers=tool_cfg.num_conformers,
+            random_seed=tool_cfg.conformer_random_seed,
+            tool_config=tool_cfg,
+        )
+        assert "V2000" in molblock_kw or "V3000" in molblock_kw
+        assert hl_kw == []
+        assert pickle.loads(pickle.dumps(tool_cfg)) == tool_cfg
 
     def test_spawn_pickle_compatibility(self) -> None:
         """Все функции для `run.cpu_bound` должны быть сериализуемы через `pickle`."""

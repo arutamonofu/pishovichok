@@ -190,9 +190,9 @@ class InspectorPane:
             molblock, _ = await run.cpu_bound(
                 generate_3d_conformer_molblock,
                 cand.canonical_smiles,
-                tool_config.num_conformers,
-                tool_config.conformer_random_seed,
-                tool_config,
+                num_conformers=tool_config.num_conformers,
+                random_seed=tool_config.conformer_random_seed,
+                tool_config=tool_config,
             )
             if cid and molblock:
                 self._mol3d_cache[cache_key] = molblock

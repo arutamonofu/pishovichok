@@ -141,8 +141,7 @@ class MPOCanvas:
         coords = await run.cpu_bound(
             compute_chemical_space_projection,
             smiles_list,
-            None,
-            resolve_tool_config(self.runtime.state),
+            tool_config=resolve_tool_config(self.runtime.state),
         )
         for (kind, obj), (x, y) in zip(targets, coords, strict=False):
             if kind == "lead":
